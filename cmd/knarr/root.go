@@ -1,0 +1,83 @@
+// Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+// SPDX-License-Identifier: Apache-2.0
+
+package main
+
+import (
+	"io"
+	"log/slog"
+
+	"github.com/spf13/cobra"
+
+	"github.com/foundriesio/knarr/internal/cli"
+	"github.com/foundriesio/knarr/pkg/knarr"
+	"github.com/foundriesio/knarr/pkg/version"
+)
+
+const defaultRoot = "/var/lib/knarr"
+
+// globalOptions holds the settings shared by every subcommand. The root
+// command's persistent flags bind into it, and PersistentPreRunE fills in the
+// output writers and logger before any subcommand runs.
+type globalOptions struct {
+	root        string
+	overlayRoot string
+	verbose     bool
+	quiet       bool
+
+	stdout io.Writer
+	stderr io.Writer
+	logger *slog.Logger
+}
+
+// engine constructs the knarr engine from the resolved global options.
+func (g *globalOptions) engine() (knarr.Engine, error) {
+	return knarr.New(knarr.Config{Root: g.root, OverlayRoot: g.overlayRoot})
+}
+
+// newRootCommand builds the knarr command tree. stdout and stderr are the
+// initial output streams; they are also recorded on the returned options so
+// tests can drive the CLI with buffers.
+func newRootCommand(stdout, stderr io.Writer) (*cobra.Command, *globalOptions) {
+	g := &globalOptions{stdout: stdout, stderr: stderr}
+
+	root := &cobra.Command{
+		Use:   "knarr",
+		Short: "OCI-native content delivery and mount engine for IoT/edge devices",
+		Long: "knarr pulls, verifies, and mounts OCI content as composefs images. It " +
+			"provides primitives — publish, pull, mount, unmount, ls, remove — and " +
+			"leaves version management and update orchestration to the upper-layer agent " +
+			"that drives it.",
+		Version:       version.String(),
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			g.stdout = cmd.OutOrStdout()
+			g.stderr = cmd.ErrOrStderr()
+			g.logger = cli.NewLogger(g.stderr, g.verbose, g.quiet)
+			slog.SetDefault(g.logger)
+			return nil
+		},
+	}
+
+	root.SetOut(stdout)
+	root.SetErr(stderr)
+	root.SetVersionTemplate("knarr {{.Version}}\n")
+	root.SetFlagErrorFunc(cli.FlagErrorFunc)
+
+	pf := root.PersistentFlags()
+	pf.StringVar(&g.root, "root", defaultRoot, "knarr data directory")
+	pf.StringVar(&g.overlayRoot, "overlay-root", "", "base for writable-mount upperdir/workdir (default <root>/overlays)")
+	pf.BoolVarP(&g.verbose, "verbose", "v", false, "enable debug logging on stderr")
+	pf.BoolVarP(&g.quiet, "quiet", "q", false, "suppress progress and non-error logging")
+
+	root.AddCommand(
+		newPublishCommand(g),
+		newPullCommand(g),
+		newMountCommand(g),
+		newUnmountCommand(g),
+		newLsCommand(g),
+		newRemoveCommand(g),
+	)
+	return root, g
+}
