@@ -13,9 +13,29 @@ knarr provides **primitives, not lifecycle policy**: `pull`, `verify`, `mount`,
 activation, rollback, or update-orchestration logic — those belong to the
 upper-layer agent that drives knarr.
 
-> **Status: early development.** This repository currently contains only project
-> governance and contribution scaffolding — there is no implementation yet.
-> Documentation for building, testing, and usage will be added as the code lands.
+> **Status: early development.** The CLI surface and engine API are taking shape;
+> the engine operations are still stubs. Usage documentation will follow as they
+> are implemented.
+
+## Development
+
+Development runs in a pinned dev container (`.devcontainer/`, built from the
+`Containerfile`) so the Go toolchain and linters match CI. It needs Docker and
+the [`devcontainer` CLI](https://github.com/devcontainers/cli):
+
+```sh
+./devshell.sh        # build/start the container and open a shell (removed on exit)
+./devshell.sh exec   # open another shell in the running container (left running)
+```
+
+Inside the shell, the make targets behave exactly as they do in CI:
+
+```sh
+make         # lint, vet, test, build (the default)
+make test    # unit tests
+make lint    # gofumpt + golangci-lint
+make build   # stripped binary into bin/
+```
 
 ## Contributing
 

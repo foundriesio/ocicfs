@@ -1,0 +1,14 @@
+{
+  "name": "knarr",
+  "build": {
+    "dockerfile": "../Containerfile",
+    "context": ".."
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.Go"
+      ]
+    }
+  }
+}
