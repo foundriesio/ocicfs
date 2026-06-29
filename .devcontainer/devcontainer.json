@@ -4,6 +4,10 @@
     "dockerfile": "../Containerfile",
     "context": ".."
   },
+  "runArgs": [
+    "--privileged"
+  ],
+  "postStartCommand": "/usr/local/bin/dev-entrypoint",
   "customizations": {
     "vscode": {
       "extensions": [
