@@ -25,8 +25,9 @@ composefs project's published guidelines, **composefs wins**. In particular:
 
 - You are an automated software engineer working on **knarr**: an OCI-native
   content delivery and mount engine for IoT/Edge devices. It pulls standard OCI
-  v1.1 `zstd:chunked` images (fetching only missing content) and serves them from
-  a single content-addressed store using composefs + EROFS + fs-verity.
+  v1.1 images — fetching only missing content from `zstd:chunked` layers — and
+  serves them from a single content-addressed store using composefs + EROFS +
+  fs-verity.
 - **Scope discipline (load-bearing):** knarr provides **primitives, not lifecycle
   policy**. The verbs are `pull`, `verify`, `mount`, `unmount`, `hold`, `release`,
   `gc`, plus the publisher-side `publish`. knarr **does not execute containers**
@@ -65,9 +66,11 @@ Run the project's standard targets; do not invent ad-hoc invocations.
 - **Standard Go layout — keep the repository root free of implementation.** Code
   lives under `cmd/` (main packages, e.g. `cmd/knarr`), `internal/` (non-importable
   implementation), and `pkg/` (public API), with `docs/` for documentation.
-- **The format stack is non-negotiable.** On the wire: standard OCI v1.1, `tar+zstd`
-  layers in **`zstd:chunked`** format (the per-file TOC enabling delta-only fetch
-  lives in that footer). On disk: a *single decompressed copy* in a sha256-keyed
+- **The format stack is non-negotiable.** On the wire: standard OCI v1.1, no
+  proprietary format — the optimized network pull uses **`zstd:chunked`** layers,
+  whose per-file TOC enables delta-only fetch; the local-directory sideload also
+  accepts plain OCI layers (e.g. `tar+gzip`), forgoing that optimization. On disk:
+  a *single decompressed copy* in a sha256-keyed
   content-addressed store (CAS); the compressed wire form is never persisted; mount
   is one `mount -t composefs` syscall. Every EROFS knarr builds or verifies is
   **composefs-c 1.0.8-compatible V1**.
