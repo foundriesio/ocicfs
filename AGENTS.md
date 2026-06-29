@@ -49,10 +49,9 @@ Run the project's standard targets; do not invent ad-hoc invocations.
 - Static analysis: `make vet` (`go vet ./...`) and `gofmt` (CI rejects unformatted
   code).
 - Privileged tests: the mount, fs-verity, and CAS-build paths perform `mount(2)`,
-  fs-verity ioctls, and loop-device operations, so they require **real root** or a
-  **full-mapping user namespace**. Run them via the project's privileged test
-  target (`sudo -E PATH=$PATH make root-test`, or `podman unshare make root-test`).
-  A single-id `unshare -Ur` map is insufficient (it breaks `chown`).
+  fs-verity ioctls, and loop-device operations, so they require elevated privilege
+  and an fs-verity-capable filesystem; run them in an environment that provides
+  both. Tests that cannot reach such an environment skip.
 
 ## 3. Go runtime & syntax constraints
 
