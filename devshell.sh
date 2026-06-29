@@ -1,7 +1,7 @@
-// Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
-// SPDX-License-Identifier: Apache-2.0
-
 #!/usr/bin/env bash
+#
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: Apache-2.0
 #
 # devshell.sh — open a shell in the knarr dev container (.devcontainer).
 #
@@ -20,6 +20,9 @@ DOCKER="${DOCKER:-docker}"
 
 case "${1:-}" in
 exec)
+    # Reset the cursor to column 0 first; some devcontainer CLI / terminal
+    # combinations leave it parked mid-line after their progress output.
+    printf '\r\033[K'
     exec devcontainer exec bash
     ;;
 "")
@@ -33,6 +36,9 @@ exec)
         "$DOCKER" rm -f "$container_id" >/dev/null 2>&1 || true
     }
     trap teardown EXIT INT TERM HUP
+    # devcontainer's in-place progress output can leave the cursor parked
+    # mid-line; reset it to column 0 so the shell prompt starts at the left.
+    printf '\r\033[K'
     devcontainer exec bash || true
     ;;
 *)
