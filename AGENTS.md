@@ -180,3 +180,30 @@ A change is complete only when, at minimum:
   (`go test -race ./...`).
 - Every new/changed Go file carries the Apache-2.0 SPDX header, and any new
   behavior is covered by tests.
+
+## 12. Engineering principles
+
+Apply KISS, YAGNI, DRY, and SOLID pragmatically: prefer the smallest readable
+change that meets the current requirement, and do not add abstractions, options,
+or extension points until something needs them now. For Go style, follow
+Effective Go and the Go Code Review Comments; in particular define interfaces on
+the consumer side and only when there is a real need (multiple implementations, a
+test seam, or a genuine architectural boundary), and avoid catch-all `utils`,
+`helpers`, and `common` packages.
+
+The practices below are the ones that matter most for a content-addressed,
+integrity-verified storage engine:
+
+- **Design from invariants.** State what must always be true and preserve it in
+  both code and tests.
+- **Define trust boundaries explicitly.** Mark data and components as trusted,
+  untrusted, authenticated, mutable, or attacker-controlled where it matters.
+- **Separate policy from mechanism.** knarr provides primitives, not lifecycle
+  policy; keep decision logic out of the execution mechanics.
+- **Design failure paths first.** Account for partial state, interrupted
+  execution, and power loss; make invalid states unrepresentable, and fail closed
+  with clear errors. Stubs must fail safely, never silently succeed.
+- **Treat formats as contracts.** The on-disk layout, metadata, and CLI behavior
+  are stability contracts; record meaningful decisions as ADRs under `docs/adr/`.
+- **Keep PRs review-shaped.** Separate refactoring from behavior changes, and
+  order commits so a reviewer meets the use case before the mechanics.
