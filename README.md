@@ -1,8 +1,8 @@
 # knarr
 
 An OCI-native content delivery and mount engine for IoT/Edge devices. knarr
-pulls standard OCI v1.1 images in **zstd:chunked** format — fetching only the
-content a device does not already have — and serves them from a single
+pulls standard OCI v1.1 images — fetching only the content a device does not
+already have, from **zstd:chunked** layers — and serves them from a single
 content-addressed store using **composefs + EROFS + fs-verity**, mounting a
 filesystem tree with one `mount` syscall instead of unpacking and stacking
 layers.
@@ -16,6 +16,13 @@ upper-layer agent that drives knarr.
 > **Status: early development.** The CLI surface and engine API are taking shape;
 > the engine operations are still stubs. Usage documentation will follow as they
 > are implemented.
+
+## Project docs
+
+- [Why knarr exists](docs/why.md): problem statement, requirements,
+  constraints, and non-goals.
+- [ADR 0001: High-level architecture](docs/adr/0001-high-level-architecture.md):
+  the accepted architecture boundary and load-bearing technical decisions.
 
 ## Development
 
