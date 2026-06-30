@@ -33,7 +33,33 @@ func TestValidateSHA256(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			checkErr(t, tt.digest, ValidateSHA256(digest.Digest(tt.digest)), tt.wantErr)
+			err := ValidateSHA256(digest.Digest(tt.digest))
+			checkErr(t, tt.digest, err, tt.wantErr)
+		})
+	}
+}
+
+// TestParseSHA256 covers the parse wrapper; the shared validation edges are
+// exercised by TestValidateSHA256.
+func TestParseSHA256(t *testing.T) {
+	valid := digest.FromString("hello").String()
+
+	tests := []struct {
+		name    string
+		digest  string
+		wantErr string
+	}{
+		{"valid", valid, ""},
+		{"unparseable", "not-a-digest", "invalid checksum digest format"},
+		{"non-sha256 algorithm", "sha512:" + strings.Repeat("a", 128), "unsupported digest algorithm"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d, err := ParseSHA256(tt.digest)
+			checkErr(t, tt.digest, err, tt.wantErr)
+			if tt.wantErr == "" && d.String() != tt.digest {
+				t.Fatalf("ParseSHA256(%q) = %q, want the input digest", tt.digest, d)
+			}
 		})
 	}
 }

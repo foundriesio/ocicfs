@@ -1,8 +1,8 @@
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package digestutil validates sha256 digests, the only digest algorithm
-// knarr's content-addressed store uses.
+// Package digestutil validates and parses sha256 digests, the only digest
+// algorithm knarr's content-addressed store uses.
 //
 // A digest is validated exactly where it is not yet trustworthy: where outside
 // bytes become a digest (a parsed reference, decoded JSON) and where a digest
@@ -16,6 +16,18 @@ import (
 
 	"github.com/opencontainers/go-digest"
 )
+
+// ParseSHA256 parses s and returns it only if it is a valid sha256 digest.
+func ParseSHA256(s string) (digest.Digest, error) {
+	d, err := digest.Parse(s)
+	if err != nil {
+		return "", err
+	}
+	if err := ValidateSHA256(d); err != nil {
+		return "", err
+	}
+	return d, nil
+}
 
 // ValidateSHA256 rejects a digest that is malformed or whose algorithm is not
 // sha256. Checking the algorithm before Validate keeps the "non-sha256" verdict
