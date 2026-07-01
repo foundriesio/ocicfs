@@ -6,9 +6,9 @@
 # and by the CI workflow (via the devcontainers/ci action) for build/test/lint,
 # so the Go toolchain and lint tooling are identical for developers and CI.
 #
-# Stage 1 (composefs-builder) compiles mkcomposefs from a pinned composefs
+# Stage 1 (composefs-builder) compiles composefs tools from a pinned composefs
 # release. Stage 2 (the dev image) inherits the Go toolchain base, copies the
-# mkcomposefs artifacts across, and adds the loop-device / ext4 tooling the
+# composefs artifacts across, and adds the loop-device / ext4 tooling the
 # privileged fs-verity end-to-end tests need. The entrypoint mounts a
 # loop-backed ext4 filesystem with the verity feature so those tests get real
 # fs-verity; run the container privileged for that to succeed.
@@ -17,7 +17,7 @@ ARG GO_VERSION=1.26.1
 ARG DEBIAN_RELEASE=bookworm
 
 # ------------------------------------------------------------------
-# Stage 1 — composefs-builder: build mkcomposefs from the pinned release.
+# Stage 1 — composefs-builder: build composefs tools from the pinned release.
 # ------------------------------------------------------------------
 FROM debian:${DEBIAN_RELEASE}-slim AS composefs-builder
 
@@ -81,16 +81,18 @@ RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/ins
     | sh -s -- -b "$(go env GOPATH)/bin" "${GOLANGCI_LINT_VERSION}" \
  && golangci-lint --version
 
-# Pull mkcomposefs + composefs-info + libcomposefs.so from the builder stage.
+# Pull mkcomposefs + mount.composefs + composefs-info + libcomposefs.so from the builder stage.
 # ldconfig rebuilds the linker cache so the shared library is discoverable; the
 # smoke tests confirm the binaries are on PATH and link against it. composefs-info
 # inspects and measures a built image; the EROFS round-trip test uses its dump and
 # measure-file modes to assert WriteImage reproduces the upstream tool's output.
 COPY --from=composefs-builder /out/usr/bin/mkcomposefs /usr/bin/mkcomposefs
+COPY --from=composefs-builder /out/usr/sbin/mount.composefs /usr/bin/mount.composefs
 COPY --from=composefs-builder /out/usr/bin/composefs-info /usr/bin/composefs-info
 COPY --from=composefs-builder /out/usr/lib/ /usr/lib/
 RUN ldconfig \
  && command -v mkcomposefs >/dev/null \
+ && command -v mount.composefs >/dev/null \
  && command -v composefs-info >/dev/null \
  && ldd /usr/bin/mkcomposefs | grep -q libcomposefs
 

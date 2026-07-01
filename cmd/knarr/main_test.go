@@ -71,12 +71,39 @@ func TestRunUnknownSubcommand(t *testing.T) {
 
 func TestRunSubcommandNotImplemented(t *testing.T) {
 	var out, errOut bytes.Buffer
-	code := run(context.Background(), []string{"mount", "example.com/foo:v1", "/mnt/foo"}, &out, &errOut)
+	code := run(context.Background(), []string{"publish", "dir", "example.com/team/app:latest"}, &out, &errOut)
 	if code != 1 {
 		t.Errorf("exit code = %d, want 1", code)
 	}
 	if !strings.Contains(errOut.String(), "not implemented") {
 		t.Errorf("stderr = %q, want it to mention not implemented", errOut.String())
+	}
+}
+
+func TestRunMountRWReportsUnsupported(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := run(context.Background(), []string{
+		"--root", t.TempDir(),
+		"mount", "--rw", "app@sha256:" + strings.Repeat("a", 64), t.TempDir(),
+	}, &out, &errOut)
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(errOut.String(), "writable mounts are not supported") {
+		t.Errorf("stderr = %q, want writable unsupported", errOut.String())
+	}
+}
+
+func TestRunUnmountDispatchesToEngine(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var out, errOut bytes.Buffer
+	code := run(ctx, []string{"unmount", "/mnt/knarr-test"}, &out, &errOut)
+	if code != 130 {
+		t.Errorf("exit code = %d, want 130", code)
+	}
+	if !strings.Contains(errOut.String(), "cancelled") {
+		t.Errorf("stderr = %q, want cancellation", errOut.String())
 	}
 }
 
