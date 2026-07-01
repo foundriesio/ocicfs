@@ -3,9 +3,8 @@
 
 // Command knarr is the command-line front end for the knarr content delivery
 // and mount engine. It dispatches a small set of primitive verbs (publish,
-// pull, mount, unmount, ls, remove) to the knarr engine. At this stage the
-// engine operations are stubs that return "not implemented"; the wiring
-// establishes the CLI surface, output contract, and dispatch.
+// pull, mount, unmount, ls, remove) to the knarr engine. Local-layout pull is
+// wired; operations that are still stubs return "not implemented".
 package main
 
 import (

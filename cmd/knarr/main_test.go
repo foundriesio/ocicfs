@@ -62,7 +62,7 @@ func TestRunUnknownSubcommand(t *testing.T) {
 
 func TestRunSubcommandNotImplemented(t *testing.T) {
 	var out, errOut bytes.Buffer
-	code := run(context.Background(), []string{"pull", "example.com/foo:v1"}, &out, &errOut)
+	code := run(context.Background(), []string{"mount", "example.com/foo:v1", "/mnt/foo"}, &out, &errOut)
 	if code != 1 {
 		t.Errorf("exit code = %d, want 1", code)
 	}

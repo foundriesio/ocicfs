@@ -24,7 +24,6 @@ func TestEngineStubReturnsNotImplemented(t *testing.T) {
 
 	calls := map[string]func() error{
 		"Publish": func() error { return eng.Publish(ctx, "dir", "dest") },
-		"Pull":    func() error { _, err := eng.Pull(ctx, "ref"); return err },
 		"Mount":   func() error { return eng.Mount(ctx, "ref", "target") },
 		"Unmount": func() error { return eng.Unmount(ctx, "target") },
 		"List":    func() error { _, err := eng.List(ctx); return err },

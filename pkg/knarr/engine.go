@@ -14,15 +14,22 @@ package knarr
 import (
 	"context"
 	"errors"
+	"fmt"
+
+	"github.com/foundriesio/knarr/internal/imagestore"
+	"github.com/foundriesio/knarr/internal/objectstore"
+	"github.com/foundriesio/knarr/internal/refstore"
 )
 
 // Image describes an image present in the local store.
 type Image struct {
 	// Ref is the local reference the image is stored under.
 	Ref string
-	// Digest is the image manifest digest, e.g. "sha256:…".
+	// Digest is the pinned OCI root digest (an image manifest or an image
+	// index), e.g. "sha256:…".
 	Digest string
-	// Size is the on-disk size of the image's content, in bytes.
+	// Size is the size of the image's composefs image object, in bytes; file
+	// content shared in the object store is not counted.
 	Size int64
 }
 
@@ -150,10 +157,32 @@ type Config struct {
 	OverlayRoot string
 }
 
-// New returns an Engine backed by the store under cfg.Root.
+// engine is the default Engine backed by a local knarr data root.
+type engine struct {
+	root        string
+	overlayRoot string
+	obj         *objectstore.Store
+	img         *imagestore.Store
+	refs        *refstore.Store
+}
+
+// New returns an Engine backed by the store under cfg.Root, creating the
+// store's directories on first use.
 func New(cfg Config) (Engine, error) {
 	if cfg.Root == "" {
 		return nil, errors.New("knarr: empty root directory")
 	}
-	return &engine{}, nil
+	obj, err := objectstore.New(cfg.Root)
+	if err != nil {
+		return nil, fmt.Errorf("knarr: open object store: %w", err)
+	}
+	img, err := imagestore.New(cfg.Root)
+	if err != nil {
+		return nil, fmt.Errorf("knarr: open image store: %w", err)
+	}
+	refs, err := refstore.New(cfg.Root)
+	if err != nil {
+		return nil, fmt.Errorf("knarr: open ref store: %w", err)
+	}
+	return &engine{root: cfg.Root, overlayRoot: cfg.OverlayRoot, obj: obj, img: img, refs: refs}, nil
 }
