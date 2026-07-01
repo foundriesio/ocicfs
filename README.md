@@ -13,9 +13,9 @@ knarr provides **primitives, not lifecycle policy**: `pull`, `verify`, `mount`,
 activation, rollback, or update-orchestration logic — those belong to the
 upper-layer agent that drives knarr.
 
-> **Status: early development.** The CLI surface and engine API are taking shape;
-> the engine operations are still stubs. Usage documentation will follow as they
-> are implemented.
+> **Status: early development.** The CLI surface and engine API are taking shape.
+> `pull` from a local OCI layout is wired end to end; the remaining verbs are
+> still being implemented.
 
 ## Project docs
 
@@ -23,6 +23,10 @@ upper-layer agent that drives knarr.
   constraints, and non-goals.
 - [ADR 0001: High-level architecture](docs/adr/0001-high-level-architecture.md):
   the accepted architecture boundary and load-bearing technical decisions.
+- [Pulling from a local OCI layout](docs/pull.md): how to run
+  `knarr pull --from-dir`.
+- [On-disk store layout](docs/on-disk-layout.md): what a pull writes under the
+  data root.
 
 ## Development
 
