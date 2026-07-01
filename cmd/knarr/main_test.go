@@ -7,10 +7,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"os"
+	"os/exec"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
+
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/foundriesio/knarr/internal/devtest"
+	"github.com/foundriesio/knarr/internal/octest"
 )
 
 func TestCommandsCoverM1Verbs(t *testing.T) {
@@ -99,6 +108,65 @@ func TestRunInvalidFormatIsUsageError(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "invalid format") {
 		t.Errorf("stderr = %q, want it to mention invalid format", errOut.String())
+	}
+}
+
+// TestRunPullFromDirE2E drives a real `knarr pull --from-dir` through the command
+// front end: it exercises flag binding, engine construction from --root, and the
+// --format json output contract end to end, against a local OCI layout. It is
+// verity-gated because the pull seals content with fs-verity.
+func TestRunPullFromDirE2E(t *testing.T) {
+	storeRoot, cleanup, err := devtest.VerityRoot()
+	if errors.Is(err, devtest.ErrNoVerity) {
+		t.Skipf("verity-capable store root unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("VerityRoot: %v", err)
+	}
+	t.Cleanup(cleanup)
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+
+	platform := ocispec.Platform{OS: runtime.GOOS, Architecture: runtime.GOARCH}
+	lay, err := octest.BuildSingleLayerGzip(t.TempDir(), platform,
+		octest.File{Name: "etc/config.txt", Mode: 0o644, Body: "hello from knarr\n"},
+	)
+	if err != nil {
+		t.Fatalf("build layout: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := run(context.Background(), []string{
+		"--root", storeRoot,
+		"pull", "--from-dir", lay.Dir, "--format", "json", lay.Ref,
+	}, &out, &errOut)
+	if code != 0 {
+		if strings.Contains(errOut.String(), "fs-verity") {
+			t.Skipf("fs-verity unsupported on the test filesystem: %s", errOut.String())
+		}
+		t.Fatalf("exit code = %d, stderr = %q", code, errOut.String())
+	}
+
+	var got struct {
+		Ref    string `json:"ref"`
+		Digest string `json:"digest"`
+		Size   int64  `json:"size"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not JSON: %v; out=%q", err, out.String())
+	}
+	if got.Ref != lay.Ref {
+		t.Errorf("ref = %q, want %q", got.Ref, lay.Ref)
+	}
+	if got.Digest != lay.Root.String() {
+		t.Errorf("digest = %q, want %s", got.Digest, lay.Root)
+	}
+	if got.Size <= 0 {
+		t.Errorf("size = %d, want > 0", got.Size)
+	}
+	if _, err := os.Stat(octest.BindingPath(storeRoot, lay.Root, lay.Platform)); err != nil {
+		t.Errorf("binding not written by CLI pull: %v", err)
 	}
 }
 
