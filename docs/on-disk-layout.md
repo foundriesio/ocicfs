@@ -56,6 +56,13 @@ or rebuilding, and records the locally measured fs-verity digest:
 }
 ```
 
+At mount time, knarr reads the host-platform binding for the pinned root digest,
+opens the referenced composefs image from `objects/sha256`, re-measures that
+image object's fs-verity digest, and requires it to match `rootfs.fsverity.digest`
+before mounting. The mount uses `objects/sha256` as the composefs basedir, so
+regular-file redirects in the image resolve to the same content-addressed objects
+written by pull.
+
 ## `refs/` — reference records (auxiliary)
 
 One JSON file per reference, keyed by `sha256(exact ref string)` (the ref is

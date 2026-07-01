@@ -80,4 +80,4 @@ See [on-disk-layout.md](on-disk-layout.md) for the full tree and JSON schemas.
 - **Idempotent.** Objects are content-addressed and committed without replacement,
   so re-pulling the same image transfers nothing new.
 - **Mount is separate.** Pull only materializes content into the store; mounting it
-  is a distinct step (not yet implemented).
+  is a distinct step with `knarr mount`.
