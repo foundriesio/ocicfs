@@ -33,6 +33,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -46,6 +47,10 @@ import (
 const (
 	bindingSchema = "application/vnd.knarr.cfs-binding.v1+json"
 )
+
+// ErrNotFound reports that no prepared-image binding exists for a root digest
+// and platform.
+var ErrNotFound = errors.New("imagestore: binding not found")
 
 // Store writes prepared-image bindings under the knarr store root.
 type Store struct {
@@ -68,19 +73,15 @@ func New(root string) (*Store, error) {
 
 // Put writes images/sha256/<root-xx>/<root-rest>/<platform>.json atomically.
 func (s *Store) Put(root digest.Digest, p ocispec.Platform, b Binding) error {
-	if err := digestutil.ValidateSHA256(root); err != nil {
-		return fmt.Errorf("imagestore: root digest: %w", err)
-	}
 	fsv, err := digestutil.ParseSHA256(b.FsverityDigest)
 	if err != nil {
 		return fmt.Errorf("imagestore: fs-verity digest: %w", err)
 	}
-	platform, filename, err := platformPath(p)
+	path, platform, err := s.bindingPath(root, p)
 	if err != nil {
 		return err
 	}
 
-	dir := filepath.Join(s.root, "images", "sha256", root.Hex()[:2], root.Hex()[2:])
 	doc := bindingDoc{
 		Schema:   bindingSchema,
 		Platform: platform,
@@ -105,13 +106,44 @@ func (s *Store) Put(root digest.Digest, p ocispec.Platform, b Binding) error {
 	}
 	data = append(data, '\n')
 
-	if err := durable.MkdirAll(dir, 0o755); err != nil {
+	if err := durable.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("imagestore: create binding dir: %w", err)
 	}
-	if err := durable.WriteFile(filepath.Join(dir, filename+".json"), data, 0o644); err != nil {
+	if err := durable.WriteFile(path, data, 0o644); err != nil {
 		return fmt.Errorf("imagestore: write binding: %w", err)
 	}
 	return nil
+}
+
+// Get reads images/sha256/<root-xx>/<root-rest>/<platform>.json.
+func (s *Store) Get(root digest.Digest, p ocispec.Platform) (Binding, error) {
+	path, platform, err := s.bindingPath(root, p)
+	if err != nil {
+		return Binding{}, err
+	}
+	data, err := os.ReadFile(path) // #nosec G304 -- digest- and platform-derived binding path
+	if errors.Is(err, os.ErrNotExist) {
+		return Binding{}, ErrNotFound
+	}
+	if err != nil {
+		return Binding{}, fmt.Errorf("imagestore: read binding: %w", err)
+	}
+
+	var doc bindingDoc
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return Binding{}, fmt.Errorf("imagestore: decode binding: %w", err)
+	}
+	if err := validateBinding(doc, platform); err != nil {
+		return Binding{}, err
+	}
+	return Binding{
+		Descriptor: ocispec.Descriptor{
+			MediaType: doc.RootFS.Descriptor.MediaType,
+			Digest:    doc.RootFS.Descriptor.Digest,
+			Size:      doc.RootFS.Descriptor.Size,
+		},
+		FsverityDigest: doc.RootFS.Fsverity.Digest.String(),
+	}, nil
 }
 
 // The on-disk binding JSON documents.
@@ -153,6 +185,45 @@ type (
 		Source string        `json:"source"`
 	}
 )
+
+func (s *Store) bindingPath(root digest.Digest, p ocispec.Platform) (string, platformDoc, error) {
+	if err := digestutil.ValidateSHA256(root); err != nil {
+		return "", platformDoc{}, fmt.Errorf("imagestore: root digest: %w", err)
+	}
+	platform, filename, err := platformPath(p)
+	if err != nil {
+		return "", platformDoc{}, err
+	}
+	path := filepath.Join(s.root, "images", "sha256", root.Hex()[:2], root.Hex()[2:], filename+".json")
+	return path, platform, nil
+}
+
+func validateBinding(doc bindingDoc, wantPlatform platformDoc) error {
+	if doc.Schema != bindingSchema {
+		return fmt.Errorf("imagestore: unsupported binding schema %q", doc.Schema)
+	}
+	if doc.Platform != wantPlatform {
+		return fmt.Errorf("imagestore: binding platform mismatch: got %#v, want %#v", doc.Platform, wantPlatform)
+	}
+	if doc.RootFS.Type != "composefs" {
+		return fmt.Errorf("imagestore: unsupported rootfs type %q", doc.RootFS.Type)
+	}
+	if doc.RootFS.ObjectStore.Type != "composefs-digest-store" ||
+		doc.RootFS.ObjectStore.Algorithm != "sha256" ||
+		doc.RootFS.ObjectStore.Path != "objects/sha256" {
+		return fmt.Errorf("imagestore: unsupported object store %#v", doc.RootFS.ObjectStore)
+	}
+	if doc.RootFS.Fsverity.Mode != "required" || doc.RootFS.Fsverity.Source != "local-measurement" {
+		return fmt.Errorf("imagestore: unsupported fs-verity policy %#v", doc.RootFS.Fsverity)
+	}
+	if err := digestutil.ValidateSHA256(doc.RootFS.Descriptor.Digest); err != nil {
+		return fmt.Errorf("imagestore: descriptor digest: %w", err)
+	}
+	if err := digestutil.ValidateSHA256(doc.RootFS.Fsverity.Digest); err != nil {
+		return fmt.Errorf("imagestore: fs-verity digest: %w", err)
+	}
+	return nil
+}
 
 func platformPath(p ocispec.Platform) (platformDoc, string, error) {
 	arch := strings.ToLower(p.Architecture)

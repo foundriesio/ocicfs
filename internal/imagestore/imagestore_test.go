@@ -5,8 +5,10 @@ package imagestore
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/opencontainers/go-digest"
@@ -56,6 +58,14 @@ func TestPutWritesBinding(t *testing.T) {
 	}
 	if got.RootFS.Fsverity.Mode != "required" || got.RootFS.Fsverity.Digest != fsv || got.RootFS.Fsverity.Source != "local-measurement" {
 		t.Fatalf("fsverity = %#v", got.RootFS.Fsverity)
+	}
+
+	binding, err := s.Get(root, ocispec.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if binding.Descriptor.Digest != cfs || binding.Descriptor.Size != 123 || binding.FsverityDigest != fsv.String() {
+		t.Fatalf("Get = %#v", binding)
 	}
 }
 
@@ -129,5 +139,47 @@ func TestPutRejectsInvalidInputs(t *testing.T) {
 				t.Fatal("expected error")
 			}
 		})
+	}
+}
+
+func TestGetMissingReturnsErrNotFound(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = s.Get(digest.SHA256.FromString("root"), ocispec.Platform{OS: "linux", Architecture: "amd64"})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestGetRejectsInvalidBinding(t *testing.T) {
+	root := digest.SHA256.FromString("root")
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.Put(root, ocispec.Platform{OS: "linux", Architecture: "amd64"}, Binding{
+		Descriptor:     ocispec.Descriptor{Digest: digest.SHA256.FromString("composefs")},
+		FsverityDigest: digest.SHA256.FromString("verity").String(),
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	path, _, err := s.bindingPath(root, ocispec.Platform{OS: "linux", Architecture: "amd64"})
+	if err != nil {
+		t.Fatalf("bindingPath: %v", err)
+	}
+	data, err := os.ReadFile(path) // #nosec G304 -- test reads a path it wrote
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	data = []byte(strings.Replace(string(data), `"digest":"sha256:`, `"digest":"sha512:`, 1))
+	if err := os.WriteFile(path, data, 0o644); err != nil { // #nosec G703 -- test rewrites a path it wrote
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := s.Get(root, ocispec.Platform{OS: "linux", Architecture: "amd64"}); err == nil {
+		t.Fatal("expected error")
 	}
 }
