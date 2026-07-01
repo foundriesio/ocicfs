@@ -31,6 +31,7 @@ import (
 	"github.com/opencontainers/go-digest"
 	"golang.org/x/sys/unix"
 
+	"github.com/foundriesio/knarr/internal/digestutil"
 	"github.com/foundriesio/knarr/internal/verity"
 )
 
@@ -57,6 +58,19 @@ func New(root string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// ObjectPath returns the CAS path for stored object d.
+func (s *Store) ObjectPath(d digest.Digest) (string, error) {
+	if err := digestutil.ValidateSHA256(d); err != nil {
+		return "", fmt.Errorf("objectstore: object digest: %w", err)
+	}
+	return s.objectPath(d.Hex()), nil
+}
+
+// ObjectsDir returns the composefs backing-object directory.
+func (s *Store) ObjectsDir() string {
+	return s.objectPath("")
 }
 
 // CheckVerity verifies the store filesystem can enable fs-verity, which knarr
@@ -283,10 +297,10 @@ func commitNoReplace(tempPath, finalPath string) error {
 
 // VerityDigest returns the measured fs-verity digest of the stored object d.
 func (s *Store) VerityDigest(d digest.Digest) (string, error) {
-	if d.Algorithm() != digest.SHA256 {
-		return "", fmt.Errorf("objectstore: unsupported digest algorithm %s", d.Algorithm())
+	path, err := s.ObjectPath(d)
+	if err != nil {
+		return "", err
 	}
-	path := s.objectPath(d.Hex())
 	f, err := os.Open(path) // #nosec G304 -- digest-derived object-store path
 	if err != nil {
 		return "", fmt.Errorf("objectstore: open %s: %w", path, err)

@@ -156,3 +156,23 @@ func TestWriteBlobRoundTrip(t *testing.T) {
 		t.Fatal("expected digest-mismatch error")
 	}
 }
+
+func TestObjectPaths(t *testing.T) {
+	s := newTestStore(t)
+	d := digest.SHA256.FromString("object")
+
+	path, err := s.ObjectPath(d)
+	if err != nil {
+		t.Fatalf("ObjectPath: %v", err)
+	}
+	want := filepath.Join(s.root, "objects", "sha256", d.Hex()[:2], d.Hex()[2:])
+	if path != want {
+		t.Fatalf("ObjectPath = %q, want %q", path, want)
+	}
+	if got := s.ObjectsDir(); got != filepath.Join(s.root, "objects", "sha256") {
+		t.Fatalf("ObjectsDir = %q", got)
+	}
+	if _, err := s.ObjectPath(digest.Digest("sha512:abc")); err == nil {
+		t.Fatal("expected invalid digest error")
+	}
+}
