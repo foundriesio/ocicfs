@@ -3,16 +3,16 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: Apache-2.0
 #
-# knarr smoke test: pull a real image from a local OCI layout, mount it read-only,
-# then mount its metadata alone and serve the data through a consumer-assembled overlay.
+# knarr smoke test: exercise the local image lifecycle against a real image.
 #
-# Drives the built knarr binary through the pull --from-dir -> mount -> unmount happy
-# path against a real image, then through mount --metadata-only with the overlay a
-# writable consumer assembles over it (objects/sha256 as the data-only lowerdir,
-# verity=require), so the currently implemented functionality can be checked
-# by hand in one command. It needs a privileged, fs-verity-capable environment with
-# mkcomposefs and mount.composefs on PATH -- i.e. the dev container. Either open the
-# dev container and run the target inside it:
+# Drives the built knarr binary through pull --from-dir -> ls -> mount ->
+# unmount, then through mount --metadata-only with the overlay a writable
+# consumer assembles over it (objects/sha256 as the data-only lowerdir,
+# verity=require), and finally remove, so the currently implemented
+# functionality can be checked by hand in one command. It needs a privileged,
+# fs-verity-capable environment with mkcomposefs and mount.composefs on PATH
+# -- i.e. the dev container. Either open the dev container and run the target
+# inside it:
 #
 #   ./devshell.sh                # opens a shell in the dev container; then: make smoke
 #
@@ -61,6 +61,12 @@ ref="smoke@$(jq -r '.manifests[0].digest' "$LAYOUT/index.json")"
 
 echo "== pull =="
 "${KN[@]}" pull --from-dir "$LAYOUT" "$ref"
+
+echo "== ls (expect the pulled image) =="
+listed="$("${KN[@]}" ls)"
+printf '%s\n' "$listed"
+printf '%s\n' "$listed" | grep -qF "$ref" || fail "ls did not list $ref after pull"
+
 echo "== mount =="
 "${KN[@]}" mount "$ref" "$MNT"
 echo "== mounted rootfs (expect non-empty, read-only) =="
@@ -92,4 +98,11 @@ touch "$OVL/merged/.smoke-rw-probe" || fail "merged overlay is not writable"
 "${KN[@]}" unmount "$OVL/meta"
 [ -z "$(ls -A "$OVL/meta")" ] || fail "metadata mountpoint not empty after unmount"
 
-echo "SMOKE OK: pull --from-dir -> mount -> unmount -> metadata-only overlay (checks passed)"
+echo "== remove =="
+"${KN[@]}" remove "$ref"
+echo "== ls (expect the image gone) =="
+listed="$("${KN[@]}" ls)"
+printf '%s\n' "$listed"
+if printf '%s\n' "$listed" | grep -qF "$ref"; then fail "ls still lists $ref after remove"; fi
+
+echo "SMOKE OK: pull -> ls -> mount -> unmount -> metadata-only overlay -> remove (checks passed)"

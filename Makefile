@@ -73,7 +73,7 @@ lint:
 fmt:
 	$(GOLANGCI_LINT) fmt
 
-# smoke runs the pull --from-dir -> mount -> unmount happy path against a real image,
+# smoke runs the pull --from-dir -> ls -> mount -> unmount -> remove lifecycle against a real image,
 # for a quick by-hand check of the implemented functionality. Run it inside the
 # privileged dev container (fs-verity + mkcomposefs + mount.composefs), e.g.:
 #   ./devshell.sh                                              # then: make smoke
