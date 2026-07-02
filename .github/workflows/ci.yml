@@ -27,11 +27,22 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
+      # Cache the smoke test's OCI layout so a docker.io outage or anonymous
+      # rate limit cannot fail the job: the image is pinned by index digest, so
+      # the cache never goes stale and the registry is contacted at most once
+      # per arch.
+      - uses: actions/cache@v4
+        with:
+          path: .smoke-layout
+          key: smoke-layout-${{ matrix.arch }}-fd8d9aa63ba2
       # Run the make targets inside the same dev container developers use
       # (.devcontainer), so the toolchain is identical locally and in CI.
       - uses: devcontainers/ci@v0.3
         with:
-          runCmd: make build test
+          runCmd: >-
+            SMOKE_IMAGE=docker.io/library/busybox@sha256:fd8d9aa63ba2f0982b5304e1ee8d3b90a210bc1ffb5314d980eb6962f1a9715d
+            SMOKE_LAYOUT="$PWD/.smoke-layout"
+            make build test smoke
           push: never
 
   lint:
