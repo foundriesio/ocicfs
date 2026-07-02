@@ -5,8 +5,10 @@ package refstore
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -96,4 +98,156 @@ func TestPutReplacesAtomically(t *testing.T) {
 	if got.Resolved.Digest != second.Digest || got.PulledAt != "1970-01-01T00:00:01Z" {
 		t.Fatalf("ref was not replaced: %#v", got)
 	}
+}
+
+func TestGetRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	s, err := New(root)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ref := "app@sha256:abc"
+	resolved := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    digest.SHA256.FromString("root"),
+		Size:      12,
+	}
+	pulledAt := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+	if err := s.Put(ref, resolved, pulledAt, []string{"linux/amd64"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	got, err := s.Get(ref)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Ref != ref || got.Resolved.Digest != resolved.Digest || got.Resolved.Size != resolved.Size {
+		t.Fatalf("record = %#v", got)
+	}
+	if !got.PulledAt.Equal(pulledAt) {
+		t.Fatalf("pulledAt = %s, want %s", got.PulledAt, pulledAt)
+	}
+	if len(got.Platforms) != 1 || got.Platforms[0] != "linux/amd64" {
+		t.Fatalf("platforms = %#v", got.Platforms)
+	}
+}
+
+func TestListReturnsSortedRecords(t *testing.T) {
+	root := t.TempDir()
+	s, err := New(root)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	resolved := ocispec.Descriptor{Digest: digest.SHA256.FromString("root"), Size: 1}
+	for _, ref := range []string{"z@sha256:def", "a@sha256:abc"} {
+		if err := s.Put(ref, resolved, time.Unix(0, 0).UTC(), []string{"linux/amd64"}); err != nil {
+			t.Fatalf("Put %s: %v", ref, err)
+		}
+	}
+
+	got, err := s.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2", len(got))
+	}
+	if got[0].Ref != "a@sha256:abc" || got[1].Ref != "z@sha256:def" {
+		t.Fatalf("records not sorted: %#v", got)
+	}
+}
+
+func TestListEmptyStore(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	got, err := s.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("List len = %d, want empty", len(got))
+	}
+}
+
+func TestDeleteThenGetReturnsErrNotFound(t *testing.T) {
+	root := t.TempDir()
+	s, err := New(root)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ref := "app@sha256:abc"
+	if err := s.Put(ref, ocispec.Descriptor{Digest: digest.SHA256.FromString("root")}, time.Unix(0, 0).UTC(), []string{"linux/amd64"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := s.Delete(ref); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := s.Get(ref); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get error = %v, want ErrNotFound", err)
+	}
+	if err := s.Delete(ref); err != nil {
+		t.Fatalf("Delete absent: %v", err)
+	}
+}
+
+func TestListSkipsMalformedRecord(t *testing.T) {
+	root := t.TempDir()
+	s, err := New(root)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.Put("app:v1", ocispec.Descriptor{
+		MediaType: "application/vnd.oci.image.manifest.v1+json",
+		Digest:    digest.FromString("resolved"),
+		Size:      42,
+	}, time.Unix(1720000000, 0).UTC(), []string{"linux/amd64"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	dir := filepath.Join(root, "refs", "sha256", "aa")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	path := filepath.Join(dir, strings.Repeat("b", 62)+".json")
+	if err := os.WriteFile(path, []byte(`{"schema":"wrong"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	records, err := s.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(records) != 1 || records[0].Ref != "app:v1" {
+		t.Fatalf("records = %#v, want only the valid app:v1 record", records)
+	}
+}
+
+func TestGetRejectsInvalidRecord(t *testing.T) {
+	root := t.TempDir()
+	s, err := New(root)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ref := "app@sha256:abc"
+	if err := s.Put(ref, ocispec.Descriptor{Digest: digest.SHA256.FromString("root")}, time.Unix(0, 0).UTC(), []string{"linux/amd64"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	data, err := os.ReadFile(octestRefPath(root, ref))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	data = []byte(strings.Replace(string(data), `"digest":"sha256:`, `"digest":"sha512:`, 1))
+	if err := os.WriteFile(octestRefPath(root, ref), data, 0o644); err != nil { // #nosec G703 -- test rewrites a path it wrote
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := s.Get(ref); err == nil {
+		t.Fatal("expected invalid digest error")
+	}
+}
+
+func octestRefPath(root, ref string) string {
+	refKey := key(ref)
+	return filepath.Join(root, "refs", "sha256", refKey.Encoded()[:2], refKey.Encoded()[2:]+".json")
 }
