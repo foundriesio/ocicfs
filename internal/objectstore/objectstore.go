@@ -73,6 +73,37 @@ func (s *Store) ObjectsDir() string {
 	return s.objectPath("")
 }
 
+// Open returns a reader over the stored object d. The caller must close it. A
+// missing object surfaces as an error satisfying errors.Is(err, os.ErrNotExist).
+func (s *Store) Open(d digest.Digest) (io.ReadCloser, error) {
+	path, err := s.ObjectPath(d)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0) // #nosec G304 -- digest-derived object path
+	if err != nil {
+		return nil, fmt.Errorf("objectstore: open object %s: %w", d, err)
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		closeErr := f.Close()
+		err = fmt.Errorf("objectstore: stat object %s: %w", d, err)
+		if closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("objectstore: close object %s: %w", d, closeErr))
+		}
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		closeErr := f.Close()
+		err := fmt.Errorf("objectstore: object %s is not a regular file", d)
+		if closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("objectstore: close object %s: %w", d, closeErr))
+		}
+		return nil, err
+	}
+	return f, nil
+}
+
 // CheckVerity verifies the store filesystem can enable fs-verity, which knarr
 // requires for every content object. It enables verity on a throwaway probe file
 // so a pull fails fast with a clear error when the store is on a filesystem

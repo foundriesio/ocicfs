@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -174,5 +175,54 @@ func TestObjectPaths(t *testing.T) {
 	}
 	if _, err := s.ObjectPath(digest.Digest("sha512:abc")); err == nil {
 		t.Fatal("expected invalid digest error")
+	}
+}
+
+func TestOpenRejectsBadDigest(t *testing.T) {
+	s := newTestStore(t)
+	tests := []struct {
+		name string
+		d    digest.Digest
+	}{
+		{"empty", ""},
+		{"non-sha256", digest.Digest("sha512:" + strings.Repeat("a", 128))},
+		{"malformed", digest.Digest("sha256:zz")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := s.Open(tt.d); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestOpenMissingObject(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.Open(digest.SHA256.FromString("absent")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Open of a missing object: got %v, want os.ErrNotExist", err)
+	}
+}
+
+func TestOpenRoundTrip(t *testing.T) {
+	s := newVerityStore(t)
+	content := []byte("metadata blob bytes")
+	d := digest.SHA256.FromBytes(content)
+	err := s.WriteBlob(context.Background(), d, bytes.NewReader(content))
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("WriteBlob: %v", err)
+	}
+	rc, err := s.Open(d)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("read back %q, want %q", got, content)
 	}
 }
