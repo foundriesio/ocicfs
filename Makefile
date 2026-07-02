@@ -73,6 +73,15 @@ lint:
 fmt:
 	$(GOLANGCI_LINT) fmt
 
+# smoke runs the pull --from-dir -> mount -> unmount happy path against a real image,
+# for a quick by-hand check of the implemented functionality. Run it inside the
+# privileged dev container (fs-verity + mkcomposefs + mount.composefs), e.g.:
+#   ./devshell.sh                                              # then: make smoke
+#   docker run --rm --privileged -v "$PWD":/work knarr-dev make smoke
+.PHONY: smoke
+smoke: build
+	./scripts/smoke.sh
+
 # clean removes build artifacts.
 .PHONY: clean
 clean:
