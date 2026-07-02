@@ -153,6 +153,37 @@ func TestGetMissingReturnsErrNotFound(t *testing.T) {
 	}
 }
 
+func TestDeleteRemovesBinding(t *testing.T) {
+	root := digest.SHA256.FromString("root")
+	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.Put(root, platform, Binding{
+		Descriptor:     ocispec.Descriptor{Digest: digest.SHA256.FromString("composefs")},
+		FsverityDigest: digest.SHA256.FromString("verity").String(),
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := s.Delete(root, platform); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := s.Get(root, platform); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestDeleteMissingIsOK(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.Delete(digest.SHA256.FromString("root"), ocispec.Platform{OS: "linux", Architecture: "amd64"}); err != nil {
+		t.Fatalf("Delete missing: %v", err)
+	}
+}
+
 func TestGetRejectsInvalidBinding(t *testing.T) {
 	root := digest.SHA256.FromString("root")
 	s, err := New(t.TempDir())

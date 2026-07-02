@@ -44,14 +44,6 @@ import (
 	"github.com/foundriesio/knarr/internal/durable"
 )
 
-const (
-	bindingSchema = "application/vnd.knarr.cfs-binding.v1+json"
-)
-
-// ErrNotFound reports that no prepared-image binding exists for a root digest
-// and platform.
-var ErrNotFound = errors.New("imagestore: binding not found")
-
 // Store writes prepared-image bindings under the knarr store root.
 type Store struct {
 	root string
@@ -62,6 +54,10 @@ type Binding struct {
 	Descriptor     ocispec.Descriptor
 	FsverityDigest string
 }
+
+// ErrNotFound reports that no prepared-image binding exists for a root digest
+// and platform.
+var ErrNotFound = errors.New("imagestore: binding not found")
 
 // New opens an image binding store rooted at root.
 func New(root string) (*Store, error) {
@@ -145,6 +141,25 @@ func (s *Store) Get(root digest.Digest, p ocispec.Platform) (Binding, error) {
 		FsverityDigest: doc.RootFS.Fsverity.Digest.String(),
 	}, nil
 }
+
+// Delete removes images/sha256/<root-xx>/<root-rest>/<platform>.json.
+func (s *Store) Delete(root digest.Digest, p ocispec.Platform) error {
+	path, _, err := s.bindingPath(root, p)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("imagestore: delete binding: %w", err)
+	}
+	return nil
+}
+
+const (
+	bindingSchema = "application/vnd.knarr.cfs-binding.v1+json"
+)
 
 // The on-disk binding JSON documents.
 type (
