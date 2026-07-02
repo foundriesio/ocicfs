@@ -18,6 +18,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/foundriesio/knarr/internal/ocilayout"
 	"github.com/foundriesio/knarr/pkg/knarr"
 )
 
@@ -91,6 +92,57 @@ func WriteImages(w io.Writer, format Format, imgs []knarr.Image) error {
 	}
 	for _, o := range out {
 		if _, err := fmt.Fprintf(w, "%s\t%s\t%d\n", o.Ref, o.Digest, o.Size); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ImageInfoOutput is the JSON/text shape for `knarr inspect` output. Its JSON
+// field names are a stable contract for callers that parse knarr's output.
+type ImageInfoOutput struct {
+	Root      string           `json:"root"`
+	Platform  string           `json:"platform"`
+	DiffIDs   []string         `json:"diff_ids"`
+	Composefs DescriptorOutput `json:"composefs"`
+	Fsverity  string           `json:"fsverity"`
+}
+
+// DescriptorOutput is the JSON shape for an OCI descriptor in command output.
+type DescriptorOutput struct {
+	MediaType string `json:"mediaType"`
+	Digest    string `json:"digest"`
+	Size      int64  `json:"size"`
+}
+
+// WriteImageInfo renders an inspected image to w in the requested format.
+func WriteImageInfo(w io.Writer, format Format, info *knarr.ImageInfo) error {
+	diffIDs := make([]string, 0, len(info.DiffIDs))
+	for _, d := range info.DiffIDs {
+		diffIDs = append(diffIDs, d.String())
+	}
+	out := ImageInfoOutput{
+		Root:     info.Root.String(),
+		Platform: ocilayout.PlatformString(&info.Platform),
+		DiffIDs:  diffIDs,
+		Composefs: DescriptorOutput{
+			MediaType: info.Composefs.MediaType,
+			Digest:    info.Composefs.Digest.String(),
+			Size:      info.Composefs.Size,
+		},
+		Fsverity: info.FsverityDigest,
+	}
+	if format == FormatJSON {
+		return emitJSON(w, out)
+	}
+
+	rows := [][2]string{{"root", out.Root}, {"platform", out.Platform}}
+	for _, d := range out.DiffIDs {
+		rows = append(rows, [2]string{"diff_id", d})
+	}
+	rows = append(rows, [2]string{"composefs", out.Composefs.Digest}, [2]string{"fsverity", out.Fsverity})
+	for _, r := range rows {
+		if _, err := fmt.Fprintf(w, "%s\t%s\n", r[0], r[1]); err != nil {
 			return err
 		}
 	}

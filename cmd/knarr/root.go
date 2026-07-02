@@ -77,6 +77,7 @@ func newRootCommand(stdout, stderr io.Writer) (*cobra.Command, *globalOptions) {
 		newMountCommand(g),
 		newUnmountCommand(g),
 		newLsCommand(g),
+		newInspectCommand(g),
 		newRemoveCommand(g),
 	)
 	return root, g
