@@ -7,14 +7,17 @@
 // holds no version-management, activation, or update-orchestration policy.
 //
 // The current surface covers the basic primitives — publish, pull, mount,
-// unmount, list, remove. The remaining primitives (verify, hold, release,
-// status, gc) are added as they are implemented.
+// unmount, inspect, list, remove. The remaining primitives (verify, hold,
+// release, status, gc) are added as they are implemented.
 package knarr
 
 import (
 	"context"
 	"errors"
 	"fmt"
+
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/foundriesio/knarr/internal/imagestore"
 	"github.com/foundriesio/knarr/internal/objectstore"
@@ -31,6 +34,24 @@ type Image struct {
 	// Size is the size of the image's composefs image object, in bytes; file
 	// content shared in the object store is not counted.
 	Size int64
+}
+
+// ImageInfo is the identity of a locally stored image: its OCI coordinates and
+// the composefs image built for it.
+type ImageInfo struct {
+	// Root is the digest the image was pulled under (index or manifest).
+	Root digest.Digest
+	// Platform is the resolved platform, as declared by the image config (it
+	// may carry a variant the host request omitted, e.g. arm64/v8).
+	Platform ocispec.Platform
+	// DiffIDs are the config's ordered rootfs.diff_ids (sha256, one per layer).
+	DiffIDs []digest.Digest
+	// Composefs is the descriptor of the composefs image blob recorded for
+	// {Root, Platform}; its digest names the blob in the object store.
+	Composefs ocispec.Descriptor
+	// FsverityDigest is the fs-verity digest recorded for the composefs blob,
+	// which a mount enforces.
+	FsverityDigest string
 }
 
 // PullOptions is the resolved configuration a Pull acts on. Callers pass the
@@ -161,6 +182,15 @@ type Engine interface {
 	// a caller that assembles its own overlay data plane over a metadata-only
 	// mount (the directory is the overlay's data-only lower).
 	ObjectsDir() (string, error)
+	// Inspect reports the OCI identity and composefs binding of an image
+	// already present in the local store: root digest, resolved platform,
+	// ordered config diff_ids, and the composefs image descriptor with its
+	// fs-verity digest. Inspect reads only local state and never fetches over
+	// the network; it returns an error satisfying errors.Is(err, ErrNotFound)
+	// when the image has not been pulled (its metadata or binding is absent
+	// locally). An image whose index does not offer the host platform is a
+	// different, permanent condition and is reported as its own error.
+	Inspect(ctx context.Context, ref string) (*ImageInfo, error)
 	// List returns the images present in the local store.
 	List(ctx context.Context) ([]Image, error)
 	// Remove forgets a local image.

@@ -34,6 +34,7 @@ type Layout struct {
 	Manifest   digest.Digest
 	Config     digest.Digest
 	FileDigest digest.Digest
+	DiffIDs    []digest.Digest
 	Platform   ocispec.Platform
 }
 
@@ -123,6 +124,7 @@ func BuildSingleLayerGzip(dir string, platform ocispec.Platform, files ...File) 
 		Manifest:   manifestDesc.Digest,
 		Config:     configDesc.Digest,
 		FileDigest: digest.SHA256.FromBytes([]byte(files[0].Body)),
+		DiffIDs:    config.RootFS.DiffIDs,
 		Platform:   platform,
 	}, nil
 }
