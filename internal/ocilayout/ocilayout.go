@@ -40,6 +40,25 @@ func PlatformString(p *ocispec.Platform) string {
 	return s
 }
 
+// ParsePlatform parses an os/arch[/variant] platform string.
+func ParsePlatform(s string) (ocispec.Platform, error) {
+	parts := strings.Split(s, "/")
+	if len(parts) != 2 && len(parts) != 3 {
+		return ocispec.Platform{}, fmt.Errorf("ocilayout: invalid platform %q", s)
+	}
+	for i, part := range parts {
+		parts[i] = strings.ToLower(part)
+		if !validPlatformComponent(parts[i]) {
+			return ocispec.Platform{}, fmt.Errorf("ocilayout: invalid platform component %q", part)
+		}
+	}
+	p := ocispec.Platform{OS: parts[0], Architecture: parts[1]}
+	if len(parts) == 3 {
+		p.Variant = parts[2]
+	}
+	return p, nil
+}
+
 type (
 	source struct {
 		dir string
@@ -112,6 +131,18 @@ func (s *source) DescribeMissingRoot(root digest.Digest, cause error) error {
 }
 
 const maxMetadataBytes = 32 << 20 // 32 MiB
+
+func validPlatformComponent(s string) bool {
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
+}
 
 func warnClose(msg string, c io.Closer) {
 	if err := c.Close(); err != nil && !errors.Is(err, os.ErrNotExist) {

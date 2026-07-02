@@ -166,6 +166,51 @@ func TestResolveMissingRootListsIndex(t *testing.T) {
 	}
 }
 
+func TestParsePlatform(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want ocispec.Platform
+	}{
+		{
+			name: "os arch",
+			in:   "linux/amd64",
+			want: ocispec.Platform{OS: "linux", Architecture: "amd64"},
+		},
+		{
+			name: "variant",
+			in:   "linux/arm/v7",
+			want: ocispec.Platform{OS: "linux", Architecture: "arm", Variant: "v7"},
+		},
+		{
+			name: "normalized",
+			in:   "Linux/ARM64/V8",
+			want: ocispec.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParsePlatform(tt.in)
+			if err != nil {
+				t.Fatalf("ParsePlatform: %v", err)
+			}
+			if got.OS != tt.want.OS || got.Architecture != tt.want.Architecture || got.Variant != tt.want.Variant {
+				t.Fatalf("platform = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParsePlatformRejectsInvalidStrings(t *testing.T) {
+	for _, in := range []string{"", "linux", "linux/", "linux/amd64/v8/extra", "linux/amd64/v8.1"} {
+		t.Run(in, func(t *testing.T) {
+			if _, err := ParsePlatform(in); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
 func openSource(t *testing.T, dir string) ocichain.BlobSource {
 	t.Helper()
 	src, err := Open(dir)
