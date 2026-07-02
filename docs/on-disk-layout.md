@@ -81,12 +81,17 @@ provenance, and tag→digest naming — it is **not** a trust anchor:
 }
 ```
 
+`knarr ls` reads these records and reports one row per stored reference. `knarr
+remove <ref>` deletes the matching ref record and any unshared image binding for
+the recorded root digest and platform; it does not delete content from
+`objects/`.
+
 ## Authoritative vs. auxiliary
 
 `images/` and `refs/` are **regenerable indexes**, not trust anchors: all content
 lives in `objects/`, and re-pulling a pinned digest rebuilds both indexes without
-re-storing it. Because they are not trusted, they must be **verified on use**
-against the object store — a binding's composefs image is content-addressed there
-and its fs-verity digest is enforced at mount, and a ref's stored digest is
-checked against resolved content — so a stale or tampered index cannot serve
-unverified content.
+re-storing it. Because they are not trusted, bindings are verified on use against
+the object store — a binding's composefs image is content-addressed there and its
+fs-verity digest is enforced at mount, so a stale or tampered binding cannot
+serve unverified content. Ref records are validated when read (schema, ref key,
+and sha256 digests), but they are not content trust anchors.
