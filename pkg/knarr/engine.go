@@ -129,14 +129,14 @@ func WithMetadataOnly() MountOption {
 // RemoveOptions is the resolved configuration a Remove acts on. Callers pass
 // the With* options to Remove, which apply to a zero RemoveOptions.
 type RemoveOptions struct {
-	// Force removes the image even while it is held against garbage collection.
+	// Force is accepted and currently has no effect.
 	Force bool
 }
 
 // RemoveOption opts a Remove into a particular behaviour.
 type RemoveOption func(*RemoveOptions)
 
-// WithForce removes the image even while it is held against garbage collection.
+// WithForce accepts the force option for Remove.
 func WithForce() RemoveOption {
 	return func(o *RemoveOptions) { o.Force = true }
 }

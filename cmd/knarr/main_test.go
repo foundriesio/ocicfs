@@ -15,11 +15,16 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/foundriesio/knarr/internal/devtest"
+	"github.com/foundriesio/knarr/internal/imagestore"
+	"github.com/foundriesio/knarr/internal/ocilayout"
 	"github.com/foundriesio/knarr/internal/octest"
+	"github.com/foundriesio/knarr/internal/refstore"
 )
 
 func TestCommandsCoverM1Verbs(t *testing.T) {
@@ -152,6 +157,61 @@ func TestRunInvalidFormatIsUsageError(t *testing.T) {
 	}
 }
 
+func TestRunLsJSON(t *testing.T) {
+	root := t.TempDir()
+	imageRoot := digest.SHA256.FromString("root")
+	ref := "app@" + imageRoot.String()
+	writeCLIImage(t, root, ref, imageRoot, 72, ocispec.Platform{OS: "linux", Architecture: "amd64"})
+
+	var out, errOut bytes.Buffer
+	code := run(context.Background(), []string{"--root", root, "ls", "--format", "json"}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, errOut.String())
+	}
+	var got []struct {
+		Ref    string `json:"ref"`
+		Digest string `json:"digest"`
+		Size   int64  `json:"size"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not JSON: %v; out=%q", err, out.String())
+	}
+	if len(got) != 1 || got[0].Ref != ref || got[0].Digest != imageRoot.String() || got[0].Size != 4096 {
+		t.Fatalf("ls JSON = %#v", got)
+	}
+}
+
+func TestRunRemoveDispatchesToEngine(t *testing.T) {
+	root := t.TempDir()
+	imageRoot := digest.SHA256.FromString("root")
+	ref := "app@" + imageRoot.String()
+	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	writeCLIImage(t, root, ref, imageRoot, 72, platform)
+
+	var out, errOut bytes.Buffer
+	code := run(context.Background(), []string{"--root", root, "remove", "--force", ref}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, errOut.String())
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", out.String())
+	}
+	refStore, err := refstore.New(root)
+	if err != nil {
+		t.Fatalf("refstore.New: %v", err)
+	}
+	if _, err := refStore.Get(ref); !errors.Is(err, refstore.ErrNotFound) {
+		t.Fatalf("Get ref error = %v, want ErrNotFound", err)
+	}
+	imgStore, err := imagestore.New(root)
+	if err != nil {
+		t.Fatalf("imagestore.New: %v", err)
+	}
+	if _, err := imgStore.Get(imageRoot, platform); !errors.Is(err, imagestore.ErrNotFound) {
+		t.Fatalf("Get binding error = %v, want ErrNotFound", err)
+	}
+}
+
 // TestRunPullFromDirE2E drives a real `knarr pull --from-dir` through the command
 // front end: it exercises flag binding, engine construction from --root, and the
 // --format json output contract end to end, against a local OCI layout. It is
@@ -221,5 +281,30 @@ func TestImageListJSONShape(t *testing.T) {
 	}
 	if len(got) != 1 || got[0]["ref"] != "foo" {
 		t.Errorf("unexpected decoded shape: %v", got)
+	}
+}
+
+func writeCLIImage(t *testing.T, root, ref string, d digest.Digest, size int64, p ocispec.Platform) {
+	t.Helper()
+	refStore, err := refstore.New(root)
+	if err != nil {
+		t.Fatalf("refstore.New: %v", err)
+	}
+	if err := refStore.Put(ref, ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    d,
+		Size:      size,
+	}, time.Unix(0, 0).UTC(), []string{ocilayout.PlatformString(&p)}); err != nil {
+		t.Fatalf("Put ref: %v", err)
+	}
+	imgStore, err := imagestore.New(root)
+	if err != nil {
+		t.Fatalf("imagestore.New: %v", err)
+	}
+	if err := imgStore.Put(d, p, imagestore.Binding{
+		Descriptor:     ocispec.Descriptor{Digest: digest.SHA256.FromString("composefs"), Size: 4096},
+		FsverityDigest: digest.SHA256.FromString("verity").String(),
+	}); err != nil {
+		t.Fatalf("Put binding: %v", err)
 	}
 }

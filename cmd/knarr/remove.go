@@ -30,6 +30,6 @@ func newRemoveCommand(g *globalOptions) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().BoolVar(&force, "force", false, "remove even while the image is held")
+	cmd.Flags().BoolVar(&force, "force", false, "accepted; currently no effect")
 	return cmd
 }

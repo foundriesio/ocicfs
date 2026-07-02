@@ -30,8 +30,6 @@ func TestEngineStubReturnsNotImplemented(t *testing.T) {
 
 	calls := map[string]func() error{
 		"Publish": func() error { return eng.Publish(ctx, "dir", "dest") },
-		"List":    func() error { _, err := eng.List(ctx); return err },
-		"Remove":  func() error { return eng.Remove(ctx, "ref") },
 	}
 
 	for name, call := range calls {
