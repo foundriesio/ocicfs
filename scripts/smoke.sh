@@ -5,10 +5,10 @@
 #
 # knarr smoke test: exercise the local image lifecycle against a real image.
 #
-# Drives the built knarr binary through pull --from-dir -> ls -> mount ->
-# unmount, then through mount --metadata-only with the overlay a writable
-# consumer assembles over it (objects/sha256 as the data-only lowerdir,
-# verity=require), and finally remove, so the currently implemented
+# Drives the built knarr binary through pull --from-dir -> ls -> inspect ->
+# mount -> unmount, then through mount --metadata-only with the overlay a
+# writable consumer assembles over it (objects/sha256 as the data-only
+# lowerdir, verity=require), and finally remove, so the currently implemented
 # functionality can be checked by hand in one command. It needs a privileged,
 # fs-verity-capable environment with mkcomposefs and mount.composefs on PATH
 # -- i.e. the dev container. Either open the dev container and run the target
@@ -67,6 +67,13 @@ listed="$("${KN[@]}" ls)"
 printf '%s\n' "$listed"
 printf '%s\n' "$listed" | grep -qF "$ref" || fail "ls did not list $ref after pull"
 
+echo "== inspect (text, then json checked against the pulled digest) =="
+"${KN[@]}" inspect "$ref"
+inspected="$("${KN[@]}" inspect --format json "$ref")"
+[ "$(jq -r .root <<<"$inspected")" = "${ref#smoke@}" ] || fail "inspect root is not the pulled digest"
+jq -e '.composefs.digest | startswith("sha256:")' <<<"$inspected" >/dev/null || fail "inspect reports no composefs digest"
+jq -e '.fsverity != ""' <<<"$inspected" >/dev/null || fail "inspect reports no fsverity digest"
+
 echo "== mount =="
 "${KN[@]}" mount "$ref" "$MNT"
 echo "== mounted rootfs (expect non-empty, read-only) =="
@@ -105,4 +112,4 @@ listed="$("${KN[@]}" ls)"
 printf '%s\n' "$listed"
 if printf '%s\n' "$listed" | grep -qF "$ref"; then fail "ls still lists $ref after remove"; fi
 
-echo "SMOKE OK: pull -> ls -> mount -> unmount -> metadata-only overlay -> remove (checks passed)"
+echo "SMOKE OK: pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> remove (checks passed)"
