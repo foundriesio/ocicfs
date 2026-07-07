@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/opencontainers/go-digest"
+	"golang.org/x/sys/unix"
 
 	"github.com/foundriesio/knarr/internal/devtest"
 	"github.com/foundriesio/knarr/internal/imagestore"
@@ -273,5 +274,99 @@ func TestUnmountNotMountedReturnsErrNotMounted(t *testing.T) {
 	err = eng.Unmount(context.Background(), t.TempDir())
 	if !errors.Is(err, ErrNotMounted) {
 		t.Fatalf("Unmount = %v, want an ErrNotMounted match", err)
+	}
+}
+
+// TestMountMetadataOnlyConsumerOverlayE2E exercises the metadata-only mount
+// the way a snapshotter consumes it: mount the verified EROFS metadata alone,
+// then assemble a single writable overlay whose data-only lower is the
+// store's object directory, and check that file content is served through the
+// data plane and that the upper takes writes.
+func TestMountMetadataOnlyConsumerOverlayE2E(t *testing.T) {
+	storeRoot, cleanup, err := devtest.VerityRoot()
+	if errors.Is(err, devtest.ErrNoVerity) {
+		t.Skipf("verity-capable store root unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("VerityRoot: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	lay, err := octest.BuildSingleLayerGzip(t.TempDir(), hostPlatform(),
+		octest.File{Name: "etc/config.txt", Mode: 0o644, Body: "hello from knarr\n"},
+	)
+	if err != nil {
+		t.Fatalf("build layout: %v", err)
+	}
+	eng, err := New(Config{Root: storeRoot})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := eng.Pull(context.Background(), lay.Ref, WithFromDir(lay.Dir)); devtest.IsVerityUnsupported(err) {
+		t.Skipf("fs-verity unsupported on the test filesystem: %v", err)
+	} else if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+
+	objects, err := eng.ObjectsDir()
+	if err != nil {
+		t.Fatalf("ObjectsDir: %v", err)
+	}
+	if want := filepath.Join(storeRoot, "objects", "sha256"); objects != want {
+		t.Fatalf("ObjectsDir = %q, want %q", objects, want)
+	}
+
+	meta := filepath.Join(storeRoot, "meta")
+	merged := filepath.Join(storeRoot, "merged")
+	upper := filepath.Join(storeRoot, "upper")
+	work := filepath.Join(storeRoot, "work")
+	for _, dir := range []string{meta, merged, upper, work} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatalf("Mkdir: %v", err)
+		}
+	}
+
+	var metaMounted, overlayMounted bool
+	t.Cleanup(func() {
+		if overlayMounted {
+			if err := eng.Unmount(context.Background(), merged); err != nil {
+				t.Errorf("cleanup unmount overlay: %v", err)
+			}
+		}
+		if metaMounted {
+			if err := eng.Unmount(context.Background(), meta); err != nil {
+				t.Errorf("cleanup unmount metadata: %v", err)
+			}
+		}
+	})
+
+	err = eng.Mount(context.Background(), lay.Ref, meta, WithMetadataOnly())
+	if skipMountEnvironment(err) {
+		t.Skipf("mount environment unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("Mount: %v", err)
+	}
+	metaMounted = true
+
+	// The metadata mount alone carries no file data; content is served only
+	// through an overlay with the object directory as its data-only lower.
+	opts := "lowerdir=" + meta + "::" + objects +
+		",upperdir=" + upper + ",workdir=" + work +
+		",redirect_dir=on,metacopy=on,verity=require"
+	if err := unix.Mount("overlay", merged, "overlay", 0, opts); err != nil {
+		t.Fatalf("overlay mount: %v", err)
+	}
+	overlayMounted = true
+
+	data, err := os.ReadFile(filepath.Join(merged, "etc", "config.txt")) // #nosec G304 -- test mount path
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(data, []byte("hello from knarr\n")) {
+		t.Fatalf("merged file = %q", data)
+	}
+	if err := os.WriteFile(filepath.Join(merged, "scratch.txt"), []byte("rw"), 0o644); err != nil {
+		t.Fatalf("write through overlay upper: %v", err)
 	}
 }

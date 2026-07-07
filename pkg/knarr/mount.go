@@ -23,6 +23,11 @@ func (e *engine) Mount(ctx context.Context, ref, target string, opts ...MountOpt
 	return nil
 }
 
+// ObjectsDir returns the store's composefs backing-object directory.
+func (e *engine) ObjectsDir() (string, error) {
+	return e.obj.ObjectsDir(), nil
+}
+
 // Unmount tears down the mount at target. A target with no mount returns an
 // error matching ErrNotMounted.
 func (e *engine) Unmount(ctx context.Context, target string) error {
@@ -82,12 +87,16 @@ func (e *engine) mount(ctx context.Context, ref, target string, opts ...MountOpt
 		return err
 	}
 
-	return mount.ReadOnly(ctx, mount.Spec{
+	spec := mount.Spec{
 		ImagePath:      imagePath,
 		Basedir:        e.obj.ObjectsDir(),
 		Target:         target,
 		FsverityDigest: b.FsverityDigest,
-	})
+	}
+	if cfg.MetadataOnly {
+		return mount.MetadataOnly(ctx, spec)
+	}
+	return mount.ReadOnly(ctx, spec)
 }
 
 func validateMountTarget(target string) error {

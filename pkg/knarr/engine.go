@@ -66,6 +66,12 @@ type MountOptions struct {
 	// bypassing allocation under any overlay root. Both must be set together.
 	UpperDir string
 	WorkDir  string
+	// MetadataOnly mounts only the image's EROFS metadata, read-only on a
+	// loop device, without the object data plane a composefs mount attaches.
+	// The caller assembles its own single overlay over the mount with
+	// ObjectsDir as a data-only lower, passing verity=require so fs-verity
+	// stays enforced. It cannot be combined with the writable options.
+	MetadataOnly bool
 }
 
 // MountOption opts a Mount into a particular behaviour. The zero set of options
@@ -111,6 +117,15 @@ func WithWorkDir(dir string) MountOption {
 	}
 }
 
+// WithMetadataOnly mounts only the image's verified EROFS metadata, for a
+// caller that assembles its own overlay data plane: stacking a writable
+// overlay on a composefs mount can exceed the kernel's filesystem
+// stacking-depth limit, so such a caller folds the store's object directory
+// (ObjectsDir) into its overlay as a data-only lower instead.
+func WithMetadataOnly() MountOption {
+	return func(o *MountOptions) { o.MetadataOnly = true }
+}
+
 // RemoveOptions is the resolved configuration a Remove acts on. Callers pass
 // the With* options to Remove, which apply to a zero RemoveOptions.
 type RemoveOptions struct {
@@ -135,12 +150,17 @@ type Engine interface {
 	// store does not already hold, and returns the stored image.
 	Pull(ctx context.Context, ref string, opts ...PullOption) (*Image, error)
 	// Mount mounts ref at target: a single read-only composefs mount by
-	// default, or, when a With* option opts in, a writable overlay over that
-	// composefs base. Mount operates on content already present in the store
-	// and does not fetch over the network; pull ref first.
+	// default, a writable overlay over that composefs base when a writable
+	// With* option opts in, or the image's verified EROFS metadata alone with
+	// WithMetadataOnly. Mount operates on content already present in the
+	// store and does not fetch over the network; pull ref first.
 	Mount(ctx context.Context, ref, target string, opts ...MountOption) error
 	// Unmount tears down the mount at target.
 	Unmount(ctx context.Context, target string) error
+	// ObjectsDir returns the store's composefs backing-object directory, for
+	// a caller that assembles its own overlay data plane over a metadata-only
+	// mount (the directory is the overlay's data-only lower).
+	ObjectsDir() (string, error)
 	// List returns the images present in the local store.
 	List(ctx context.Context) ([]Image, error)
 	// Remove forgets a local image.
