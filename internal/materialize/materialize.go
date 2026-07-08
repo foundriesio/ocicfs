@@ -54,14 +54,12 @@ func Materialize(ctx context.Context, store *objectstore.Store, img *imagestore.
 		return Built{}, err
 	}
 
-	layers, closers, err := openLayers(ctx, src, res.Manifest.Layers)
+	openLayer := func(i int) (io.ReadCloser, error) {
+		return ocichain.OpenLayer(ctx, src, res.Manifest.Layers[i])
+	}
+	built, err := rootfs.Assemble(ctx, store, openLayer, res.DiffIDs)
 	if err != nil {
 		return Built{}, err
-	}
-	built, buildErr := rootfs.Assemble(ctx, store, layers, res.DiffIDs)
-	closeErr := closeLayers(closers)
-	if buildErr != nil || closeErr != nil {
-		return Built{}, errors.Join(buildErr, closeErr)
 	}
 
 	if err := store.Sync(); err != nil {
@@ -103,32 +101,4 @@ func writeMetaBlob(ctx context.Context, store *objectstore.Store, seen map[diges
 	}
 	seen[desc.Digest] = true
 	return store.WriteBlob(ctx, desc.Digest, bytes.NewReader(data))
-}
-
-func openLayers(ctx context.Context, src ocichain.BlobSource, descs []ocispec.Descriptor) ([]io.Reader, []io.Closer, error) {
-	layers := make([]io.Reader, 0, len(descs))
-	closers := make([]io.Closer, 0, len(descs))
-	for _, desc := range descs {
-		rc, err := ocichain.OpenLayer(ctx, src, desc)
-		if err != nil {
-			if closeErr := closeLayers(closers); closeErr != nil {
-				return nil, nil, errors.Join(err, closeErr)
-			}
-			return nil, nil, err
-		}
-		layers = append(layers, rc)
-		closers = append(closers, rc)
-	}
-	return layers, closers, nil
-}
-
-func closeLayers(closers []io.Closer) error {
-	var err error
-	for _, c := range closers {
-		err = errors.Join(err, c.Close())
-	}
-	if err != nil {
-		return fmt.Errorf("close OCI layer: %w", err)
-	}
-	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -162,7 +163,7 @@ func TestCloneHardlinkRejectsNonRegular(t *testing.T) {
 
 func TestBuildEntriesRejectsEscapingName(t *testing.T) {
 	layer := tarBytes(t, tarEntry{name: "../../x", typ: tar.TypeDir, mode: 0o755})
-	_, err := buildEntries(context.Background(), nil, []io.Reader{bytes.NewReader(layer)}, []digest.Digest{digest.FromBytes(layer)})
+	_, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	if err == nil {
 		t.Fatal("expected escaping path error")
 	}
@@ -173,7 +174,7 @@ func TestBuildEntriesRejectsNonRegularHardlinkTarget(t *testing.T) {
 		tarEntry{name: "target", typ: tar.TypeSymlink, mode: 0o777, link: "somewhere"},
 		tarEntry{name: "link", typ: tar.TypeLink, link: "target"},
 	)
-	_, err := buildEntries(context.Background(), nil, []io.Reader{bytes.NewReader(layer)}, []digest.Digest{digest.FromBytes(layer)})
+	_, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	if err == nil {
 		t.Fatal("expected non-regular hardlink target error")
 	}
@@ -184,7 +185,7 @@ func TestBuildEntriesRejectsForwardHardlink(t *testing.T) {
 		tarEntry{name: "link", typ: tar.TypeLink, link: "target"},
 		tarEntry{name: "target", typ: tar.TypeSymlink, mode: 0o777, link: "somewhere"},
 	)
-	_, err := buildEntries(context.Background(), nil, []io.Reader{bytes.NewReader(layer)}, []digest.Digest{digest.FromBytes(layer)})
+	_, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	if err == nil {
 		t.Fatal("expected missing hardlink target error")
 	}
@@ -193,7 +194,7 @@ func TestBuildEntriesRejectsForwardHardlink(t *testing.T) {
 func TestBuildEntriesChecksDiffID(t *testing.T) {
 	layer := tarBytes(t, tarEntry{name: "dir", typ: tar.TypeDir, mode: 0o755})
 	wrong := digest.SHA256.FromString("wrong")
-	_, err := buildEntries(context.Background(), nil, []io.Reader{bytes.NewReader(layer)}, []digest.Digest{wrong})
+	_, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{wrong})
 	if err == nil {
 		t.Fatal("expected diff_id mismatch")
 	}
@@ -218,7 +219,7 @@ func TestBuildEntriesWithStore(t *testing.T) {
 		tarEntry{name: "var/lib/.wh..wh..opq", typ: tar.TypeReg, mode: 0o000},
 		tarEntry{name: "var/lib/new", typ: tar.TypeReg, mode: 0o644, body: "new"},
 	)
-	entries, err := buildEntries(context.Background(), store, []io.Reader{bytes.NewReader(layer1), bytes.NewReader(layer2)}, []digest.Digest{
+	entries, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
 		digest.FromBytes(layer1),
 		digest.FromBytes(layer2),
 	})
@@ -261,7 +262,7 @@ func TestBuildEntriesModifyWithoutWhiteout(t *testing.T) {
 	layer2 := tarBytes(t,
 		tarEntry{name: "etc/config", typ: tar.TypeReg, mode: 0o600, body: "v2", pax: map[string]string{"SCHILY.xattr.user.test": "yes"}},
 	)
-	entries, err := buildEntries(context.Background(), store, []io.Reader{bytes.NewReader(layer1), bytes.NewReader(layer2)}, []digest.Digest{
+	entries, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
 		digest.FromBytes(layer1),
 		digest.FromBytes(layer2),
 	})
@@ -291,7 +292,7 @@ func TestBuildEntriesReplaceDirWithFile(t *testing.T) {
 	layer2 := tarBytes(t,
 		tarEntry{name: "lib", typ: tar.TypeSymlink, mode: 0o777, link: "usr/lib"},
 	)
-	entries, err := buildEntries(context.Background(), store, []io.Reader{bytes.NewReader(layer1), bytes.NewReader(layer2)}, []digest.Digest{
+	entries, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
 		digest.FromBytes(layer1),
 		digest.FromBytes(layer2),
 	})
@@ -314,7 +315,7 @@ func TestBuild(t *testing.T) {
 	}
 	store := newVerityStore(t)
 	layer := tarBytes(t, tarEntry{name: "hello", typ: tar.TypeReg, mode: 0o644, body: "world"})
-	img, err := Assemble(context.Background(), store, []io.Reader{bytes.NewReader(layer)}, []digest.Digest{digest.FromBytes(layer)})
+	img, err := Assemble(context.Background(), store, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	skipIfNoVerity(t, err)
 	if err != nil {
 		t.Fatalf("Assemble: %v", err)
@@ -330,6 +331,51 @@ func TestBuild(t *testing.T) {
 	}
 	if _, err := digestutil.ParseSHA256(img.FsverityDigest); err != nil {
 		t.Fatalf("fsverity digest invalid: %v", err)
+	}
+}
+
+func TestBuildEntriesOpensConsumesClosesLayerBeforeNext(t *testing.T) {
+	layers := [][]byte{
+		tarBytes(t, tarEntry{name: "one", typ: tar.TypeDir, mode: 0o755}),
+		tarBytes(t, tarEntry{name: "two", typ: tar.TypeDir, mode: 0o755}),
+		tarBytes(t, tarEntry{name: "three", typ: tar.TypeDir, mode: 0o755}),
+	}
+	diffIDs := []digest.Digest{
+		digest.FromBytes(layers[0]),
+		digest.FromBytes(layers[1]),
+		digest.FromBytes(layers[2]),
+	}
+
+	var events []string
+	layerOpen := false
+	openLayer := func(i int) (io.ReadCloser, error) {
+		if layerOpen {
+			t.Fatalf("opened layer %d before closing previous layer", i)
+		}
+		events = append(events, fmt.Sprintf("open:%d", i))
+		layerOpen = true
+		return &observedLayer{
+			r:      bytes.NewReader(layers[i]),
+			index:  i,
+			events: &events,
+			open:   &layerOpen,
+		}, nil
+	}
+
+	if _, err := buildEntries(context.Background(), nil, openLayer, diffIDs); err != nil {
+		t.Fatalf("buildEntries: %v", err)
+	}
+	if layerOpen {
+		t.Fatal("last layer was not closed")
+	}
+
+	want := strings.Join([]string{
+		"open:0", "eof:0", "close:0:true",
+		"open:1", "eof:1", "close:1:true",
+		"open:2", "eof:2", "close:2:true",
+	}, ",")
+	if got := strings.Join(events, ","); got != want {
+		t.Fatalf("events = %s, want %s", got, want)
 	}
 }
 
@@ -363,6 +409,39 @@ func entriesByPath(entries []composefs.Entry) map[string]composefs.Entry {
 		out[e.Path] = e
 	}
 	return out
+}
+
+type observedLayer struct {
+	r        *bytes.Reader
+	index    int
+	events   *[]string
+	open     *bool
+	consumed bool
+}
+
+func (l *observedLayer) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	if errors.Is(err, io.EOF) && !l.consumed {
+		*l.events = append(*l.events, fmt.Sprintf("eof:%d", l.index))
+		l.consumed = true
+	}
+	return n, err
+}
+
+func (l *observedLayer) Close() error {
+	*l.events = append(*l.events, fmt.Sprintf("close:%d:%t", l.index, l.consumed))
+	*l.open = false
+	return nil
+}
+
+func openTestLayers(t *testing.T, layers ...[]byte) func(int) (io.ReadCloser, error) {
+	t.Helper()
+	return func(i int) (io.ReadCloser, error) {
+		if i < 0 || i >= len(layers) {
+			t.Fatalf("layer index %d out of range", i)
+		}
+		return io.NopCloser(bytes.NewReader(layers[i])), nil
+	}
 }
 
 type tarEntry struct {

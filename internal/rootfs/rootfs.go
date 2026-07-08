@@ -38,11 +38,16 @@ type Image struct {
 // Assemble merges decompressed layer tar streams, writes their regular file
 // content to CAS, generates a composefs image, stores it in CAS, and returns its
 // descriptor plus measured fs-verity digest.
-func Assemble(ctx context.Context, store *objectstore.Store, layers []io.Reader, diffIDs []digest.Digest) (Image, error) {
+//
+// openLayer must return the decompressed tar stream of layer i, for i in
+// [0, len(diffIDs)). It is called once per layer, in order, and at most one
+// returned reader is open at a time: each is read to EOF and closed before the
+// next is opened.
+func Assemble(ctx context.Context, store *objectstore.Store, openLayer func(int) (io.ReadCloser, error), diffIDs []digest.Digest) (Image, error) {
 	if store == nil {
 		return Image{}, errors.New("rootfs: nil CAS store")
 	}
-	entries, err := buildEntries(ctx, store, layers, diffIDs)
+	entries, err := buildEntries(ctx, store, openLayer, diffIDs)
 	if err != nil {
 		return Image{}, err
 	}
@@ -123,17 +128,27 @@ type node struct {
 
 // buildEntries applies every layer in order into one tree, synthesises any
 // missing parent directories, and returns the merged composefs inventory.
-func buildEntries(ctx context.Context, store *objectstore.Store, layers []io.Reader, diffIDs []digest.Digest) ([]composefs.Entry, error) {
-	if len(layers) != len(diffIDs) {
-		return nil, fmt.Errorf("rootfs: layer count %d does not match diff_id count %d", len(layers), len(diffIDs))
+func buildEntries(ctx context.Context, store *objectstore.Store, openLayer func(int) (io.ReadCloser, error), diffIDs []digest.Digest) ([]composefs.Entry, error) {
+	if openLayer == nil {
+		return nil, errors.New("rootfs: nil layer opener")
 	}
 	tree := make(map[string]*node)
 	for i, id := range diffIDs {
-		if layers[i] == nil {
+		layer, err := openLayer(i)
+		if err != nil {
+			return nil, fmt.Errorf("rootfs: open layer %d: %w", i, err)
+		}
+		if layer == nil {
 			return nil, fmt.Errorf("rootfs: layer[%d] is nil", i)
 		}
-		if err := applyLayer(ctx, store, tree, layers[i], id, i); err != nil {
-			return nil, err
+
+		applyErr := applyLayer(ctx, store, tree, layer, id, i)
+		closeErr := layer.Close()
+		if closeErr != nil {
+			closeErr = fmt.Errorf("rootfs: layer %d: close: %w", i, closeErr)
+		}
+		if applyErr != nil || closeErr != nil {
+			return nil, errors.Join(applyErr, closeErr)
 		}
 	}
 	if err := ensureParents(tree); err != nil {

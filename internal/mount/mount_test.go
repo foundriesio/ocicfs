@@ -102,7 +102,10 @@ func TestReadOnlyMountsComposefs(t *testing.T) {
 		t.Fatalf("CheckVerity: %v", err)
 	}
 	layer := tarLayer(t, "hello.txt", 0o644, "hello from mount\n")
-	image, err := rootfs.Assemble(context.Background(), obj, []io.Reader{bytes.NewReader(layer)}, []digest.Digest{digest.SHA256.FromBytes(layer)})
+	openLayer := func(int) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(layer)), nil
+	}
+	image, err := rootfs.Assemble(context.Background(), obj, openLayer, []digest.Digest{digest.SHA256.FromBytes(layer)})
 	if devtest.IsVerityUnsupported(err) {
 		t.Skipf("fs-verity unsupported on the test filesystem: %v", err)
 	}
