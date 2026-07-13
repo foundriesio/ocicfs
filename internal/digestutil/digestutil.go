@@ -3,6 +3,11 @@
 
 // Package digestutil validates sha256 digests, the only digest algorithm
 // knarr's content-addressed store uses.
+//
+// A digest is validated exactly where it is not yet trustworthy: where outside
+// bytes become a digest (a parsed reference, decoded JSON) and where a digest
+// becomes a filesystem path (the store path constructors). A typed digest
+// between those points has already passed one of them and is not re-validated.
 package digestutil
 
 import (
