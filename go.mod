@@ -3,7 +3,7 @@ module github.com/foundriesio/knarr
 go 1.26
 
 require (
-	github.com/klauspost/compress v1.17.11
+	github.com/klauspost/compress v1.19.0
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/spf13/cobra v1.10.2
