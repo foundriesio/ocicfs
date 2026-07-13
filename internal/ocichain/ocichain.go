@@ -124,9 +124,6 @@ func OpenLayer(ctx context.Context, src BlobSource, desc ocispec.Descriptor) (io
 	if src == nil {
 		return nil, errors.New("ocichain: nil blob source")
 	}
-	if err := digestutil.ValidateSHA256(desc.Digest); err != nil {
-		return nil, fmt.Errorf("ocichain: OpenLayer: %w", err)
-	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

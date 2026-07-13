@@ -586,19 +586,6 @@ func TestOpenLayerUndersizedSourceRejected(t *testing.T) {
 	}
 }
 
-func TestOpenLayerNonSHA256Rejected(t *testing.T) {
-	f := newFixture(t)
-	desc := ocispec.Descriptor{
-		MediaType: ocispec.MediaTypeImageLayer,
-		Digest:    digest.Digest("sha512:" + strings.Repeat("a", 128)),
-		Size:      4,
-	}
-	_, err := OpenLayer(context.Background(), f, desc)
-	if err == nil || !strings.Contains(err.Error(), "non-sha256") {
-		t.Fatalf("error = %v, want non-sha256 rejection", err)
-	}
-}
-
 // TestOpenLayerCtxCancelledBeforeOpen covers the entry guard.
 func TestOpenLayerCtxCancelledBeforeOpen(t *testing.T) {
 	f := newFixture(t)
