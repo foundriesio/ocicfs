@@ -68,6 +68,25 @@ sudo knarr unmount /mnt/app
 `unmount` tears down the mount at the target path. It does not remove the target
 directory or delete store content.
 
+## Metadata-only mounts (`--metadata-only`)
+
+A consumer that assembles its own writable overlay (a containerd snapshotter,
+or a script-driven agent) mounts only the image's verified EROFS metadata and
+folds the store's object directory into that overlay as a data-only lower:
+
+```sh
+sudo knarr mount --metadata-only "app@$digest" /mnt/app-meta
+sudo mount -t overlay overlay -o \
+  "lowerdir=/mnt/app-meta::/var/lib/knarr/objects/sha256,upperdir=$upper,workdir=$work,redirect_dir=on,metacopy=on,verity=require" \
+  /mnt/app
+```
+
+The metadata mount alone serves no file data; content is read only through the
+overlay, and `verity=require` keeps the kernel enforcing fs-verity on every
+backing object. This flat overlay is the supported writable pattern: stacking a
+writable overlay directly on a composefs mount exceeds the kernel's filesystem
+stacking depth. The upper and work directories must not live on an overlayfs.
+
 ## Notes
 
 - **Digest-pinned only.** Accepted forms are `name@sha256:<hex>` or a bare
@@ -75,7 +94,8 @@ directory or delete store content.
 - **Host platform only.** Mount looks for the binding matching the local OS and
   architecture. If that binding is absent, pull the image for this platform first.
 - **Read-only only.** `--rw` and writable overlay options are rejected with
-  `writable mounts are not supported`.
+  `writable mounts are not supported`. A writable rootfs is assembled by the
+  consumer over a `--metadata-only` mount instead (see above).
 - **Fail closed.** knarr requires fs-verity for the composefs image and backing
   objects. There is no unverified mount fallback.
 - **What the verity check binds.** The kernel enforces the binding's recorded

@@ -94,6 +94,20 @@ func TestRunMountRWReportsUnsupported(t *testing.T) {
 	}
 }
 
+func TestRunMountRWAndMetadataOnlyIsUsageError(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := run(context.Background(), []string{
+		"--root", t.TempDir(),
+		"mount", "--rw", "--metadata-only", "app@sha256:" + strings.Repeat("a", 64), t.TempDir(),
+	}, &out, &errOut)
+	if code != 2 {
+		t.Errorf("exit code = %d, want 2", code)
+	}
+	if !strings.Contains(errOut.String(), "mutually exclusive") {
+		t.Errorf("stderr = %q, want mutual-exclusion error", errOut.String())
+	}
+}
+
 func TestRunUnmountDispatchesToEngine(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
