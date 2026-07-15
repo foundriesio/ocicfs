@@ -13,7 +13,9 @@
 # a loopback HTTP registry (crane registry serve), and for the same image
 # pulled and addressed by tag (checked to resolve to the same pinned digest),
 # so the currently implemented functionality can be checked by hand in one
-# command. It needs a privileged,
+# command. A final differential leg diffs the mounted rootfs against the same
+# image flattened by crane export, so the layer merge is checked against an
+# independent implementation on a real image. It needs a privileged,
 # fs-verity-capable environment with mkcomposefs and mount.composefs on PATH
 # -- i.e. the dev container. Either open the dev container and run the target
 # inside it:
@@ -37,6 +39,7 @@ STORE=""
 MNT=""
 OVL=""
 REGPID=""
+EXPORTDIR=""
 
 cleanup() {
 	set +e
@@ -49,6 +52,7 @@ cleanup() {
 	[ -n "$REGPID" ] && kill "$REGPID" 2>/dev/null
 	[ -n "$STORE" ] && rm -rf "$STORE"
 	[ -n "$MNT" ] && rm -rf "$MNT"
+	[ -n "$EXPORTDIR" ] && rm -rf "$EXPORTDIR"
 }
 trap cleanup EXIT
 
@@ -153,4 +157,24 @@ run_lifecycle "127.0.0.1:$port/smoke@$digest" "$digest" pull "127.0.0.1:$port/sm
 echo "==== lifecycle 3: image pulled and addressed by tag ===="
 run_lifecycle "127.0.0.1:$port/smoke:latest" "$digest" pull "127.0.0.1:$port/smoke:latest"
 
-echo "SMOKE OK: pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> remove, from --from-dir and from a registry, digest-pinned and by tag (checks passed)"
+echo "==== differential: mounted rootfs vs crane's image-level flatten ===="
+# crane export flattens the image the same way knarr's merge must (docker
+# export would not do: it dumps a *container*, whose runtime artifacts --
+# .dockerenv, /etc/mtab, /dev stubs -- are not image content). The export is
+# pinned to the host platform: knarr mounts the host-platform image, while
+# crane resolves a multi-arch index to linux/amd64 by default on any host.
+# Symlinks are compared as symlinks: real images carry links that only resolve
+# in a running container (absolute targets, dpkg-trimmed doc trees), so
+# dereferencing would produce false errors. diff checks names, content, and
+# link targets; owners, modes, xattrs, and hardlink identity are covered by
+# the Go e2e tests.
+ref="127.0.0.1:$port/smoke@$digest"
+"${KN[@]}" pull "$ref"
+"${KN[@]}" mount "$ref" "$MNT"
+EXPORTDIR="$(mktemp -d)"
+crane --platform "linux/$(go env GOARCH)" export "$ref" - | tar -C "$EXPORTDIR" -x
+diff -r -q --no-dereference "$EXPORTDIR" "$MNT" || fail "mounted rootfs differs from the flattened image"
+"${KN[@]}" unmount "$MNT"
+"${KN[@]}" remove "$ref"
+
+echo "SMOKE OK: pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export (checks passed)"
