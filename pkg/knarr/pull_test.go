@@ -7,11 +7,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 
+	"github.com/google/go-containerregistry/pkg/name"
+	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/random"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -61,20 +68,62 @@ func TestParseDigestPinnedRef(t *testing.T) {
 	}
 }
 
-func TestPullWithoutFromDirReportsRegistryUnsupported(t *testing.T) {
+func TestPullRegistryRejectsBareDigestAndMalformedRef(t *testing.T) {
 	eng, err := New(Config{Root: t.TempDir()})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	_, err = eng.Pull(context.Background(), "registry.example.com/team/app:latest")
+	for _, tt := range []struct {
+		ref     string
+		wantErr string
+	}{
+		{"sha256:" + strings.Repeat("a", 64), "bare digest"},
+		{"not a ref", "ociremote: parse reference"},
+	} {
+		_, err = eng.Pull(context.Background(), tt.ref)
+		if err == nil {
+			t.Fatalf("Pull(%q): expected error", tt.ref)
+		}
+		if errors.Is(err, ErrNotImplemented) || errors.Is(err, ErrNotFound) {
+			t.Fatalf("Pull(%q) error = %v, want parse error only", tt.ref, err)
+		}
+		if !strings.Contains(err.Error(), tt.wantErr) {
+			t.Fatalf("Pull(%q) error = %v, want it to contain %q", tt.ref, err, tt.wantErr)
+		}
+	}
+}
+
+func TestPullRegistryMissingRootNotLocalNotFound(t *testing.T) {
+	storeRoot, cleanup, err := devtest.VerityRoot()
+	if errors.Is(err, devtest.ErrNoVerity) {
+		t.Skipf("verity-capable store root unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("VerityRoot: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	reg := octest.NewRegistry()
+	t.Cleanup(reg.Close)
+	useRemoteDefaultTransport(t, reg.Transport())
+
+	eng, err := New(Config{Root: storeRoot})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ref := "registry.example.com/team/missing@sha256:" + strings.Repeat("d", 64)
+	_, err = eng.Pull(context.Background(), ref)
+	if devtest.IsVerityUnsupported(err) {
+		t.Skipf("fs-verity unsupported on the test filesystem: %v", err)
+	}
 	if err == nil {
-		t.Fatal("expected error")
+		t.Fatal("expected missing-root error")
 	}
-	if errors.Is(err, ErrNotImplemented) {
-		t.Fatalf("error = %v, want registry unsupported, not ErrNotImplemented", err)
+	if errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing remote root must not be local ErrNotFound: %v", err)
 	}
-	if !strings.Contains(err.Error(), registryPullUnsupported) {
-		t.Fatalf("error = %v, want registry unsupported", err)
+	if !strings.Contains(err.Error(), "not present in registry registry.example.com/team/missing") {
+		t.Fatalf("error = %v, want ociremote missing-root message", err)
 	}
 }
 
@@ -170,6 +219,82 @@ func TestPullFromDirE2E(t *testing.T) {
 	}
 }
 
+func TestPullRegistryE2ESkipsExistingImage(t *testing.T) {
+	storeRoot, cleanup, err := devtest.VerityRoot()
+	if errors.Is(err, devtest.ErrNoVerity) {
+		t.Skipf("verity-capable store root unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("VerityRoot: %v", err)
+	}
+	t.Cleanup(cleanup)
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+
+	reg := octest.NewRegistry()
+	t.Cleanup(reg.Close)
+	tr := reg.Transport()
+	useRemoteDefaultTransport(t, tr)
+
+	remoteImage, wantDiffIDs := registryHostImage(t, 2)
+	root := pushRegistryImage(t, "registry.example.com", "team/app", remoteImage, tr)
+	ref := "registry.example.com/team/app@" + root.String()
+	aliasRef := "registry.example.com/team/alias@" + root.String()
+
+	eng, err := New(Config{Root: storeRoot})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	first, err := eng.Pull(context.Background(), ref)
+	if devtest.IsVerityUnsupported(err) {
+		t.Skipf("fs-verity unsupported on the test filesystem: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("first Pull: %v", err)
+	}
+
+	info, err := eng.Inspect(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	assertDiffIDs(t, info.DiffIDs, wantDiffIDs)
+
+	tagRef := "registry.example.com/team/app:latest"
+	tagged, err := eng.Pull(context.Background(), tagRef)
+	if err != nil {
+		t.Fatalf("Pull by tag: %v", err)
+	}
+	if tagged.Ref != tagRef || tagged.Digest != root.String() {
+		t.Fatalf("tag pull = %#v, want ref %q resolved to %s", tagged, tagRef, root)
+	}
+	tagRecord := readPullRef(t, storeRoot, tagRef)
+	if tagRecord.Ref != tagRef || tagRecord.Resolved.Digest != root {
+		t.Fatalf("tag ref record = %#v, want %q -> %s", tagRecord, tagRef, root)
+	}
+
+	reg.Close()
+
+	if _, err := eng.Pull(context.Background(), tagRef); err == nil {
+		t.Fatal("Pull by tag with closed registry: expected resolution error")
+	}
+
+	second, err := eng.Pull(context.Background(), aliasRef)
+	if err != nil {
+		t.Fatalf("second Pull with closed registry: %v", err)
+	}
+	if second.Ref != aliasRef || second.Digest != root.String() || second.Size != first.Size {
+		t.Fatalf("second image = %#v, want ref %q digest %s size %d", second, aliasRef, root, first.Size)
+	}
+	refRecord := readPullRef(t, storeRoot, aliasRef)
+	if refRecord.Ref != aliasRef || refRecord.Resolved.Digest != root {
+		t.Fatalf("alias ref record = %#v, want %q -> %s", refRecord, aliasRef, root)
+	}
+	if len(refRecord.Platforms) != 1 || refRecord.Platforms[0] != ocilayout.PlatformString(&info.Platform) {
+		t.Fatalf("alias platforms = %#v, want %s", refRecord.Platforms, ocilayout.PlatformString(&info.Platform))
+	}
+}
+
 type (
 	pullBindingDoc struct {
 		Platform ocispec.Platform `json:"platform"`
@@ -197,6 +322,67 @@ type (
 		Platforms []string `json:"platforms"`
 	}
 )
+
+func useRemoteDefaultTransport(t *testing.T, tr http.RoundTripper) {
+	t.Helper()
+	old := remote.DefaultTransport
+	remote.DefaultTransport = tr
+	t.Cleanup(func() {
+		remote.DefaultTransport = old
+	})
+}
+
+func registryHostImage(t *testing.T, layers int64) (ggcrv1.Image, []digest.Digest) {
+	t.Helper()
+	img, err := random.Image(1024, layers)
+	if err != nil {
+		t.Fatalf("random image: %v", err)
+	}
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		t.Fatalf("config file: %v", err)
+	}
+	cfg.OS = runtime.GOOS
+	cfg.Architecture = runtime.GOARCH
+	img, err = mutate.ConfigFile(img, cfg)
+	if err != nil {
+		t.Fatalf("set platform: %v", err)
+	}
+
+	diffIDs := make([]digest.Digest, 0, len(cfg.RootFS.DiffIDs))
+	for _, id := range cfg.RootFS.DiffIDs {
+		diffIDs = append(diffIDs, digest.Digest(id.String()))
+	}
+	return img, diffIDs
+}
+
+func pushRegistryImage(t *testing.T, host, repo string, img ggcrv1.Image, tr http.RoundTripper) digest.Digest {
+	t.Helper()
+	tag, err := name.NewTag(host + "/" + repo + ":latest")
+	if err != nil {
+		t.Fatalf("tag: %v", err)
+	}
+	if err := remote.Write(tag, img, remote.WithTransport(tr)); err != nil {
+		t.Fatalf("push image: %v", err)
+	}
+	d, err := img.Digest()
+	if err != nil {
+		t.Fatalf("image digest: %v", err)
+	}
+	return digest.Digest(d.String())
+}
+
+func assertDiffIDs(t *testing.T, got, want []digest.Digest) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("DiffIDs len = %d, want %d", len(got), len(want))
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("DiffIDs[%d] = %s, want %s", i, got[i], want[i])
+		}
+	}
+}
 
 func readPullBinding(t *testing.T, root string, d digest.Digest, p ocispec.Platform) pullBindingDoc {
 	t.Helper()

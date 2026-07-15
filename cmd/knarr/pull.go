@@ -35,7 +35,7 @@ func newPullCommand(g *globalOptions) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&fromDir, "from-dir", "", "source from an OCI image layout directory instead of a registry")
+	cmd.Flags().StringVar(&fromDir, "from-dir", "", "sideload from an OCI image layout directory instead of a registry")
 	cli.AddFormatFlag(cmd, &format)
 	return cmd
 }

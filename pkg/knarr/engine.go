@@ -168,7 +168,11 @@ type Engine interface {
 	// it to dest.
 	Publish(ctx context.Context, dir, dest string) error
 	// Pull fetches ref into the local store, transferring only content the
-	// store does not already hold, and returns the stored image.
+	// store does not already hold, and returns the stored image. A registry
+	// ref may be digest-pinned (the digest is the trust anchor) or tagged, in
+	// which case the tag is resolved to the digest the registry currently
+	// serves and recorded only as a reference alias; a sideload ref must be
+	// digest-pinned.
 	Pull(ctx context.Context, ref string, opts ...PullOption) (*Image, error)
 	// Mount mounts ref at target: a single read-only composefs mount by
 	// default, a writable overlay over that composefs base when a writable

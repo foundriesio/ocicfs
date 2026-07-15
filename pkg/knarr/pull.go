@@ -15,11 +15,13 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/foundriesio/knarr/internal/digestutil"
+	"github.com/foundriesio/knarr/internal/imagestore"
 	"github.com/foundriesio/knarr/internal/materialize"
+	"github.com/foundriesio/knarr/internal/objectstore"
+	"github.com/foundriesio/knarr/internal/ocichain"
 	"github.com/foundriesio/knarr/internal/ocilayout"
+	"github.com/foundriesio/knarr/internal/ociremote"
 )
-
-const registryPullUnsupported = "registry pull is not yet supported; use --from-dir"
 
 // Pull fetches ref into the local store and returns the stored image.
 func (e *engine) Pull(ctx context.Context, ref string, opts ...PullOption) (*Image, error) {
@@ -35,21 +37,43 @@ func (e *engine) pull(ctx context.Context, ref string, opts ...PullOption) (*Ima
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+
+	var (
+		src  ocichain.BlobSource
+		root digest.Digest
+		err  error
+	)
 	if cfg.FromDir == "" {
-		return nil, errors.New(registryPullUnsupported)
+		src, root, err = ociremote.Open(ctx, ref)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		root, err = parseDigestPinnedRef(ref)
+		if err != nil {
+			return nil, err
+		}
+		src, err = ocilayout.Open(cfg.FromDir)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	root, err := parseDigestPinnedRef(ref)
-	if err != nil {
+	platform := hostPlatform()
+	if cached, ok, err := verifiedPulledImage(ctx, e.obj, e.img, root, platform); err != nil {
 		return nil, err
+	} else if ok {
+		if err := e.refs.Put(ref, cached.rootDesc, time.Now(), []string{ocilayout.PlatformString(&cached.platform)}); err != nil {
+			return nil, err
+		}
+		return &Image{
+			Ref:    ref,
+			Digest: root.String(),
+			Size:   cached.descriptor.Size,
+		}, nil
 	}
 
-	src, err := ocilayout.Open(cfg.FromDir)
-	if err != nil {
-		return nil, err
-	}
-
-	built, err := materialize.Materialize(ctx, e.obj, e.img, src, root, hostPlatform())
+	built, err := materialize.Materialize(ctx, e.obj, e.img, src, root, platform)
 	if err != nil {
 		return nil, err
 	}
@@ -62,6 +86,46 @@ func (e *engine) pull(ctx context.Context, ref string, opts ...PullOption) (*Ima
 		Digest: root.String(),
 		Size:   built.Descriptor.Size,
 	}, nil
+}
+
+type cachedImage struct {
+	rootDesc   ocispec.Descriptor
+	platform   ocispec.Platform
+	descriptor ocispec.Descriptor
+}
+
+// verifiedPulledImage reports whether (root, platform) is already materialized
+// and trustworthy: a binding exists, the bound composefs object measures to the
+// recorded fs-verity digest, and the metadata chain resolves from the local
+// store. Any failure short of a canceled context reports "not cached" rather
+// than an error, so the caller falls through to a full pull, which rewrites the
+// same content idempotently and heals whatever was stale or missing.
+func verifiedPulledImage(ctx context.Context, obj *objectstore.Store, imgStore *imagestore.Store, root digest.Digest, platform ocispec.Platform) (cachedImage, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return cachedImage{}, false, err
+	}
+	b, err := imgStore.Get(root, platform)
+	if err != nil {
+		return cachedImage{}, false, nil
+	}
+	if err := obj.CheckVerity(); err != nil {
+		return cachedImage{}, false, nil
+	}
+	measured, err := obj.VerityDigest(b.Descriptor.Digest)
+	if err != nil || measured != b.FsverityDigest {
+		return cachedImage{}, false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return cachedImage{}, false, err
+	}
+	res, err := ocichain.Resolve(ctx, casBlobSource{store: obj}, root, platform)
+	if err != nil {
+		if err := ctx.Err(); err != nil {
+			return cachedImage{}, false, err
+		}
+		return cachedImage{}, false, nil
+	}
+	return cachedImage{rootDesc: res.RootDesc, platform: res.Platform, descriptor: b.Descriptor}, true, nil
 }
 
 func parseDigestPinnedRef(ref string) (digest.Digest, error) {
