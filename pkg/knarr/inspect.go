@@ -28,7 +28,7 @@ func (e *engine) Inspect(ctx context.Context, ref string) (*ImageInfo, error) {
 }
 
 func (e *engine) inspect(ctx context.Context, ref string) (*ImageInfo, error) {
-	root, err := parseDigestPinnedRef(ref)
+	root, err := e.resolveLocalRef(ref)
 	if err != nil {
 		return nil, err
 	}

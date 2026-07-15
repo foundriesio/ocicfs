@@ -275,6 +275,14 @@ func TestPullRegistryE2ESkipsExistingImage(t *testing.T) {
 
 	reg.Close()
 
+	tagInfo, err := eng.Inspect(context.Background(), tagRef)
+	if err != nil {
+		t.Fatalf("Inspect by pulled tag with closed registry: %v", err)
+	}
+	if tagInfo.Root != root {
+		t.Fatalf("Inspect by tag root = %s, want %s", tagInfo.Root, root)
+	}
+
 	if _, err := eng.Pull(context.Background(), tagRef); err == nil {
 		t.Fatal("Pull by tag with closed registry: expected resolution error")
 	}

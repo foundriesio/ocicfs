@@ -52,7 +52,9 @@ digest the registry currently serves (one extra round-trip) and from there runs
 the same digest-verified pull as a pinned reference. The resolution step trusts
 the registry, so pin digests in production — the printed digest is the one to
 pin. The tag is recorded only as a reference alias; the image is stored under
-its digest.
+its digest. Mount, inspect, and remove accept the same reference afterwards:
+an unpinned ref resolves locally — never over the network — to the digest its
+most recent pull recorded.
 
 Registry pull uses HTTPS, with one exception: a loopback registry (localhost
 or a loopback IP) may use plain HTTP — content integrity comes from the

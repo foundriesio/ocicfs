@@ -29,12 +29,13 @@ func newInspectEngine(t *testing.T) Engine {
 	return eng
 }
 
-func TestInspectRequiresDigestPinnedRef(t *testing.T) {
+func TestInspectRejectsUnresolvableRef(t *testing.T) {
 	eng := newInspectEngine(t)
-	for _, ref := range []string{"repo/app:latest", "app@sha256:nothex"} {
-		if _, err := eng.Inspect(context.Background(), ref); err == nil {
-			t.Errorf("Inspect(%q): expected a digest-pinned-ref error", ref)
-		}
+	if _, err := eng.Inspect(context.Background(), "repo/app:latest"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Inspect(unrecorded tag) error = %v, want ErrNotFound", err)
+	}
+	if _, err := eng.Inspect(context.Background(), "app@sha256:nothex"); err == nil || errors.Is(err, ErrNotFound) {
+		t.Errorf("Inspect(malformed pinned ref) error = %v, want a digest parse error, not ErrNotFound", err)
 	}
 }
 

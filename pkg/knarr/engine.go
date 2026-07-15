@@ -178,7 +178,9 @@ type Engine interface {
 	// default, a writable overlay over that composefs base when a writable
 	// With* option opts in, or the image's verified EROFS metadata alone with
 	// WithMetadataOnly. Mount operates on content already present in the
-	// store and does not fetch over the network; pull ref first.
+	// store and does not fetch over the network; pull ref first. A ref that
+	// does not pin a digest resolves locally to the digest its most recent
+	// pull recorded; every verification still keys on that digest.
 	Mount(ctx context.Context, ref, target string, opts ...MountOption) error
 	// Unmount tears down the mount at target.
 	Unmount(ctx context.Context, target string) error
@@ -190,9 +192,11 @@ type Engine interface {
 	// already present in the local store: root digest, resolved platform,
 	// ordered config diff_ids, and the composefs image descriptor with its
 	// fs-verity digest. Inspect reads only local state and never fetches over
-	// the network; it returns an error satisfying errors.Is(err, ErrNotFound)
-	// when the image has not been pulled (its metadata or binding is absent
-	// locally). An image whose index does not offer the host platform is a
+	// the network; a ref that does not pin a digest resolves locally to the
+	// digest its most recent pull recorded. Inspect returns an error
+	// satisfying errors.Is(err, ErrNotFound) when the image has not been
+	// pulled (its metadata or binding is absent locally). An image whose
+	// index does not offer the host platform is a
 	// different, permanent condition and is reported as its own error.
 	Inspect(ctx context.Context, ref string) (*ImageInfo, error)
 	// List returns the images present in the local store.

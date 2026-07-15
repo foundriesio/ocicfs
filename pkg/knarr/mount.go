@@ -52,7 +52,7 @@ func (e *engine) mount(ctx context.Context, ref, target string, opts ...MountOpt
 		return errors.New(writableMountUnsupported)
 	}
 
-	root, err := parseDigestPinnedRef(ref)
+	root, err := e.resolveLocalRef(ref)
 	if err != nil {
 		return err
 	}

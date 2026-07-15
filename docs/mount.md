@@ -1,8 +1,12 @@
 # Mounting a pulled image (`knarr mount`)
 
-`knarr mount` exposes an already-pulled, digest-pinned image as a read-only
-composefs filesystem. It does not pull, rebuild, or execute anything; it reads
-the local binding and object store produced by `knarr pull --from-dir`.
+`knarr mount` exposes an already-pulled image as a read-only composefs
+filesystem. It does not pull, rebuild, or execute anything; it reads the local
+binding and object store produced by `knarr pull`. The reference may pin a
+digest (`name@sha256:<hex>` or a bare `sha256:<hex>`) or be any ref string a
+previous pull recorded, such as a tag: an unpinned ref resolves locally —
+never over the network — to the digest its most recent pull recorded, and
+every verification keys on that digest.
 
 ## Prerequisites
 

@@ -74,8 +74,11 @@ func TestMountValidatesRefAndTargetBeforeStore(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	target := t.TempDir()
-	if err := eng.Mount(context.Background(), "example.com/app:latest", target); err == nil || !strings.Contains(err.Error(), "digest-pinned reference") {
-		t.Fatalf("tag mount error = %v, want digest-pinned reference error", err)
+	if err := eng.Mount(context.Background(), "example.com/app:latest", target); !errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), "not recorded by a pull") {
+		t.Fatalf("unrecorded tag mount error = %v, want ErrNotFound with a pull hint", err)
+	}
+	if err := eng.Mount(context.Background(), "example.com/app@sha256:nothex", target); err == nil || errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), "invalid digest") {
+		t.Fatalf("malformed pinned-ref mount error = %v, want a digest parse error, not ErrNotFound", err)
 	}
 
 	ref := "app@" + digest.SHA256.FromString("root").String()

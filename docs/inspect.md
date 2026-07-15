@@ -7,8 +7,10 @@ composefs image built for it. It reads only local state and never touches the ne
 knarr inspect app@sha256:<digest>
 ```
 
-The reference is digest-pinned, the same forms `mount` accepts — `name@sha256:<hex>` or a bare
-`sha256:<hex>`. It prints, for the host platform:
+The reference takes the same forms `mount` accepts — `name@sha256:<hex>`, a bare
+`sha256:<hex>`, or any ref string a previous pull recorded (a tag resolves locally to the
+digest its most recent pull recorded, never over the network). It prints, for the host
+platform:
 
 ```
 root       sha256:<digest>          # the pinned root (index or manifest)

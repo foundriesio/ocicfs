@@ -21,6 +21,7 @@ import (
 	"github.com/foundriesio/knarr/internal/ocichain"
 	"github.com/foundriesio/knarr/internal/ocilayout"
 	"github.com/foundriesio/knarr/internal/ociremote"
+	"github.com/foundriesio/knarr/internal/refstore"
 )
 
 // Pull fetches ref into the local store and returns the stored image.
@@ -126,6 +127,33 @@ func verifiedPulledImage(ctx context.Context, obj *objectstore.Store, imgStore *
 		return cachedImage{}, false, nil
 	}
 	return cachedImage{rootDesc: res.RootDesc, platform: res.Platform, descriptor: b.Descriptor}, true, nil
+}
+
+// resolveLocalRef returns the root digest ref names. A digest-pinned ref
+// carries the digest itself; any other ref string resolves through the local
+// reference store to the digest its most recent pull recorded, so a pulled tag
+// works with the verbs that read only local state. Resolution is by exact ref
+// string and never touches the network; the returned digest, not the ref, is
+// what every subsequent lookup and verification keys on. A ref that reads as a
+// digest-pin attempt (it contains "@" or is a bare digest) reports its parse
+// error instead of falling through, because pull can never have recorded such
+// a string.
+func (e *engine) resolveLocalRef(ref string) (digest.Digest, error) {
+	root, perr := parseDigestPinnedRef(ref)
+	if perr == nil {
+		return root, nil
+	}
+	if strings.ContainsRune(ref, '@') || looksLikeBareDigest(ref) {
+		return "", perr
+	}
+	rec, err := e.refs.Get(ref)
+	if errors.Is(err, refstore.ErrNotFound) {
+		return "", fmt.Errorf("not digest-pinned and not recorded by a pull; run `knarr pull` first or pin a digest (name@sha256:…): %w", errors.Join(ErrNotFound, err))
+	}
+	if err != nil {
+		return "", err
+	}
+	return rec.Resolved.Digest, nil
 }
 
 func parseDigestPinnedRef(ref string) (digest.Digest, error) {
