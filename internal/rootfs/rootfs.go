@@ -109,9 +109,14 @@ func tempOutput(dir string) (string, error) {
 	return name, nil
 }
 
-// node is one entry in the merged tree while layers are applied: its metadata,
+// node is one name in the merged tree while layers are applied: its metadata,
 // the content and fs-verity digests for a regular file, and the index of the
-// layer that last wrote it (so an opaque marker removes only lower-layer entries).
+// layer that last wrote it (so an opaque marker removes only lower-layer names).
+// A hardlink name carries only link and layer: link points at the node holding
+// the shared inode's metadata and content, so every name of one inode reads the
+// same payload, a whiteout removes just a name, and replacing one name installs
+// a fresh node at it without touching the others — the semantics of link(2).
+// link always points at a payload node directly, never at another link node.
 type node struct {
 	mode     os.FileMode
 	uid      int
@@ -124,6 +129,7 @@ type node struct {
 	devmajor int64
 	devminor int64
 	layer    int
+	link     *node
 }
 
 // buildEntries applies every layer in order into one tree, synthesises any
@@ -214,9 +220,10 @@ func applyLayer(ctx context.Context, store *objectstore.Store, tree map[string]*
 }
 
 // applyHeader merges a single tar entry into tree: a regular file streams from tr
-// into CAS (recording its content and fs-verity digests), a hardlink clones its
-// regular-file target, and the remaining types become metadata-only nodes.
-// Whiteout and opaque markers are handled by the caller before this is reached.
+// into CAS (recording its content and fs-verity digests), a hardlink becomes
+// another name of its target's inode, and the remaining types become
+// metadata-only nodes. Whiteout and opaque markers are handled by the caller
+// before this is reached.
 func applyHeader(ctx context.Context, store *objectstore.Store, tree map[string]*node, tr *tar.Reader, hdr *tar.Header, name string, idx int) error {
 	// A non-directory entry replaces whatever occupied name. If that was a
 	// directory, its children lose their parent, so drop the whole subtree
@@ -257,7 +264,7 @@ func applyHeader(ctx context.Context, store *objectstore.Store, tree map[string]
 		if err != nil {
 			return fmt.Errorf("hardlink %s target: %w", name, err)
 		}
-		if err := cloneHardlink(tree, name, target, idx); err != nil {
+		if err := linkHardlink(tree, name, target, idx); err != nil {
 			return fmt.Errorf("hardlink %s -> %s: %w", name, target, err)
 		}
 	case tar.TypeSymlink:
@@ -374,27 +381,23 @@ func removeOpaque(tree map[string]*node, dir string, idx int) {
 	}
 }
 
-// cloneHardlink records name as an independent copy of an existing regular-file
-// node, so a later whiteout of the target does not drop the link; a missing or
-// non-regular target is a malformed layer.
-func cloneHardlink(tree map[string]*node, name, target string, idx int) error {
+// linkHardlink records name as another name of target's inode: the new name's
+// node points at the payload node all names of that inode share, so the final
+// image gives them one inode, exactly as link(2) would. A missing target is a
+// malformed layer, and a directory target is rejected as it is by every kernel;
+// any other type — including a symlink or device — can be hardlinked.
+func linkHardlink(tree map[string]*node, name, target string, idx int) error {
 	n, ok := tree[target]
 	if !ok {
 		return errors.New("target does not exist")
 	}
-	if n.mode&os.ModeType != 0 {
-		return fmt.Errorf("target is not a regular file")
+	if n.mode&os.ModeDir != 0 {
+		return errors.New("target is a directory")
 	}
-	tree[name] = &node{
-		mode:   n.mode,
-		uid:    n.uid,
-		gid:    n.gid,
-		xattrs: cloneXattrs(n.xattrs),
-		digest: n.digest,
-		verity: n.verity,
-		size:   n.size,
-		layer:  idx,
+	if n.link != nil {
+		n = n.link
 	}
+	tree[name] = &node{layer: idx, link: n}
 	return nil
 }
 
@@ -423,16 +426,40 @@ func ensureParents(tree map[string]*node) error {
 }
 
 // entriesFromTree converts the merged tree into composefs entries with absolute
-// paths, sorted by path.
+// paths, sorted by path. Names sharing an inode collapse to one full entry — the
+// first surviving name in path order carries the payload and the inode's name
+// count — with every further name emitted as a hardlink entry referencing it, so
+// the target of a hardlink entry always precedes it in the sorted dump.
 func entriesFromTree(tree map[string]*node) []composefs.Entry {
 	paths := make([]string, 0, len(tree))
-	for p := range tree {
+	nlink := make(map[*node]int, len(tree))
+	for p, n := range tree {
 		paths = append(paths, p)
+		if n.link != nil {
+			n = n.link
+		}
+		if n.mode&os.ModeDir == 0 {
+			nlink[n]++
+		}
 	}
 	sort.Strings(paths)
 	entries := make([]composefs.Entry, 0, len(paths))
+	canonical := make(map[*node]string, len(nlink))
 	for _, p := range paths {
 		n := tree[p]
+		if n.link != nil {
+			n = n.link
+		}
+		if n.mode&os.ModeDir == 0 {
+			if first, ok := canonical[n]; ok {
+				entries = append(entries, composefs.Entry{
+					Path:     "/" + p,
+					Hardlink: "/" + first,
+				})
+				continue
+			}
+			canonical[n] = p
+		}
 		entries = append(entries, composefs.Entry{
 			Path:     "/" + p,
 			Mode:     n.mode,
@@ -445,6 +472,7 @@ func entriesFromTree(tree map[string]*node) []composefs.Entry {
 			Size:     n.size,
 			Devmajor: n.devmajor,
 			Devminor: n.devminor,
+			Nlink:    nlink[n],
 		})
 	}
 	return entries

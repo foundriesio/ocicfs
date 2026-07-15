@@ -37,11 +37,13 @@ type Layout struct {
 	Platform   ocispec.Platform
 }
 
-// File is a regular file placed in the layout's single layer.
+// File is a regular file placed in the layout's single layer, or, when Link is
+// set, a hardlink to the earlier entry named by Link (Mode and Body are ignored).
 type File struct {
 	Name string
 	Mode int64
 	Body string
+	Link string
 }
 
 // BuildSingleLayerGzip writes a minimal OCI image layout under dir: one tar+gzip
@@ -158,6 +160,13 @@ func tarBytes(files []File) ([]byte, error) {
 		return nil, fmt.Errorf("octest: tar root header: %w", err)
 	}
 	for _, f := range files {
+		if f.Link != "" {
+			hdr := &tar.Header{Name: f.Name, Typeflag: tar.TypeLink, Linkname: f.Link}
+			if err := tw.WriteHeader(hdr); err != nil {
+				return nil, fmt.Errorf("octest: tar header %s: %w", f.Name, err)
+			}
+			continue
+		}
 		hdr := &tar.Header{Name: f.Name, Mode: f.Mode, Size: int64(len(f.Body))}
 		if err := tw.WriteHeader(hdr); err != nil {
 			return nil, fmt.Errorf("octest: tar header %s: %w", f.Name, err)

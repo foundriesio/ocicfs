@@ -28,13 +28,16 @@ import (
 //	PATH SIZE MODE NLINK UID GID RDEV MTIME PAYLOAD CONTENT DIGEST [xattrs...]
 //
 // The fields below map onto those columns (see the per-field comments). WriteDump
-// fixes the columns Entry does not model: NLINK is always 1 (mkcomposefs recomputes
-// directory link counts), MTIME is always 0 (reproducible builds), and CONTENT is
-// always "-". knarr never inlines file content into the image: every regular file
-// is stored by digest, so its bytes live in a separate fs-verity-sealed CAS object
-// rather than in the EROFS, which is what keeps per-file integrity and content
-// dedup. Hardlinks are resolved to regular files referencing the target's backing
-// object before they reach here.
+// fixes the columns Entry does not model: MTIME is always 0 (reproducible builds)
+// and CONTENT is always "-". knarr never inlines file content into the image:
+// every regular file is stored by digest, so its bytes live in a separate
+// fs-verity-sealed CAS object rather than in the EROFS, which is what keeps
+// per-file integrity and content dedup. An entry with Hardlink set is another
+// name for an earlier entry: it carries only Path and Hardlink, and mkcomposefs
+// gives both names one shared inode whose metadata and content come from the
+// target entry. mkcomposefs recomputes directory link counts but takes a leaf's
+// st_nlink from the NLINK column, so a multiply-linked entry must carry its
+// name count in Nlink for the mounted inode to report it.
 //
 // PAYLOAD and DIGEST are distinct in knarr: PAYLOAD redirects into the
 // content-sha256-keyed CAS (derived from Digest) while DIGEST is the fs-verity
@@ -46,11 +49,13 @@ type Entry struct {
 	UID, GID int               // UID, GID: owner ids
 	Xattrs   map[string]string // trailing KEY=VALUE xattr fields
 	Linkname string            // PAYLOAD, for symlinks: the link target
+	Hardlink string            // PAYLOAD, for hardlinks: absolute path of the earlier entry this name shares an inode with; when set every other field except Path is ignored
 	Digest   digest.Digest     // PAYLOAD, for regular files: content digest of the backing CAS object, emitted as the "<2>/<rest>" redirect
 	Verity   digest.Digest     // DIGEST: fs-verity digest the kernel validates the backing object against; required for regular files
 	Size     int64             // SIZE: file size (ignored for directories)
 	Devmajor int64             // RDEV (major): device number for device nodes
 	Devminor int64             // RDEV (minor): device number for device nodes
+	Nlink    int               // NLINK: the inode's name count; 0 is written as 1
 }
 
 // WriteImage streams a composefs dump for entries to a temp file beside out and
@@ -124,11 +129,24 @@ func WriteDump(w io.Writer, entries []Entry) error {
 //
 //	PATH SIZE MODE NLINK UID GID RDEV MTIME PAYLOAD CONTENT DIGEST [xattrs...]
 //
-// knarr does not track per-file mtime or link counts, so MTIME is fixed at zero
-// (reproducible) and NLINK at 1 (mkcomposefs recomputes directory link counts).
+// knarr does not track per-file mtime, so MTIME is fixed at zero (reproducible).
 func writeDumpLine(w io.Writer, e *Entry) error {
 	if e.Path == "" || e.Path[0] != '/' {
 		return fmt.Errorf("path must be absolute, got %q", e.Path)
+	}
+
+	if e.Hardlink != "" {
+		if e.Hardlink[0] != '/' {
+			return fmt.Errorf("hardlink target must be absolute, got %q", e.Hardlink)
+		}
+		// A hardlink line carries only the path and its target: the '@' prefix
+		// on the mode column marks it (the mode value after it is ignored, as
+		// are the stat columns, written as placeholders) and PAYLOAD names the
+		// target entry, whose line defines the shared inode's metadata,
+		// content, and xattrs.
+		_, err := fmt.Fprintf(w, "%s 0 @120000 - - - - 0.0 %s - -\n",
+			escapeDumpField(e.Path), escapeDumpField(e.Hardlink))
+		return err
 	}
 
 	size := e.Size
@@ -140,8 +158,12 @@ func writeDumpLine(w io.Writer, e *Entry) error {
 		rdev = unix.Mkdev(uint32(e.Devmajor), uint32(e.Devminor)) // #nosec G115 -- device major/minor fit in uint32
 	}
 
-	if _, err := fmt.Fprintf(w, "%s %d %o 1 %d %d %d 0.000000000 ",
-		escapeDumpField(e.Path), size, unixMode(e.Mode), e.UID, e.GID, rdev); err != nil {
+	nlink := e.Nlink
+	if nlink < 1 {
+		nlink = 1
+	}
+	if _, err := fmt.Fprintf(w, "%s %d %o %d %d %d %d 0.000000000 ",
+		escapeDumpField(e.Path), size, unixMode(e.Mode), nlink, e.UID, e.GID, rdev); err != nil {
 		return err
 	}
 

@@ -35,7 +35,10 @@ func TestWriteDump(t *testing.T) {
 		{Path: "/dev/null", Mode: os.ModeDevice | os.ModeCharDevice | 0o666, Devmajor: 1, Devminor: 3},
 		{Path: "/app/fifo", Mode: os.ModeNamedPipe | 0o644},
 		{Path: "/app/cfg", Mode: 0o600, Size: 2, Digest: d('2'), Verity: d('b'), Xattrs: map[string]string{"user.foo": "bar"}},
+		{Path: "/app/run2", Hardlink: "/app/run"},
 	}
+	// /app/run is hardlinked by /app/run2, so its entry carries Nlink 2.
+	entries[1].Nlink = 2
 
 	const ones = "1111111111111111111111111111111111111111111111111111111111111111" // /app/run content
 	const twos = "2222222222222222222222222222222222222222222222222222222222222222" // /app/cfg content
@@ -46,7 +49,8 @@ func TestWriteDump(t *testing.T) {
 		"/app/cfg 2 100600 1 0 0 0 0.000000000 " + twos[:2] + "/" + twos[2:] + " - " + bbbs + " user.foo=bar\n" +
 		"/app/fifo 0 10644 1 0 0 0 0.000000000 - - -\n" +
 		"/app/link 0 120777 1 0 0 0 0.000000000 run - -\n" +
-		"/app/run 5 100644 1 0 0 0 0.000000000 " + ones[:2] + "/" + ones[2:] + " - " + aaas + "\n" +
+		"/app/run 5 100644 2 0 0 0 0.000000000 " + ones[:2] + "/" + ones[2:] + " - " + aaas + "\n" +
+		"/app/run2 0 @120000 - - - - 0.0 /app/run - -\n" +
 		"/dev 0 40755 1 0 0 0 0.000000000 - - -\n" +
 		"/dev/null 0 20666 1 0 0 259 0.000000000 - - -\n"
 
@@ -104,6 +108,13 @@ func TestWriteDumpRejectsRelativePath(t *testing.T) {
 	}
 }
 
+func TestWriteDumpRejectsRelativeHardlinkTarget(t *testing.T) {
+	err := WriteDump(&bytes.Buffer{}, []Entry{{Path: "/link", Hardlink: "target"}})
+	if err == nil {
+		t.Fatal("expected error for non-absolute hardlink target")
+	}
+}
+
 func TestWriteImage(t *testing.T) {
 	if _, err := exec.LookPath("mkcomposefs"); err != nil {
 		t.Skip("mkcomposefs not found in PATH")
@@ -112,6 +123,7 @@ func TestWriteImage(t *testing.T) {
 	entries := []Entry{
 		{Path: "/dir", Mode: os.ModeDir | 0o755},
 		{Path: "/dir/hello", Mode: 0o644, Size: 11, Digest: d('a'), Verity: d('b')},
+		{Path: "/dir/hello2", Hardlink: "/dir/hello"},
 	}
 	if err := WriteImage(context.Background(), out, entries); err != nil {
 		t.Fatalf("WriteImage: %v", err)

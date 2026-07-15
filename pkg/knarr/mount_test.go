@@ -41,6 +41,7 @@ func TestMountFromPulledImageE2E(t *testing.T) {
 
 	lay, err := octest.BuildSingleLayerGzip(t.TempDir(), hostPlatform(),
 		octest.File{Name: "etc/config.txt", Mode: 0o644, Body: "hello from knarr\n"},
+		octest.File{Name: "etc/config.link", Link: "etc/config.txt"},
 	)
 	if err != nil {
 		t.Fatalf("build layout: %v", err)
@@ -85,6 +86,20 @@ func TestMountFromPulledImageE2E(t *testing.T) {
 	if !bytes.Equal(data, []byte("hello from knarr\n")) {
 		t.Fatalf("mounted file = %q", data)
 	}
+
+	// The layer's hardlink must surface as a real shared inode, not an
+	// independent copy of the file.
+	var st1, st2 unix.Stat_t
+	if err := unix.Stat(filepath.Join(target, "etc", "config.txt"), &st1); err != nil {
+		t.Fatalf("stat config.txt: %v", err)
+	}
+	if err := unix.Stat(filepath.Join(target, "etc", "config.link"), &st2); err != nil {
+		t.Fatalf("stat config.link: %v", err)
+	}
+	if st1.Ino != st2.Ino || st1.Nlink != 2 {
+		t.Fatalf("hardlink inodes = %d/%d nlink = %d, want one shared inode with nlink 2", st1.Ino, st2.Ino, st1.Nlink)
+	}
+
 	if err := eng.Unmount(context.Background(), target); err != nil {
 		t.Fatalf("Unmount: %v", err)
 	}

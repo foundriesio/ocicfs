@@ -123,41 +123,37 @@ func TestEnsureParents(t *testing.T) {
 	}
 }
 
-func TestCloneHardlink(t *testing.T) {
-	content := digest.SHA256.FromString("content")
-	verity := digest.SHA256.FromString("verity")
-	tree := map[string]*node{
-		"target": {
-			mode:   0o600,
-			uid:    10,
-			gid:    20,
-			xattrs: map[string]string{"user.k": "v"},
-			digest: content,
-			verity: verity,
-			size:   5,
-			layer:  1,
-		},
+func TestLinkHardlink(t *testing.T) {
+	target := &node{mode: 0o600, digest: digest.SHA256.FromString("content"), layer: 1}
+	tree := map[string]*node{"target": target}
+	if err := linkHardlink(tree, "link", "target", 2); err != nil {
+		t.Fatalf("linkHardlink: %v", err)
 	}
-	if err := cloneHardlink(tree, "link", "target", 2); err != nil {
-		t.Fatalf("cloneHardlink: %v", err)
+	if got := tree["link"]; got.link != target || got.layer != 2 {
+		t.Fatalf("link node = %#v, want target's payload node at layer 2", got)
 	}
-	got := tree["link"]
-	if got.digest != content || got.verity != verity || got.layer != 2 || got.uid != 10 || got.gid != 20 {
-		t.Fatalf("clone = %#v", got)
+	// A link to a link points at the payload node directly, never forming a chain.
+	if err := linkHardlink(tree, "link2", "link", 3); err != nil {
+		t.Fatalf("linkHardlink to a link: %v", err)
 	}
-	got.xattrs["user.k"] = "changed"
-	if tree["target"].xattrs["user.k"] != "v" {
-		t.Fatal("xattrs were not cloned")
+	if got := tree["link2"]; got.link != target {
+		t.Fatalf("link-to-link node = %#v, want target's payload node", got)
 	}
 }
 
-func TestCloneHardlinkRejectsNonRegular(t *testing.T) {
-	tree := map[string]*node{"target": {mode: os.ModeSymlink | 0o777}}
-	if err := cloneHardlink(tree, "link", "target", 1); err == nil {
-		t.Fatal("expected non-regular target error")
+func TestLinkHardlinkTargetChecks(t *testing.T) {
+	tree := map[string]*node{
+		"dir":     {mode: os.ModeDir | 0o755},
+		"symlink": {mode: os.ModeSymlink | 0o777, linkname: "somewhere"},
 	}
-	if err := cloneHardlink(tree, "missing-link", "missing", 1); err == nil {
+	if err := linkHardlink(tree, "link", "dir", 1); err == nil {
+		t.Fatal("expected directory target error")
+	}
+	if err := linkHardlink(tree, "link", "missing", 1); err == nil {
 		t.Fatal("expected missing target error")
+	}
+	if err := linkHardlink(tree, "link", "symlink", 1); err != nil {
+		t.Fatalf("hardlink to a symlink must be allowed: %v", err)
 	}
 }
 
@@ -169,14 +165,23 @@ func TestBuildEntriesRejectsEscapingName(t *testing.T) {
 	}
 }
 
-func TestBuildEntriesRejectsNonRegularHardlinkTarget(t *testing.T) {
+func TestBuildEntriesHardlinkToSymlink(t *testing.T) {
 	layer := tarBytes(t,
 		tarEntry{name: "target", typ: tar.TypeSymlink, mode: 0o777, link: "somewhere"},
 		tarEntry{name: "link", typ: tar.TypeLink, link: "target"},
 	)
-	_, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
-	if err == nil {
-		t.Fatal("expected non-regular hardlink target error")
+	entries, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	if err != nil {
+		t.Fatalf("buildEntries: %v", err)
+	}
+	byPath := entriesByPath(entries)
+	// "/link" sorts first, so it carries the shared inode's payload and the
+	// original "/target" name becomes the hardlink entry referencing it.
+	if got := byPath["/link"]; got.Linkname != "somewhere" || got.Hardlink != "" {
+		t.Fatalf("/link = %#v, want the symlink payload", got)
+	}
+	if got := byPath["/target"]; got.Hardlink != "/link" {
+		t.Fatalf("/target = %#v, want a hardlink entry to /link", got)
 	}
 }
 
@@ -241,13 +246,80 @@ func TestBuildEntriesWithStore(t *testing.T) {
 	if cfg.Mode.Perm() != 0o600 || cfg.Xattrs["user.test"] != "yes" {
 		t.Fatalf("/etc/config metadata = %#v", cfg)
 	}
-	app := byPath["/usr/bin/app"]
-	link := byPath["/app-copy"]
-	if link.Digest != app.Digest || link.Verity != app.Verity {
-		t.Fatalf("hardlink did not clone backing digests: app=%#v link=%#v", app, link)
+	// "/app-copy" sorts before "/usr/bin/app", so it carries the shared inode's
+	// payload and the original name is emitted as the hardlink entry.
+	appCopy := byPath["/app-copy"]
+	if appCopy.Digest != digest.FromBytes([]byte("app")) || appCopy.Verity == "" || appCopy.Hardlink != "" || appCopy.Nlink != 2 {
+		t.Fatalf("/app-copy = %#v, want the shared inode payload with Nlink 2", appCopy)
+	}
+	if got := byPath["/usr/bin/app"]; got.Hardlink != "/app-copy" {
+		t.Fatalf("/usr/bin/app = %#v, want a hardlink entry to /app-copy", got)
 	}
 	if byPath["/link"].Linkname != "etc/config" {
 		t.Fatalf("symlink = %#v", byPath["/link"])
+	}
+}
+
+// TestBuildEntriesHardlinkSurvivesTargetWhiteout asserts that whiting out one
+// name of a multiply-linked inode removes only that name: the remaining names
+// keep the content, one of them becoming the payload entry.
+func TestBuildEntriesHardlinkSurvivesTargetWhiteout(t *testing.T) {
+	store := newVerityStore(t)
+	layer1 := tarBytes(t,
+		tarEntry{name: "bin/app", typ: tar.TypeReg, mode: 0o755, body: "app"},
+		tarEntry{name: "bin/alias1", typ: tar.TypeLink, link: "bin/app"},
+		tarEntry{name: "bin/alias2", typ: tar.TypeLink, link: "bin/alias1"},
+	)
+	layer2 := tarBytes(t,
+		tarEntry{name: "bin/.wh.app", typ: tar.TypeReg, mode: 0o000},
+	)
+	entries, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
+		digest.FromBytes(layer1),
+		digest.FromBytes(layer2),
+	})
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("buildEntries: %v", err)
+	}
+	byPath := entriesByPath(entries)
+	if _, ok := byPath["/bin/app"]; ok {
+		t.Fatal("whiteout did not remove the target name")
+	}
+	if got := byPath["/bin/alias1"]; got.Digest != digest.FromBytes([]byte("app")) || got.Mode.Perm() != 0o755 || got.Hardlink != "" || got.Nlink != 2 {
+		t.Fatalf("/bin/alias1 = %#v, want the surviving payload entry with Nlink 2", got)
+	}
+	if got := byPath["/bin/alias2"]; got.Hardlink != "/bin/alias1" {
+		t.Fatalf("/bin/alias2 = %#v, want a hardlink entry to /bin/alias1", got)
+	}
+}
+
+// TestBuildEntriesHardlinkTargetReplaced asserts that re-emitting one name of a
+// multiply-linked inode in an upper layer detaches only that name: it gets the
+// new content while the other names keep the old inode, matching what an
+// unlink-and-create sequence does to a hardlink group on a real filesystem.
+func TestBuildEntriesHardlinkTargetReplaced(t *testing.T) {
+	store := newVerityStore(t)
+	layer1 := tarBytes(t,
+		tarEntry{name: "bin/app", typ: tar.TypeReg, mode: 0o755, body: "v1"},
+		tarEntry{name: "bin/alias", typ: tar.TypeLink, link: "bin/app"},
+	)
+	layer2 := tarBytes(t,
+		tarEntry{name: "bin/app", typ: tar.TypeReg, mode: 0o755, body: "v2"},
+	)
+	entries, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
+		digest.FromBytes(layer1),
+		digest.FromBytes(layer2),
+	})
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("buildEntries: %v", err)
+	}
+	byPath := entriesByPath(entries)
+	if got := byPath["/bin/app"]; got.Digest != digest.FromBytes([]byte("v2")) || got.Hardlink != "" {
+		t.Fatalf("/bin/app = %#v, want the replacing v2 payload", got)
+	}
+	if got := byPath["/bin/alias"]; got.Digest != digest.FromBytes([]byte("v1")) || got.Hardlink != "" {
+		t.Fatalf("/bin/alias = %#v, want the original v1 payload", got)
 	}
 }
 
