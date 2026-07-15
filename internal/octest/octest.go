@@ -1,9 +1,8 @@
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package octest builds minimal on-disk OCI image layouts for tests and derives
-// the store paths a successful pull writes, so the engine-level and CLI-level
-// pull tests share one fixture instead of hand-rolling a layout each.
+// Package octest provides OCI layout, registry, and store-path fixtures shared
+// by engine-level and CLI-level tests.
 package octest
 
 import (
