@@ -87,6 +87,16 @@ run_lifecycle() {
 	jq -e '.composefs.digest | startswith("sha256:")' <<<"$inspected" >/dev/null || fail "inspect reports no composefs digest"
 	jq -e '.fsverity != ""' <<<"$inspected" >/dev/null || fail "inspect reports no fsverity digest"
 
+	echo "== inspect --layers (table, then json layer identity checks) =="
+	"${KN[@]}" inspect --layers "$ref"
+	local layered
+	layered="$("${KN[@]}" inspect --layers --format json "$ref")"
+	[ "$(jq -r '.layers | length' <<<"$layered")" -ge 1 ] || fail "inspect --layers reports no layers"
+	jq -e '[.layers[].diffID | startswith("sha256:")] | all' <<<"$layered" >/dev/null || fail "a layer diffID is malformed"
+	[ "$(jq -r '.layers[0].chainID' <<<"$layered")" = "$(jq -r '.diff_ids[0]' <<<"$layered")" ] \
+		|| fail "first layer chainID is not the first diff_id"
+	jq -e '[.layers[].size > 0] | all' <<<"$layered" >/dev/null || fail "a layer reports no archive size"
+
 	echo "== mount =="
 	"${KN[@]}" mount "$ref" "$MNT"
 	echo "== mounted rootfs (expect non-empty, read-only) =="

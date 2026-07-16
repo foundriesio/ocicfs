@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"text/tabwriter"
+	"unicode"
 
 	"github.com/spf13/cobra"
 
@@ -106,6 +108,7 @@ type ImageInfoOutput struct {
 	DiffIDs   []string         `json:"diff_ids"`
 	Composefs DescriptorOutput `json:"composefs"`
 	Fsverity  string           `json:"fsverity"`
+	Layers    []LayerOutput    `json:"layers,omitempty"`
 }
 
 // DescriptorOutput is the JSON shape for an OCI descriptor in command output.
@@ -115,8 +118,24 @@ type DescriptorOutput struct {
 	Size      int64  `json:"size"`
 }
 
+// LayerOutput is the JSON shape for one layer in `inspect --layers` output.
+// Size is the layer blob's byte size from the manifest descriptor — the
+// archive as transferred, compressed for +gzip/+zstd media types.
+type LayerOutput struct {
+	Index     int    `json:"index"`
+	MediaType string `json:"mediaType"`
+	Digest    string `json:"digest"`
+	DiffID    string `json:"diffID"`
+	ChainID   string `json:"chainID"`
+	Size      int64  `json:"size"`
+	CreatedBy string `json:"createdBy,omitempty"`
+}
+
 // WriteImageInfo renders an inspected image to w in the requested format.
-func WriteImageInfo(w io.Writer, format Format, info *knarr.ImageInfo) error {
+// withLayers appends the per-layer view — an aligned table in text output,
+// the layers array in JSON; without it the output is unchanged from before
+// the layer view existed.
+func WriteImageInfo(w io.Writer, format Format, info *knarr.ImageInfo, withLayers bool) error {
 	diffIDs := make([]string, 0, len(info.DiffIDs))
 	for _, d := range info.DiffIDs {
 		diffIDs = append(diffIDs, d.String())
@@ -132,21 +151,111 @@ func WriteImageInfo(w io.Writer, format Format, info *knarr.ImageInfo) error {
 		},
 		Fsverity: info.FsverityDigest,
 	}
+	if withLayers {
+		out.Layers = make([]LayerOutput, 0, len(info.Layers))
+		for i, l := range info.Layers {
+			out.Layers = append(out.Layers, LayerOutput{
+				Index:     i,
+				MediaType: l.MediaType,
+				Digest:    l.Digest.String(),
+				DiffID:    l.DiffID.String(),
+				ChainID:   l.ChainID.String(),
+				Size:      l.Size,
+				CreatedBy: l.CreatedBy,
+			})
+		}
+	}
 	if format == FormatJSON {
 		return emitJSON(w, out)
 	}
 
-	rows := [][2]string{{"root", out.Root}, {"platform", out.Platform}}
-	for _, d := range out.DiffIDs {
-		rows = append(rows, [2]string{"diff_id", d})
+	// Text output is the image's identity and binding; per-layer detail
+	// (including the diff_ids) renders only as the --layers table. JSON always
+	// carries diff_ids — that list is part of the stable contract. The rows go
+	// through a tabwriter so the value column is aligned for human eyes;
+	// machine consumers parse the JSON format, not this.
+	rows := [][2]string{
+		{"root", out.Root},
+		{"platform", out.Platform},
+		{"composefs", out.Composefs.Digest},
+		{"fsverity", out.Fsverity},
 	}
-	rows = append(rows, [2]string{"composefs", out.Composefs.Digest}, [2]string{"fsverity", out.Fsverity})
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, r := range rows {
-		if _, err := fmt.Fprintf(w, "%s\t%s\n", r[0], r[1]); err != nil {
+		if _, err := fmt.Fprintf(tw, "%s\t%s\n", r[0], r[1]); err != nil {
 			return err
 		}
 	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if withLayers {
+		return writeLayerTable(w, out.Layers)
+	}
 	return nil
+}
+
+// writeLayerTable renders the per-layer view as an aligned table. Digests
+// are abbreviated to keep rows terminal-sized; the JSON format carries the
+// full digest values plus the createdBy history command, which the table
+// omits.
+func writeLayerTable(w io.Writer, layers []LayerOutput) error {
+	if _, err := fmt.Fprintln(w); err != nil {
+		return err
+	}
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	if _, err := fmt.Fprintln(tw, "#\tBLOB DIGEST\tDIFFID\tCHAINID\tARCHIVE\tMEDIA TYPE"); err != nil {
+		return err
+	}
+	for _, l := range layers {
+		if _, err := fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n",
+			l.Index,
+			shortHex(l.Digest),
+			shortHex(l.DiffID),
+			shortHex(l.ChainID),
+			humanBytes(l.Size),
+			scrubControl(l.MediaType),
+		); err != nil {
+			return err
+		}
+	}
+	return tw.Flush()
+}
+
+// scrubControl replaces control characters — C0, DEL, and the C1 range,
+// whose 8-bit escape forms terminals may also interpret — with spaces so
+// publisher-authored strings (media types) cannot inject escape sequences or
+// forged rows into the terminal. The JSON path needs no scrubbing:
+// encoding/json escapes control characters.
+func scrubControl(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)
+}
+
+// shortHex abbreviates a sha256 digest string to its first 12 hex characters
+// for table display; an unexpectedly shaped value passes through scrubbed.
+func shortHex(s string) string {
+	hex, ok := strings.CutPrefix(s, "sha256:")
+	if !ok || len(hex) < 12 {
+		return scrubControl(s)
+	}
+	return hex[:12]
+}
+
+// humanBytes renders a byte count as B/KiB/MiB/… with one decimal.
+func humanBytes(n int64) string {
+	if n < 1024 {
+		return fmt.Sprintf("%d B", n)
+	}
+	v, unit := float64(n)/1024, 0
+	for v >= 1024 {
+		v, unit = v/1024, unit+1
+	}
+	return fmt.Sprintf("%.1f %ciB", v, "KMGTPE"[unit])
 }
 
 // emitJSON writes v to w as indented JSON followed by a newline.

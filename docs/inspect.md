@@ -15,10 +15,13 @@ platform:
 ```
 root       sha256:<digest>          # the pinned root (index or manifest)
 platform   linux/arm64/v8           # the resolved platform (config-declared)
-diff_id    sha256:<digest>          # one line per layer, in order
 composefs  sha256:<digest>          # the composefs image blob in the store
 fsverity   sha256:<digest>          # the fs-verity digest a mount enforces
 ```
+
+Per-layer detail — including the diff_ids — is shown by
+[`--layers`](#per-layer-view---layers); the JSON output always carries the
+`diff_ids` list as part of its stable contract.
 
 Use `--format json` for machine-readable output:
 
@@ -27,6 +30,55 @@ knarr inspect app@sha256:<digest> --format json
 # {"root":"sha256:…","platform":"linux/arm64/v8","diff_ids":["sha256:…"],
 #  "composefs":{"mediaType":"…+erofs","digest":"sha256:…","size":12288},
 #  "fsverity":"sha256:…"}
+```
+
+## Per-layer view (`--layers`)
+
+`--layers` appends a table describing each filesystem layer of the resolved
+manifest, in manifest order. It is assembled entirely from the locally stored,
+digest-verified manifest and config — no layer body is read, and nothing is
+fetched:
+
+```sh
+knarr inspect --layers app@sha256:<digest>
+```
+
+```
+root       sha256:…
+platform   linux/arm64/v8
+composefs  sha256:…
+fsverity   sha256:…
+
+#  BLOB DIGEST   DIFFID        CHAINID       ARCHIVE  MEDIA TYPE
+0  ab12cdef3456  cd34ab9012ef  cd34ab9012ef  3.4 MiB  application/vnd.oci.image.layer.v1.tar+gzip
+1  ef5678901234  781290abcdef  90123456cdab  6.1 MiB  application/vnd.oci.image.layer.v1.tar+zstd
+```
+
+Column semantics:
+
+- **ARCHIVE** is the layer blob's size from the manifest descriptor — the
+  archive as transferred, compressed for gzip/zstd layers (OCI `+gzip`/`+zstd`
+  media types or their Docker-schema equivalents) and the bare tar size for
+  uncompressed ones. It is *not* the extracted filesystem size, which is not
+  recorded in OCI metadata.
+- **DIFFID** is the digest of the layer's *uncompressed* tar stream, from
+  `config.rootfs.diff_ids`.
+- **CHAINID** is the cumulative identity of the layer stack up to that layer,
+  derived from the ordered diff_ids per the OCI image spec.
+The table abbreviates digests to 12 hex characters (the media type prints
+whole); `--format json` carries the full values, with the plain diff_id list
+unchanged and a `layers` array added (the `layers` key appears only with
+`--layers`).
+The JSON layer entries additionally carry `createdBy` — the config history
+command correlated to the layer (history entries marked `empty_layer` describe
+config-only steps and consume no layer; when history is absent or does not
+correlate cleanly, the field is omitted rather than guessed):
+
+```sh
+knarr inspect --layers --format json app@sha256:<digest>
+# {…,"layers":[{"index":0,"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip",
+#   "digest":"sha256:…","diffID":"sha256:…","chainID":"sha256:…",
+#   "size":3565158,"createdBy":"ADD rootfs.tar /"}]}
 ```
 
 ## Success and failure
