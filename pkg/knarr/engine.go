@@ -52,6 +52,13 @@ type ImageInfo struct {
 	// FsverityDigest is the fs-verity digest recorded for the composefs blob,
 	// which a mount enforces.
 	FsverityDigest string
+	// RootfsSize is the apparent size of the merged rootfs recorded when the
+	// image was built: its regular-file content bytes, each hardlink group
+	// counted once. It is not the on-disk cost (content is shared in the
+	// object store). 0 means the binding predates the field; it is recorded
+	// when the image is next actually built (a pull that verifies the image
+	// as already present does not rewrite the binding).
+	RootfsSize int64
 	// Layers describes each filesystem layer of the resolved manifest, in
 	// manifest order.
 	Layers []LayerInfo

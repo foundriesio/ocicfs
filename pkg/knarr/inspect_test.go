@@ -125,6 +125,9 @@ func TestInspectAfterPullE2E(t *testing.T) {
 	if info.FsverityDigest != binding.RootFS.Fsverity.Digest.String() {
 		t.Fatalf("FsverityDigest = %s, want %s", info.FsverityDigest, binding.RootFS.Fsverity.Digest)
 	}
+	if want := int64(len("hello from knarr\n")); info.RootfsSize != want {
+		t.Fatalf("RootfsSize = %d, want %d (the fixture file's content bytes)", info.RootfsSize, want)
+	}
 	if len(info.Layers) != 1 {
 		t.Fatalf("Layers len = %d, want 1", len(info.Layers))
 	}

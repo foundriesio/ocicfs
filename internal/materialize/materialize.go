@@ -68,6 +68,7 @@ func Materialize(ctx context.Context, store *objectstore.Store, img *imagestore.
 	if err := img.Put(root, res.Platform, imagestore.Binding{
 		Descriptor:     built.Descriptor,
 		FsverityDigest: built.FsverityDigest,
+		RootfsSize:     built.RootfsSize,
 	}); err != nil {
 		return Built{}, err
 	}

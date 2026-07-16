@@ -17,7 +17,20 @@ root       sha256:<digest>          # the pinned root (index or manifest)
 platform   linux/arm64/v8           # the resolved platform (config-declared)
 composefs  sha256:<digest>          # the composefs image blob in the store
 fsverity   sha256:<digest>          # the fs-verity digest a mount enforces
+rootfs     117.7 MiB                # apparent size of the merged rootfs
 ```
+
+The rootfs size is recorded when the image is built at pull time: it is the
+merged tree's regular-file content bytes — each hardlink group counted once,
+overwritten and whited-out files excluded — i.e. what the mounted image's
+files add up to. It is **not** the on-disk cost (content is deduplicated and
+shared across images in the object store) and not the sum of the layer sizes.
+An image pulled before knarr recorded this value shows no row: a pull that
+verifies the image as already present is a cache hit and deliberately does
+not refetch layers just to compute a display metric. The value appears when
+the image is next actually built — after removing its last local ref and
+pulling again, or on any ordinary image update (a new digest is a fresh
+build).
 
 Per-layer detail — including the diff_ids — is shown by
 [`--layers`](#per-layer-view---layers); the JSON output always carries the
@@ -29,7 +42,7 @@ Use `--format json` for machine-readable output:
 knarr inspect app@sha256:<digest> --format json
 # {"root":"sha256:…","platform":"linux/arm64/v8","diff_ids":["sha256:…"],
 #  "composefs":{"mediaType":"…+erofs","digest":"sha256:…","size":12288},
-#  "fsverity":"sha256:…"}
+#  "fsverity":"sha256:…","rootfs_size":123456789}
 ```
 
 ## Per-layer view (`--layers`)
@@ -65,6 +78,7 @@ Column semantics:
   `config.rootfs.diff_ids`.
 - **CHAINID** is the cumulative identity of the layer stack up to that layer,
   derived from the ordered diff_ids per the OCI image spec.
+
 The table abbreviates digests to 12 hex characters (the media type prints
 whole); `--format json` carries the full values, with the plain diff_id list
 unchanged and a `layers` array added (the `layers` key appears only with

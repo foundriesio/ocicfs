@@ -17,16 +17,18 @@
 //	<root>/images/sha256/<root-xx>/<root-rest>/<os>[-<arch>[-<variant>]].json
 //
 // It records the composefs blob descriptor, the object store backing it
-// (objects/sha256), and the fs-verity digest the mount enforces -- always mode
-// "required" with a "local-measurement" source. The file is written atomically
-// and durably.
+// (objects/sha256), the fs-verity digest the mount enforces -- always mode
+// "required" with a "local-measurement" source -- and the merged rootfs's
+// apparent size as display metadata (optional; absent in bindings written
+// before it existed). The file is written atomically and durably.
 //
 //	{ "schema": "application/vnd.knarr.cfs-binding.v1+json",
 //	  "platform": {"os":"linux","architecture":"arm64","variant":"v8"},
 //	  "rootfs": { "type":"composefs",
 //	    "descriptor":  {"mediaType":"...composefs.image.v1+erofs","digest":"sha256:...","size":N},
 //	    "objectStore": {"type":"composefs-digest-store","algorithm":"sha256","path":"objects/sha256"},
-//	    "fsverity":    {"mode":"required","digest":"sha256:...","source":"local-measurement"} } }
+//	    "fsverity":    {"mode":"required","digest":"sha256:...","source":"local-measurement"},
+//	    "size":        N } }
 package imagestore
 
 import (
@@ -50,9 +52,15 @@ type Store struct {
 }
 
 // Binding is the rootfs data recorded in a prepared-image binding.
+// RootfsSize is the apparent size of the merged rootfs measured when the
+// image was built (regular-file content bytes, hardlink groups counted
+// once); it is display metadata, and 0 when the binding predates the field
+// (recorded when the image is next actually built — a pull that verifies
+// the image as already present does not rewrite the binding).
 type Binding struct {
 	Descriptor     ocispec.Descriptor
 	FsverityDigest string
+	RootfsSize     int64
 }
 
 // ErrNotFound reports that no prepared-image binding exists for a root digest
@@ -94,6 +102,7 @@ func (s *Store) Put(root digest.Digest, p ocispec.Platform, b Binding) error {
 				Digest: fsv,
 				Source: "local-measurement",
 			},
+			Size: b.RootfsSize,
 		},
 	}
 	data, err := json.Marshal(doc)
@@ -139,6 +148,7 @@ func (s *Store) Get(root digest.Digest, p ocispec.Platform) (Binding, error) {
 			Size:      doc.RootFS.Descriptor.Size,
 		},
 		FsverityDigest: doc.RootFS.Fsverity.Digest.String(),
+		RootfsSize:     doc.RootFS.Size,
 	}, nil
 }
 
@@ -180,6 +190,10 @@ type (
 		Descriptor  descriptorDoc  `json:"descriptor"`
 		ObjectStore objectStoreDoc `json:"objectStore"`
 		Fsverity    fsverityDoc    `json:"fsverity"`
+		// Size is the merged rootfs's apparent size: display metadata, not
+		// part of the trust chain, absent in bindings written before it
+		// existed.
+		Size int64 `json:"size,omitempty"`
 	}
 
 	descriptorDoc struct {
@@ -236,6 +250,9 @@ func validateBinding(doc bindingDoc, wantPlatform platformDoc) error {
 	}
 	if err := digestutil.ValidateSHA256(doc.RootFS.Fsverity.Digest); err != nil {
 		return fmt.Errorf("imagestore: fs-verity digest: %w", err)
+	}
+	if doc.RootFS.Size < 0 {
+		return fmt.Errorf("imagestore: negative rootfs size %d", doc.RootFS.Size)
 	}
 	return nil
 }

@@ -51,10 +51,18 @@ or rebuilding, and records the locally measured fs-verity digest:
     "descriptor": { "mediaType": "application/vnd.knarr.composefs.image.v1+erofs",
                     "digest": "sha256:…", "size": 12288 },
     "objectStore": { "type": "composefs-digest-store", "algorithm": "sha256", "path": "objects/sha256" },
-    "fsverity": { "mode": "required", "digest": "sha256:…", "source": "local-measurement" }
+    "fsverity": { "mode": "required", "digest": "sha256:…", "source": "local-measurement" },
+    "size": 123456789
   }
 }
 ```
+
+`rootfs.size` is display metadata recorded at build time — the merged tree's
+regular-file content bytes, hardlink groups counted once. It is not part of the
+trust chain, and is absent in bindings written before it existed. A pull that
+verifies the image as already present does not rewrite the binding, so the
+field appears when the image is next actually built (after the binding's last
+ref is removed, or on an image update).
 
 At mount time, knarr reads the host-platform binding for the pinned root digest,
 opens the referenced composefs image from `objects/sha256`, re-measures that

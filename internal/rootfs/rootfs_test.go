@@ -260,6 +260,38 @@ func TestBuildEntriesWithStore(t *testing.T) {
 	}
 }
 
+// TestContentSizeMergedTree asserts the rootfs size reflects the merged tree:
+// an overwritten file counts its final content only, a whited-out file does
+// not count, a hardlink group counts once, and metadata-only entries
+// (directories, symlinks) contribute nothing.
+func TestContentSizeMergedTree(t *testing.T) {
+	store := newVerityStore(t)
+	layer1 := tarBytes(t,
+		tarEntry{name: "etc/config", typ: tar.TypeReg, mode: 0o644, body: "original content"}, // replaced in layer2
+		tarEntry{name: "usr/bin/app", typ: tar.TypeReg, mode: 0o755, body: "application"},     // hardlinked in layer2
+		tarEntry{name: "var/junk", typ: tar.TypeReg, mode: 0o644, body: "to be removed"},      // whited out in layer2
+		tarEntry{name: "link", typ: tar.TypeSymlink, mode: 0o777, link: "etc/config"},
+		tarEntry{name: "var/lib", typ: tar.TypeDir, mode: 0o755},
+	)
+	layer2 := tarBytes(t,
+		tarEntry{name: "etc/config", typ: tar.TypeReg, mode: 0o644, body: "v2"},
+		tarEntry{name: "app-copy", typ: tar.TypeLink, link: "usr/bin/app"},
+		tarEntry{name: "var/.wh.junk", typ: tar.TypeReg, mode: 0o000},
+	)
+	entries, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
+		digest.FromBytes(layer1),
+		digest.FromBytes(layer2),
+	})
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("buildEntries: %v", err)
+	}
+	want := int64(len("v2") + len("application"))
+	if got := contentSize(entries); got != want {
+		t.Fatalf("contentSize = %d, want %d (final config + app counted once, junk removed)", got, want)
+	}
+}
+
 // TestBuildEntriesHardlinkSurvivesTargetWhiteout asserts that whiting out one
 // name of a multiply-linked inode removes only that name: the remaining names
 // keep the content, one of them becoming the payload entry.

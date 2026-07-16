@@ -91,9 +91,13 @@ func TestWriteImageInfoRendering(t *testing.T) {
 		}
 	}
 	// Per-layer detail, including the diff_ids, is --layers territory; the
-	// default text output carries only the image identity and binding.
+	// default text output carries only the image identity and binding, and an
+	// unknown (zero) rootfs size renders no row at all.
 	if strings.Contains(text.String(), "diff_id") {
 		t.Errorf("text output without --layers carries diff_id rows:\n%s", text.String())
+	}
+	if strings.Contains(text.String(), "rootfs") {
+		t.Errorf("text output shows a rootfs row for an unknown size:\n%s", text.String())
 	}
 
 	var jsonBuf bytes.Buffer
@@ -108,8 +112,9 @@ func TestWriteImageInfoRendering(t *testing.T) {
 		got.Composefs.Digest != info.Composefs.Digest.String() || got.Fsverity != info.FsverityDigest {
 		t.Fatalf("json output = %#v", got)
 	}
-	// Without --layers the JSON contract is byte-compatible with the pre-layer
-	// shape: exactly the five legacy keys, no "layers" key at all.
+	// Without --layers, and with no recorded rootfs size, the JSON contract is
+	// byte-compatible with the pre-layer shape: exactly the five legacy keys —
+	// no "layers", no "rootfs_size".
 	var keys map[string]json.RawMessage
 	if err := json.Unmarshal(jsonBuf.Bytes(), &keys); err != nil {
 		t.Fatalf("unmarshal json keys: %v", err)
@@ -136,6 +141,7 @@ func TestWriteImageInfoLayersRendering(t *testing.T) {
 			Size:      4096,
 		},
 		FsverityDigest: digest.SHA256.FromString("verity").String(),
+		RootfsSize:     25000000,
 		Layers: []knarr.LayerInfo{
 			{
 				MediaType: "application/vnd.oci.image.layer.v1.tar+gzip",
@@ -181,6 +187,9 @@ func TestWriteImageInfoLayersRendering(t *testing.T) {
 	if !strings.Contains(got, "3.4 MiB") || !strings.Contains(got, "512 B") {
 		t.Errorf("human-readable sizes missing:\n%s", got)
 	}
+	if !strings.Contains(got, "rootfs") || !strings.Contains(got, "23.8 MiB") {
+		t.Errorf("rootfs size row missing:\n%s", got)
+	}
 	// Publisher-authored text (the media type) is scrubbed: no C0 escape byte,
 	// no single-byte C1 CSI reaches the terminal.
 	if strings.ContainsAny(got, "\x1b\u009b") {
@@ -218,6 +227,19 @@ func TestWriteImageInfoLayersRendering(t *testing.T) {
 	// JSON keeps the original string; encoding/json escapes it safely.
 	if l1.CreatedBy != info.Layers[1].CreatedBy {
 		t.Errorf("json createdBy = %q, want the unmodified value", l1.CreatedBy)
+	}
+	if out.RootfsSize != 25000000 {
+		t.Errorf("json rootfs_size = %d, want the numeric byte count", out.RootfsSize)
+	}
+
+	// The rootfs size row is part of the identity block, not layer detail: it
+	// renders in the default text output too, without --layers.
+	var plain bytes.Buffer
+	if err := cli.WriteImageInfo(&plain, cli.FormatText, info, false); err != nil {
+		t.Fatalf("WriteImageInfo text without layers: %v", err)
+	}
+	if !strings.Contains(plain.String(), "rootfs") || !strings.Contains(plain.String(), "23.8 MiB") {
+		t.Errorf("default text output missing the rootfs size row:\n%s", plain.String())
 	}
 }
 
@@ -296,6 +318,9 @@ func TestRunInspectLayersFromDirE2E(t *testing.T) {
 	}
 	if got.Layers[1].MediaType != string(ocispec.MediaTypeImageLayerZstd) {
 		t.Errorf("layer 1 mediaType = %q, want zstd", got.Layers[1].MediaType)
+	}
+	if want := int64(len("base\n") + len("app\n")); got.RootfsSize != want {
+		t.Errorf("rootfs_size = %d, want %d (the merged tree's content bytes)", got.RootfsSize, want)
 	}
 
 	out.Reset()

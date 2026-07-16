@@ -64,6 +64,7 @@ func (e *engine) inspect(ctx context.Context, ref string) (*ImageInfo, error) {
 		DiffIDs:        res.DiffIDs,
 		Composefs:      b.Descriptor,
 		FsverityDigest: b.FsverityDigest,
+		RootfsSize:     b.RootfsSize,
 		Layers:         layerTable(res),
 	}, nil
 }

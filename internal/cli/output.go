@@ -102,13 +102,17 @@ func WriteImages(w io.Writer, format Format, imgs []knarr.Image) error {
 
 // ImageInfoOutput is the JSON/text shape for `knarr inspect` output. Its JSON
 // field names are a stable contract for callers that parse knarr's output.
+// RootfsSize is the merged rootfs's apparent size in bytes (regular-file
+// content, hardlink groups counted once), omitted when the local binding
+// predates the field.
 type ImageInfoOutput struct {
-	Root      string           `json:"root"`
-	Platform  string           `json:"platform"`
-	DiffIDs   []string         `json:"diff_ids"`
-	Composefs DescriptorOutput `json:"composefs"`
-	Fsverity  string           `json:"fsverity"`
-	Layers    []LayerOutput    `json:"layers,omitempty"`
+	Root       string           `json:"root"`
+	Platform   string           `json:"platform"`
+	DiffIDs    []string         `json:"diff_ids"`
+	Composefs  DescriptorOutput `json:"composefs"`
+	Fsverity   string           `json:"fsverity"`
+	RootfsSize int64            `json:"rootfs_size,omitempty"`
+	Layers     []LayerOutput    `json:"layers,omitempty"`
 }
 
 // DescriptorOutput is the JSON shape for an OCI descriptor in command output.
@@ -149,7 +153,8 @@ func WriteImageInfo(w io.Writer, format Format, info *knarr.ImageInfo, withLayer
 			Digest:    info.Composefs.Digest.String(),
 			Size:      info.Composefs.Size,
 		},
-		Fsverity: info.FsverityDigest,
+		Fsverity:   info.FsverityDigest,
+		RootfsSize: info.RootfsSize,
 	}
 	if withLayers {
 		out.Layers = make([]LayerOutput, 0, len(info.Layers))
@@ -179,6 +184,12 @@ func WriteImageInfo(w io.Writer, format Format, info *knarr.ImageInfo, withLayer
 		{"platform", out.Platform},
 		{"composefs", out.Composefs.Digest},
 		{"fsverity", out.Fsverity},
+	}
+	// The merged rootfs's apparent size is recorded at build time; a binding
+	// written before the field existed reports 0, and the row is left out
+	// rather than shown as a bogus zero.
+	if out.RootfsSize > 0 {
+		rows = append(rows, [2]string{"rootfs", humanBytes(out.RootfsSize)})
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, r := range rows {

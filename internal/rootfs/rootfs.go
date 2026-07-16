@@ -30,9 +30,14 @@ import (
 const MediaTypeComposefsImage = "application/vnd.knarr.composefs.image.v1+erofs"
 
 // Image is the generated composefs blob and its measured fs-verity digest.
+// RootfsSize is the apparent size of the merged rootfs: the regular-file
+// content bytes of the merged tree, each hardlink group counted once. It is
+// not the on-disk cost (content is shared in the object store) and not the
+// sum of the layer tar sizes (overwritten and whited-out files don't count).
 type Image struct {
 	Descriptor     ocispec.Descriptor
 	FsverityDigest string
+	RootfsSize     int64
 }
 
 // Assemble merges decompressed layer tar streams, writes their regular file
@@ -88,7 +93,22 @@ func Assemble(ctx context.Context, store *objectstore.Store, openLayer func(int)
 			Size:      fi.Size(),
 		},
 		FsverityDigest: fsv,
+		RootfsSize:     contentSize(entries),
 	}, nil
+}
+
+// contentSize sums the regular-file content bytes of the merged tree. Only a
+// payload-carrying entry has a non-zero Size, and each hardlink group's
+// payload appears on exactly one entry (the others reference it by Hardlink),
+// so the sum counts every inode's content once.
+func contentSize(entries []composefs.Entry) int64 {
+	var total int64
+	for _, e := range entries {
+		if e.Hardlink == "" {
+			total += e.Size
+		}
+	}
+	return total
 }
 
 // tempOutput reserves a unique name under dir and removes the placeholder, so

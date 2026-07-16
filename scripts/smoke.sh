@@ -86,6 +86,7 @@ run_lifecycle() {
 	[ "$(jq -r .root <<<"$inspected")" = "$digest" ] || fail "inspect root is not the pulled digest"
 	jq -e '.composefs.digest | startswith("sha256:")' <<<"$inspected" >/dev/null || fail "inspect reports no composefs digest"
 	jq -e '.fsverity != ""' <<<"$inspected" >/dev/null || fail "inspect reports no fsverity digest"
+	jq -e '.rootfs_size > 0' <<<"$inspected" >/dev/null || fail "inspect reports no merged rootfs size"
 
 	echo "== inspect --layers (table, then json layer identity checks) =="
 	"${KN[@]}" inspect --layers "$ref"

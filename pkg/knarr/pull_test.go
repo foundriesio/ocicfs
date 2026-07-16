@@ -259,6 +259,9 @@ func TestPullRegistryE2ESkipsExistingImage(t *testing.T) {
 		t.Fatalf("Inspect: %v", err)
 	}
 	assertDiffIDs(t, info.DiffIDs, wantDiffIDs)
+	if info.RootfsSize <= 0 {
+		t.Fatalf("RootfsSize = %d, want > 0 after a real build", info.RootfsSize)
+	}
 
 	tagRef := "registry.example.com/team/app:latest"
 	tagged, err := eng.Pull(context.Background(), tagRef)
@@ -287,6 +290,12 @@ func TestPullRegistryE2ESkipsExistingImage(t *testing.T) {
 		t.Fatal("Pull by tag with closed registry: expected resolution error")
 	}
 
+	// Simulate a binding written before the rootfs size existed and prove the
+	// verified-cache-hit pull below does not backfill it: that would require
+	// refetching every layer for a display metric. The size is recorded when
+	// the image is next actually built.
+	stripBindingSize(t, storeRoot, root, info.Platform)
+
 	second, err := eng.Pull(context.Background(), aliasRef)
 	if err != nil {
 		t.Fatalf("second Pull with closed registry: %v", err)
@@ -300,6 +309,14 @@ func TestPullRegistryE2ESkipsExistingImage(t *testing.T) {
 	}
 	if len(refRecord.Platforms) != 1 || refRecord.Platforms[0] != ocilayout.PlatformString(&info.Platform) {
 		t.Fatalf("alias platforms = %#v, want %s", refRecord.Platforms, ocilayout.PlatformString(&info.Platform))
+	}
+
+	legacy, err := eng.Inspect(context.Background(), aliasRef)
+	if err != nil {
+		t.Fatalf("Inspect after cache-hit pull: %v", err)
+	}
+	if legacy.RootfsSize != 0 {
+		t.Fatalf("RootfsSize = %d after a cache-hit pull of a legacy binding, want 0 (no backfill)", legacy.RootfsSize)
 	}
 }
 
@@ -389,6 +406,38 @@ func assertDiffIDs(t *testing.T, got, want []digest.Digest) {
 		if got[i] != want[i] {
 			t.Fatalf("DiffIDs[%d] = %s, want %s", i, got[i], want[i])
 		}
+	}
+}
+
+// stripBindingSize rewrites an image binding without its rootfs.size field,
+// reproducing a binding written before the field existed.
+func stripBindingSize(t *testing.T, root string, d digest.Digest, p ocispec.Platform) {
+	t.Helper()
+	path := octest.BindingPath(root, d, p)
+	data, err := os.ReadFile(path) // #nosec G304 -- test rewrites a path derived from the digest it wrote
+	if err != nil {
+		t.Fatalf("read binding: %v", err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("unmarshal binding: %v", err)
+	}
+	var rootfs map[string]json.RawMessage
+	if err := json.Unmarshal(doc["rootfs"], &rootfs); err != nil {
+		t.Fatalf("unmarshal binding rootfs: %v", err)
+	}
+	delete(rootfs, "size")
+	rootfsRaw, err := json.Marshal(rootfs)
+	if err != nil {
+		t.Fatalf("marshal binding rootfs: %v", err)
+	}
+	doc["rootfs"] = rootfsRaw
+	out, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal binding: %v", err)
+	}
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		t.Fatalf("write binding: %v", err)
 	}
 }
 

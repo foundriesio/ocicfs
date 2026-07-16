@@ -30,6 +30,7 @@ func TestPutWritesBinding(t *testing.T) {
 			Size:      123,
 		},
 		FsverityDigest: fsv.String(),
+		RootfsSize:     456,
 	}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -66,6 +67,53 @@ func TestPutWritesBinding(t *testing.T) {
 	}
 	if binding.Descriptor.Digest != cfs || binding.Descriptor.Size != 123 || binding.FsverityDigest != fsv.String() {
 		t.Fatalf("Get = %#v", binding)
+	}
+	if binding.RootfsSize != 456 || got.RootFS.Size != 456 {
+		t.Fatalf("rootfs size = %d (doc %d), want 456", binding.RootfsSize, got.RootFS.Size)
+	}
+}
+
+// TestGetLegacyBindingWithoutRootfsSize asserts a binding written before the
+// size field existed still reads cleanly, reporting the size as unknown (0),
+// and that a zero size is omitted from the JSON on write.
+func TestGetLegacyBindingWithoutRootfsSize(t *testing.T) {
+	root := digest.SHA256.FromString("root")
+	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.Put(root, platform, Binding{
+		Descriptor:     ocispec.Descriptor{Digest: digest.SHA256.FromString("composefs")},
+		FsverityDigest: digest.SHA256.FromString("verity").String(),
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	path, _, err := s.bindingPath(root, platform)
+	if err != nil {
+		t.Fatalf("bindingPath: %v", err)
+	}
+	data, err := os.ReadFile(path) // #nosec G304 -- test reads a path it wrote
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var doc struct {
+		RootFS map[string]json.RawMessage `json:"rootfs"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if _, ok := doc.RootFS["size"]; ok {
+		t.Fatalf("zero rootfs size not omitted from binding JSON:\n%s", data)
+	}
+
+	binding, err := s.Get(root, platform)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if binding.RootfsSize != 0 {
+		t.Fatalf("legacy binding rootfs size = %d, want 0 (unknown)", binding.RootfsSize)
 	}
 }
 
