@@ -52,6 +52,32 @@ type ImageInfo struct {
 	// FsverityDigest is the fs-verity digest recorded for the composefs blob,
 	// which a mount enforces.
 	FsverityDigest string
+	// Layers describes each filesystem layer of the resolved manifest, in
+	// manifest order.
+	Layers []LayerInfo
+}
+
+// LayerInfo describes one filesystem layer of a resolved manifest; a layer's
+// index is its position in ImageInfo.Layers.
+type LayerInfo struct {
+	// MediaType is the layer descriptor's media type from the manifest.
+	MediaType string
+	// Digest names the layer blob as transferred (manifest layers[i].digest).
+	Digest digest.Digest
+	// Size is the layer blob's byte size declared by the manifest descriptor:
+	// the archive as transferred, compressed for +gzip/+zstd media types and
+	// the bare tar size for uncompressed layers.
+	Size int64
+	// DiffID is the digest of the layer's uncompressed tar stream
+	// (config rootfs.diff_ids[i]).
+	DiffID digest.Digest
+	// ChainID is the cumulative identity of the layer stack up to and
+	// including this layer, derived from the ordered diff_ids.
+	ChainID digest.Digest
+	// CreatedBy is the config history command correlated to this layer. It is
+	// empty when the config records no history or when its non-empty entries
+	// do not match the layer count, in which case no correlation is guessed.
+	CreatedBy string
 }
 
 // PullOptions is the resolved configuration a Pull acts on. Callers pass the

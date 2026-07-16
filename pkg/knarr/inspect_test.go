@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/foundriesio/knarr/internal/devtest"
 	"github.com/foundriesio/knarr/internal/objectstore"
+	"github.com/foundriesio/knarr/internal/ocichain"
+	"github.com/foundriesio/knarr/internal/ocilayout"
 	"github.com/foundriesio/knarr/internal/octest"
 )
 
@@ -122,6 +125,19 @@ func TestInspectAfterPullE2E(t *testing.T) {
 	if info.FsverityDigest != binding.RootFS.Fsverity.Digest.String() {
 		t.Fatalf("FsverityDigest = %s, want %s", info.FsverityDigest, binding.RootFS.Fsverity.Digest)
 	}
+	if len(info.Layers) != 1 {
+		t.Fatalf("Layers len = %d, want 1", len(info.Layers))
+	}
+	layer := info.Layers[0]
+	if layer.DiffID != lay.DiffIDs[0] || layer.ChainID != lay.DiffIDs[0] {
+		t.Fatalf("layer diff/chain = %s/%s, want both %s (single layer)", layer.DiffID, layer.ChainID, lay.DiffIDs[0])
+	}
+	if layer.MediaType != ocispec.MediaTypeImageLayerGzip || layer.Size <= 0 {
+		t.Fatalf("layer descriptor = %q/%d, want tar+gzip with positive size", layer.MediaType, layer.Size)
+	}
+	if layer.CreatedBy != "" {
+		t.Fatalf("layer CreatedBy = %q, want empty (fixture has no history)", layer.CreatedBy)
+	}
 
 	// After the image is removed, Inspect is fail-closed even though the metadata
 	// blobs remain in the object store.
@@ -179,6 +195,156 @@ func TestInspectCorruptMetadata(t *testing.T) {
 	}
 	if errors.Is(err, ErrNotFound) {
 		t.Fatalf("corrupt metadata should not be ErrNotFound: %v", err)
+	}
+}
+
+// resolvedFixture builds an ocichain.Resolved directly with n layers and the
+// given config history; layerTable consumes only Manifest.Layers, DiffIDs,
+// and Config.History, all of which are exported.
+func resolvedFixture(n int, history []ocispec.History) ocichain.Resolved {
+	var res ocichain.Resolved
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("layer-%d", i)
+		res.Manifest.Layers = append(res.Manifest.Layers, ocispec.Descriptor{
+			MediaType: ocispec.MediaTypeImageLayerGzip,
+			Digest:    digest.SHA256.FromString("blob-" + name),
+			Size:      int64(100 + i),
+		})
+		res.DiffIDs = append(res.DiffIDs, digest.SHA256.FromString("diff-"+name))
+	}
+	res.Config.History = history
+	return res
+}
+
+func TestLayerTableCorrelationAndChainIDs(t *testing.T) {
+	res := resolvedFixture(3, []ocispec.History{
+		{CreatedBy: "ADD rootfs.tar /"},
+		{CreatedBy: "ENV A=1", EmptyLayer: true},
+		{CreatedBy: "RUN apk add nginx"},
+		{CreatedBy: "LABEL x=y", EmptyLayer: true},
+		{CreatedBy: "COPY conf /etc"},
+	})
+
+	layers := layerTable(res)
+	if len(layers) != 3 {
+		t.Fatalf("layers = %d, want 3", len(layers))
+	}
+
+	// Chain-ID oracle, hand-computed per the OCI definition:
+	// chain(parent, diff) = sha256(parent + " " + diff).
+	chain := func(parent, diff digest.Digest) digest.Digest {
+		return digest.SHA256.FromString(string(parent) + " " + string(diff))
+	}
+	wantChains := []digest.Digest{res.DiffIDs[0]}
+	wantChains = append(wantChains, chain(wantChains[0], res.DiffIDs[1]))
+	wantChains = append(wantChains, chain(wantChains[1], res.DiffIDs[2]))
+	wantCreated := []string{"ADD rootfs.tar /", "RUN apk add nginx", "COPY conf /etc"}
+
+	for i, l := range layers {
+		want := res.Manifest.Layers[i]
+		if l.Digest != want.Digest || l.MediaType != want.MediaType || l.Size != want.Size {
+			t.Errorf("layer %d descriptor = %s/%q/%d, want %s/%q/%d", i, l.Digest, l.MediaType, l.Size, want.Digest, want.MediaType, want.Size)
+		}
+		if l.DiffID != res.DiffIDs[i] {
+			t.Errorf("layer %d DiffID = %s, want %s", i, l.DiffID, res.DiffIDs[i])
+		}
+		if l.ChainID != wantChains[i] {
+			t.Errorf("layer %d ChainID = %s, want %s", i, l.ChainID, wantChains[i])
+		}
+		if l.CreatedBy != wantCreated[i] {
+			t.Errorf("layer %d CreatedBy = %q, want %q", i, l.CreatedBy, wantCreated[i])
+		}
+	}
+}
+
+func TestLayerTableDoesNotMutateDiffIDs(t *testing.T) {
+	res := resolvedFixture(3, nil)
+	orig := append([]digest.Digest(nil), res.DiffIDs...)
+
+	_ = layerTable(res)
+
+	for i := range orig {
+		if res.DiffIDs[i] != orig[i] {
+			t.Fatalf("DiffIDs[%d] mutated by layerTable: %s, want %s", i, res.DiffIDs[i], orig[i])
+		}
+	}
+}
+
+func TestLayerTableSingleLayerChainIDIsDiffID(t *testing.T) {
+	res := resolvedFixture(1, nil)
+	layers := layerTable(res)
+	if len(layers) != 1 || layers[0].ChainID != res.DiffIDs[0] {
+		t.Fatalf("single-layer ChainID = %v, want DiffID %s", layers, res.DiffIDs[0])
+	}
+}
+
+func TestLayerTableUncorrelatableHistoryLeavesCreatedByEmpty(t *testing.T) {
+	for name, history := range map[string][]ocispec.History{
+		"absent":             nil,
+		"too few non-empty":  {{CreatedBy: "ADD /"}},
+		"too many non-empty": {{CreatedBy: "a"}, {CreatedBy: "b"}, {CreatedBy: "c"}},
+	} {
+		res := resolvedFixture(2, history)
+		for i, l := range layerTable(res) {
+			if l.CreatedBy != "" {
+				t.Errorf("%s: layer %d CreatedBy = %q, want empty", name, i, l.CreatedBy)
+			}
+		}
+	}
+}
+
+// TestLayerTableMultiPlatformResolve drives a genuine multi-manifest index
+// through ocilayout + ocichain.Resolve and checks the table describes the
+// host platform's layers, not the other platform's.
+func TestLayerTableMultiPlatformResolve(t *testing.T) {
+	host := hostPlatform()
+	lay, err := octest.BuildImage(t.TempDir(),
+		octest.ImageSpec{
+			Platform: host,
+			Layers: []octest.LayerSpec{
+				{Files: []octest.File{{Name: "base.txt", Mode: 0o644, Body: "host base"}}},
+				{Files: []octest.File{{Name: "app.txt", Mode: 0o644, Body: "host app"}}, MediaType: ocispec.MediaTypeImageLayerZstd},
+			},
+			History: []ocispec.History{
+				{CreatedBy: "ADD base /"},
+				{CreatedBy: "ENV A=1", EmptyLayer: true},
+				{CreatedBy: "ADD app /"},
+			},
+		},
+		octest.ImageSpec{
+			Platform: ocispec.Platform{OS: "linux", Architecture: "mips64le"},
+			Layers: []octest.LayerSpec{
+				{Files: []octest.File{{Name: "other.txt", Mode: 0o644, Body: "other"}}},
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("BuildImage: %v", err)
+	}
+
+	src, err := ocilayout.Open(lay.Dir)
+	if err != nil {
+		t.Fatalf("ocilayout.Open: %v", err)
+	}
+	res, err := ocichain.Resolve(context.Background(), src, lay.Root, host)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	layers := layerTable(res)
+	if len(layers) != 2 {
+		t.Fatalf("layers = %d, want the host image's 2", len(layers))
+	}
+	for i, l := range layers {
+		if l.DiffID != lay.DiffIDs[i] {
+			t.Errorf("layer %d DiffID = %s, want host image's %s", i, l.DiffID, lay.DiffIDs[i])
+		}
+	}
+	if layers[1].MediaType != ocispec.MediaTypeImageLayerZstd {
+		t.Errorf("layer 1 media type = %q, want zstd", layers[1].MediaType)
+	}
+	if layers[0].CreatedBy != "ADD base /" || layers[1].CreatedBy != "ADD app /" {
+		t.Errorf("createdBy = %q/%q, want the two non-empty history entries", layers[0].CreatedBy, layers[1].CreatedBy)
 	}
 }
 
