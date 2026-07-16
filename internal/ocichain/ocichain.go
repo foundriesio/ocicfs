@@ -39,6 +39,7 @@ type Resolved struct {
 	ManifestBytes []byte
 	ConfigBytes   []byte
 	Manifest      ocispec.Manifest
+	Config        ocispec.Image // Parsed form of ConfigBytes (platform, rootfs, history)
 	Platform      ocispec.Platform
 	DiffIDs       []digest.Digest // Extracted from config; verified to be sha256-only and count == layers
 }
@@ -215,6 +216,7 @@ func resolveFromManifest(ctx context.Context, src BlobSource, rootDesc, manifest
 		ManifestBytes: manifestBytes,
 		ConfigBytes:   configBytes,
 		Manifest:      manifest,
+		Config:        *config,
 		Platform:      *platform,
 		DiffIDs:       config.RootFS.DiffIDs,
 	}, nil

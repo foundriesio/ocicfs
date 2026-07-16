@@ -282,6 +282,57 @@ func TestResolveBareManifestDerivesPlatform(t *testing.T) {
 	}
 }
 
+func TestResolveCarriesParsedConfig(t *testing.T) {
+	f := newFixture(t)
+
+	layers := []ocispec.Descriptor{fakeLayerDesc("l1"), fakeLayerDesc("l2")}
+	cfg := map[string]any{
+		"architecture": "amd64",
+		"os":           "linux",
+		"rootfs": map[string]any{
+			"type":     "layers",
+			"diff_ids": diffIDsFor(layers),
+		},
+		"history": []map[string]any{
+			{"created_by": "ENV A=1", "empty_layer": true},
+			{"created_by": "ADD rootfs.tar /"},
+			{"created_by": "RUN build"},
+		},
+	}
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	cfgDesc := f.writeBlob(cfgJSON, ocispec.MediaTypeImageConfig)
+	man := f.writeBlob(manifestJSON(cfgDesc, layers), ocispec.MediaTypeImageManifest)
+
+	res, err := Resolve(context.Background(), f, man.Digest, ocispec.Platform{OS: "linux", Architecture: "amd64"})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	if got := len(res.Config.History); got != 3 {
+		t.Fatalf("config history entries = %d, want 3", got)
+	}
+	if !res.Config.History[0].EmptyLayer || res.Config.History[0].CreatedBy != "ENV A=1" {
+		t.Errorf("history[0] = %+v, want empty_layer ENV A=1", res.Config.History[0])
+	}
+	if res.Config.History[1].EmptyLayer || res.Config.History[1].CreatedBy != "ADD rootfs.tar /" {
+		t.Errorf("history[1] = %+v, want non-empty ADD rootfs.tar /", res.Config.History[1])
+	}
+	if res.Config.OS != "linux" || res.Config.Architecture != "amd64" {
+		t.Errorf("config platform = %s/%s, want linux/amd64", res.Config.OS, res.Config.Architecture)
+	}
+	if len(res.Config.RootFS.DiffIDs) != len(res.DiffIDs) {
+		t.Fatalf("config diff_ids = %d, DiffIDs = %d, want equal", len(res.Config.RootFS.DiffIDs), len(res.DiffIDs))
+	}
+	for i, d := range res.Config.RootFS.DiffIDs {
+		if d != res.DiffIDs[i] {
+			t.Errorf("diff_id[%d]: config %s != resolved %s", i, d, res.DiffIDs[i])
+		}
+	}
+}
+
 func TestResolveBareManifestNonHostRejected(t *testing.T) {
 	f := newFixture(t)
 
