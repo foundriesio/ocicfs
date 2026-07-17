@@ -10,7 +10,7 @@ knarr's trust model has **two sides**, and every step below is tagged with the o
 belongs to:
 
 - **[publisher]** (CI side) builds the composefs image, measures its fs-verity, and
-  **seals** that digest into the OCI config (`containers.composefs.fsverity`).
+  **seals** that digest into the image's OCI metadata as publisher attestation.
 - **[device]** rebuilds the image from the delivered content and **verifies** its
   measured fs-verity equals the sealed value.
 
@@ -133,13 +133,13 @@ digests the OCI layer TOC already carries.)
 ```sh
 mkcomposefs --min-version=1 --max-version=1 --from-file image.dump publisher.cfs
 SEAL=$(composefs-info measure-file publisher.cfs)
-echo "containers.composefs.fsverity = $SEAL"
+echo "sealed fs-verity digest: $SEAL"
 # e.g. 57a706da69bdedab74d77389613d40bd87ae8097d93ef576baf10a2225fdd8eb
 ```
 
-In real knarr the publisher ships standard zstd:chunked OCI layers and writes `$SEAL`
-into the image config; `image.dump` + `objects/` here stand in for the content the device
-will reconstruct.
+In real knarr the publisher ships standard zstd:chunked OCI layers and publishes `$SEAL`
+in the image's OCI metadata; `image.dump` + `objects/` here stand in for the content the
+device will reconstruct.
 
 ## Device: rebuild and verify
 
@@ -203,7 +203,7 @@ the `--from-file` path.
 ## Mounting (not covered here)
 
 This walkthrough stops at building and verifying. Mounting an image
-(`mount.composefs publisher.cfs --basedir objects/sha256 /mnt`) needs the
-`mount.composefs` helper and composefs kernel support; that tool is not in the dev
-image, and the mount path is exercised on a real device rather than in this substrate
-walkthrough.
+(`mount.composefs publisher.cfs --basedir objects/sha256 /mnt`) needs root
+privilege and composefs kernel support. The `mount.composefs` helper is in the
+dev image, but mounting is knarr's `mount` verb — see [mount.md](mount.md) —
+and is exercised there rather than in this substrate walkthrough.

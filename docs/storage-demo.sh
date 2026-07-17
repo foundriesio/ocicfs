@@ -78,7 +78,7 @@ echo
 echo "== [publisher] build canonical image and seal its fs-verity =="
 mkcomposefs --min-version=1 --max-version=1 --from-file image.dump publisher.cfs
 seal=$(composefs-info measure-file publisher.cfs)
-echo "containers.composefs.fsverity = $seal"
+echo "sealed fs-verity digest: $seal"
 
 echo
 echo "== [device] rebuild from the delivered dump + objects, then verify =="
