@@ -13,9 +13,12 @@ knarr provides **primitives, not lifecycle policy**: `pull`, `verify`, `mount`,
 activation, rollback, or update-orchestration logic — those belong to the
 upper-layer agent that drives knarr.
 
-> **Status: early development.** The CLI surface and engine API are taking shape.
-> `pull` from a local OCI layout is wired end to end; the remaining verbs are
-> still being implemented.
+> **Status: early development.** The device-side verbs are wired end to end:
+> `pull` from an OCI registry (digest-pinned or tagged) or a local OCI layout,
+> read-only and metadata-only `mount`, `unmount`, `inspect`, `ls`, and `remove`.
+> Pull fetches whole layers today — per-file delta fetch from the zstd:chunked
+> TOC is not implemented yet — and `publish`, `verify`, `hold`/`release`, and
+> `gc` are still to come.
 
 ## Project docs
 
@@ -23,10 +26,18 @@ upper-layer agent that drives knarr.
   constraints, and non-goals.
 - [ADR 0001: High-level architecture](docs/adr/0001-high-level-architecture.md):
   the accepted architecture boundary and load-bearing technical decisions.
-- [Pulling from a local OCI layout](docs/pull.md): how to run
-  `knarr pull --from-dir`.
+- [Pulling images](docs/pull.md): registry pull and the local OCI layout
+  sideload (`--from-dir`).
+- [Mounting a pulled image](docs/mount.md): read-only composefs mounts and
+  metadata-only mounts for overlay consumers.
+- [Inspecting a local image](docs/inspect.md): image identity, the composefs
+  binding, and the per-layer view.
+- [Listing and forgetting local images](docs/ls-remove.md): `knarr ls` and
+  `knarr remove`.
 - [On-disk store layout](docs/on-disk-layout.md): what a pull writes under the
   data root.
+- [Hands-on storage walkthrough](docs/storage-walkthrough.md): build and verify
+  a composefs image with the upstream tools, by hand.
 
 ## Development
 
