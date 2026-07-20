@@ -31,7 +31,7 @@ jobs:
       # rate limit cannot fail the job: the image is pinned by index digest, so
       # the cache never goes stale and the registry is contacted at most once
       # per arch.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: .smoke-layout
           key: smoke-layout-${{ matrix.arch }}-fd8d9aa63ba2
