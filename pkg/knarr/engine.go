@@ -215,6 +215,12 @@ type Engine interface {
 	// does not pin a digest resolves locally to the digest its most recent
 	// pull recorded; every verification still keys on that digest.
 	Mount(ctx context.Context, ref, target string, opts ...MountOption) error
+	// MountChain mounts the stored image whose full layer chain has the given
+	// chain identity. Resolution reads only local state and never fetches over
+	// the network; a chain identity no stored image ends at is reported as an
+	// error satisfying errors.Is(err, ErrNotFound). Verification and mount
+	// semantics are Mount's, keyed on the digest the resolution produces.
+	MountChain(ctx context.Context, chainID, target string, opts ...MountOption) error
 	// Unmount tears down the mount at target.
 	Unmount(ctx context.Context, target string) error
 	// ObjectsDir returns the store's composefs backing-object directory, for
