@@ -8,6 +8,7 @@ seals every content object with it and refuses a store that cannot.
 ```
 <root>/
 ├── objects/sha256/<aa>/<rest>   # the content-addressed object store (CAS) — authoritative
+├── objects/fsverity-sha256-12/<vv>/<rest>   # fs-verity view into the CAS — auxiliary
 ├── images/sha256/<aa>/<rest>/<os>-<arch>[-<variant>].json   # image bindings — auxiliary
 ├── refs/sha256/<kk>/<rest>.json # reference records — auxiliary
 └── tmp/                         # staging + build scratch
@@ -27,6 +28,16 @@ and sealed with fs-verity. One pull writes three kinds of object here:
   identical files across images and layers are stored once.
 - **The composefs image** — the EROFS image that `mount -t composefs` mounts,
   referencing the per-file objects by digest.
+
+Alongside the sha256 tree, `objects/fsverity-sha256-12/` holds a second name for
+every object committed under this scheme: a hardlink sharded and keyed by the
+object's measured fs-verity digest (`<vv>` = first two hex chars of that digest,
+`<rest>` the rest; no `sha256:` prefix in the path). It shares one inode with the
+sha256 name, so it adds no content and carries the same fs-verity seal. The view
+is **auxiliary and regenerable** — rebuildable by walking `objects/sha256` and
+re-measuring — never a trust anchor of its own. Objects written by earlier knarr
+versions are not backfilled; each gains its view name when a write next
+deduplicates onto it.
 
 The object store is the **source of truth**: every byte a mount serves is
 content-addressed and fs-verity-sealed here, and the auxiliary indexes below are

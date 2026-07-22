@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/opencontainers/go-digest"
 	"golang.org/x/sys/unix"
@@ -34,6 +35,11 @@ import (
 	"github.com/foundriesio/knarr/internal/digestutil"
 	"github.com/foundriesio/knarr/internal/verity"
 )
+
+// verityDirName is the fs-verity view directory under objects/. It is named
+// after its key algorithm's upstream identifier, mirroring the objects/sha256
+// convention — self-description, not a multi-algorithm switch.
+const verityDirName = "fsverity-sha256-12"
 
 // Store is the content-addressed object store rooted at the knarr data directory.
 // Its objects live under <root>/objects and transient build state under <root>/tmp.
@@ -54,6 +60,9 @@ func New(root string) (*Store, error) {
 	if err := os.MkdirAll(s.objectPath(""), 0o755); err != nil { // #nosec G301 -- knarr-owned store dir
 		return nil, err
 	}
+	if err := os.MkdirAll(s.viewPath(""), 0o755); err != nil { // #nosec G301 -- knarr-owned store dir
+		return nil, err
+	}
 	if err := os.MkdirAll(s.TempDir(), 0o755); err != nil { // #nosec G301 -- knarr-owned store dir
 		return nil, err
 	}
@@ -71,6 +80,12 @@ func (s *Store) ObjectPath(d digest.Digest) (string, error) {
 // ObjectsDir returns the composefs backing-object directory.
 func (s *Store) ObjectsDir() string {
 	return s.objectPath("")
+}
+
+// ViewDir returns the fs-verity view directory: a tree of hardlinks to the CAS
+// objects, sharded and keyed by each object's measured fs-verity digest.
+func (s *Store) ViewDir() string {
+	return s.viewPath("")
 }
 
 // Open returns a reader over the stored object d. The caller must close it. A
@@ -231,11 +246,58 @@ func (s *Store) writeSealed(ctx context.Context, tempPrefix string, expect diges
 	if err := commitNoReplace(tempPath, finalPath); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			existingFsv, vErr := s.verifyCollision(finalPath, fsv)
-			return d, existingFsv, vErr
+			if vErr != nil {
+				return "", "", vErr
+			}
+			// The object was already present; repair the view link in case a
+			// prior write committed the object but not its view name.
+			if err := s.linkView(finalPath, existingFsv); err != nil {
+				return "", "", err
+			}
+			return d, existingFsv, nil
 		}
 		return "", "", fmt.Errorf("objectstore: commit to %s: %w", finalPath, err)
 	}
+	if err := s.linkView(finalPath, fsv); err != nil {
+		return "", "", err
+	}
 	return d, fsv, nil
+}
+
+// linkView hardlinks the committed object at objectPath into the fs-verity view
+// under objects/fsverity-sha256-12/, sharded like the sha256 namespace and keyed
+// by the object's measured fs-verity digest fsv ("sha256:<hex>"). Both names
+// share one inode, so fs-verity carries over. The link failing fails the write:
+// no write succeeds without its view name (a crash between the CAS commit and
+// the link leaves an object the next collision repairs). A view name that already resolves
+// to the same inode is accepted — a concurrent writer of identical content, or a
+// collision repairing its own link; a different inode at the view name is store
+// corruption.
+func (s *Store) linkView(objectPath, fsv string) error {
+	viewPath := s.viewPath(strings.TrimPrefix(fsv, "sha256:"))
+	if err := os.MkdirAll(filepath.Dir(viewPath), 0o755); err != nil { // #nosec G301 -- knarr-owned view shard dir
+		return fmt.Errorf("objectstore: create view shard dir: %w", err)
+	}
+	err := os.Link(objectPath, viewPath)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, os.ErrExist):
+		objFI, statErr := os.Lstat(objectPath)
+		if statErr != nil {
+			return fmt.Errorf("objectstore: stat object %s: %w", objectPath, statErr)
+		}
+		viewFI, statErr := os.Lstat(viewPath)
+		if statErr != nil {
+			return fmt.Errorf("objectstore: stat view %s: %w", viewPath, statErr)
+		}
+		if !os.SameFile(objFI, viewFI) {
+			return fmt.Errorf("objectstore: view name %s does not resolve to object %s", viewPath, objectPath)
+		}
+		return nil
+	default:
+		return fmt.Errorf("objectstore: link view %s: %w", viewPath, err)
+	}
 }
 
 // ctxReader aborts an in-progress copy when ctx is canceled, so a large object
@@ -368,4 +430,13 @@ func (s *Store) objectPath(hexDigest string) string {
 		return filepath.Join(s.root, "objects", "sha256")
 	}
 	return filepath.Join(s.root, "objects", "sha256", hexDigest[0:2], hexDigest[2:])
+}
+
+// viewPath returns the on-disk view path for a given fs-verity digest hex string,
+// sharded like objectPath.
+func (s *Store) viewPath(verityHex string) string {
+	if len(verityHex) < 2 {
+		return filepath.Join(s.root, "objects", verityDirName)
+	}
+	return filepath.Join(s.root, "objects", verityDirName, verityHex[0:2], verityHex[2:])
 }

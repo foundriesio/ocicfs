@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/opencontainers/go-digest"
@@ -96,6 +97,170 @@ func TestWriteObjectRoundTrip(t *testing.T) {
 	}
 }
 
+// sameInode fails the test unless the object and view names resolve to one inode.
+func sameInode(t *testing.T, objPath, viewPath string) {
+	t.Helper()
+	objFI, err := os.Lstat(objPath)
+	if err != nil {
+		t.Fatalf("lstat object %s: %v", objPath, err)
+	}
+	viewFI, err := os.Lstat(viewPath)
+	if err != nil {
+		t.Fatalf("lstat view %s: %v", viewPath, err)
+	}
+	if !os.SameFile(objFI, viewFI) {
+		t.Fatalf("view %s and object %s are not the same inode", viewPath, objPath)
+	}
+}
+
+// TestWriteObjectLinksView asserts a committed object is also reachable under the
+// fs-verity view, as a hardlink to the same inode.
+func TestWriteObjectLinksView(t *testing.T) {
+	s := newVerityStore(t)
+	content := []byte("view-linked object")
+
+	d, fsv, err := s.WriteObject(context.Background(), bytes.NewReader(content))
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("WriteObject: %v", err)
+	}
+	sameInode(t, s.objectPath(d.Hex()), s.viewPath(strings.TrimPrefix(fsv, "sha256:")))
+}
+
+// TestWriteBlobLinksView asserts metadata blobs are view-linked too: every sealed
+// object gets a view name.
+func TestWriteBlobLinksView(t *testing.T) {
+	s := newVerityStore(t)
+	content := []byte(`{"schemaVersion":2,"view":true}`)
+	d := digest.FromBytes(content)
+
+	err := s.WriteBlob(context.Background(), d, bytes.NewReader(content))
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("WriteBlob: %v", err)
+	}
+	fsv, err := s.VerityDigest(d)
+	if err != nil {
+		t.Fatalf("VerityDigest: %v", err)
+	}
+	sameInode(t, s.objectPath(d.Hex()), s.viewPath(strings.TrimPrefix(fsv, "sha256:")))
+}
+
+// TestWriteObjectRepairsView removes a committed object's view link, then rewrites
+// identical content: the collision path must repair the missing view name.
+func TestWriteObjectRepairsView(t *testing.T) {
+	s := newVerityStore(t)
+	ctx := context.Background()
+	content := []byte("repair my view link")
+
+	d, fsv, err := s.WriteObject(ctx, bytes.NewReader(content))
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("WriteObject: %v", err)
+	}
+	viewPath := s.viewPath(strings.TrimPrefix(fsv, "sha256:"))
+	if err := os.Remove(viewPath); err != nil {
+		t.Fatalf("remove view link: %v", err)
+	}
+	// Identical content hits the collision path, which repairs the view link.
+	if _, _, err := s.WriteObject(ctx, bytes.NewReader(content)); err != nil {
+		t.Fatalf("WriteObject repair: %v", err)
+	}
+	sameInode(t, s.objectPath(d.Hex()), viewPath)
+}
+
+// TestWriteObjectViewMismatch seeds a foreign file at the view name (with the CAS
+// object dropped so the write takes the new-commit path) and asserts the view
+// link's same-inode check rejects it as corruption.
+func TestWriteObjectViewMismatch(t *testing.T) {
+	s := newVerityStore(t)
+	ctx := context.Background()
+	content := []byte("mismatch content")
+
+	d, fsv, err := s.WriteObject(ctx, bytes.NewReader(content))
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("WriteObject: %v", err)
+	}
+	// Drop the CAS object so the next write commits fresh, and replace the view
+	// name with a foreign file so the view link collides with a different inode.
+	if err := os.Remove(s.objectPath(d.Hex())); err != nil {
+		t.Fatalf("remove object: %v", err)
+	}
+	viewPath := s.viewPath(strings.TrimPrefix(fsv, "sha256:"))
+	if err := os.Remove(viewPath); err != nil {
+		t.Fatalf("remove view link: %v", err)
+	}
+	if err := os.WriteFile(viewPath, []byte("foreign"), 0o600); err != nil {
+		t.Fatalf("seed foreign view: %v", err)
+	}
+	if _, _, err := s.WriteObject(ctx, bytes.NewReader(content)); err == nil {
+		t.Fatal("expected error when the view name resolves to a different inode")
+	}
+}
+
+// TestWriteObjectConcurrentView races many writers of identical content on a
+// target that does not exist yet, so the initial CAS commit, the collision
+// path, and view-link creation genuinely interleave; afterward the single
+// object and its view name must be one inode. Run under -race.
+func TestWriteObjectConcurrentView(t *testing.T) {
+	s := newVerityStore(t)
+
+	// Prime with DIFFERENT content only to surface an unsupported-fs skip
+	// before spawning goroutines; the raced target stays absent until they run.
+	_, _, err := s.WriteObject(context.Background(), bytes.NewReader([]byte("verity probe")))
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("WriteObject prime: %v", err)
+	}
+
+	content := []byte("concurrently written content")
+	const writers = 8
+	errs := make([]error, writers)
+	fsvs := make([]string, writers)
+	var wg sync.WaitGroup
+	wg.Add(writers)
+	for i := range writers {
+		go func(i int) {
+			defer wg.Done()
+			_, fsvs[i], errs[i] = s.WriteObject(context.Background(), bytes.NewReader(content))
+		}(i)
+	}
+	wg.Wait()
+	for i, e := range errs {
+		if e != nil {
+			t.Fatalf("concurrent WriteObject %d: %v", i, e)
+		}
+	}
+	d := digest.FromBytes(content)
+	sameInode(t, s.objectPath(d.Hex()), s.viewPath(strings.TrimPrefix(fsvs[0], "sha256:")))
+}
+
+// TestWriteObjectCollisionForeignView leaves the CAS object intact but replaces
+// its view name with a foreign inode: the collision verify succeeds, and the
+// view repair must then reject the mismatched link as corruption.
+func TestWriteObjectCollisionForeignView(t *testing.T) {
+	s := newVerityStore(t)
+	ctx := context.Background()
+	content := []byte("collision foreign view")
+
+	_, fsv, err := s.WriteObject(ctx, bytes.NewReader(content))
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("WriteObject: %v", err)
+	}
+	viewPath := s.viewPath(strings.TrimPrefix(fsv, "sha256:"))
+	if err := os.Remove(viewPath); err != nil {
+		t.Fatalf("remove view link: %v", err)
+	}
+	if err := os.WriteFile(viewPath, []byte("foreign"), 0o600); err != nil {
+		t.Fatalf("seed foreign view: %v", err)
+	}
+	if _, _, err := s.WriteObject(ctx, bytes.NewReader(content)); err == nil {
+		t.Fatal("expected error when the collision path finds a foreign inode at the view name")
+	}
+}
+
 // TestWriteObjectTamperedCollision pre-seeds a wrong-bytes, verity-enabled
 // object at the target path and asserts that writing the authentic content
 // fails rather than silently deduping onto the tampered file.
@@ -172,6 +337,9 @@ func TestObjectPaths(t *testing.T) {
 	}
 	if got := s.ObjectsDir(); got != filepath.Join(s.root, "objects", "sha256") {
 		t.Fatalf("ObjectsDir = %q", got)
+	}
+	if got := s.ViewDir(); got != filepath.Join(s.root, "objects", "fsverity-sha256-12") {
+		t.Fatalf("ViewDir = %q", got)
 	}
 	if _, err := s.ObjectPath(digest.Digest("sha512:abc")); err == nil {
 		t.Fatal("expected invalid digest error")
