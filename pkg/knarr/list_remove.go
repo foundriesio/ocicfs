@@ -90,7 +90,11 @@ func (e *engine) remove(ctx context.Context, ref string, opts ...RemoveOption) e
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	rec, err := e.refs.Get(ref)
+	normalized, err := normalizeRef(ref)
+	if err != nil {
+		return err
+	}
+	rec, err := e.refs.Get(normalized)
 	if errors.Is(err, refstore.ErrNotFound) {
 		return fmt.Errorf("no such image: %s: %w", ref, errors.Join(ErrNotFound, err))
 	}
@@ -117,7 +121,7 @@ func (e *engine) remove(ctx context.Context, ref string, opts ...RemoveOption) e
 	// resolves to a present binding" across a crash: a crash after the ref is
 	// gone leaves at most an orphan binding, which is auxiliary and reclaimed by
 	// gc, never a live ref pointing at a missing binding.
-	if err := e.refs.Delete(ref); err != nil {
+	if err := e.refs.Delete(normalized); err != nil {
 		return err
 	}
 	for _, platform := range toDelete {

@@ -73,9 +73,14 @@ written by pull.
 
 ## `refs/` — reference records (auxiliary)
 
-One JSON file per reference, keyed by `sha256(exact ref string)` (the ref is
-never canonicalized). It maps a human ref to what it resolved to, for `ls`,
-provenance, and tag→digest naming — it is **not** a trust anchor:
+One JSON file per reference, keyed by `sha256(ref)` where `ref` is the engine's
+normalized form of whatever string the caller passed to `pull` (a bare digest
+passes through unchanged; anything else is canonicalized through the OCI
+reference grammar, e.g. `ubuntu` becomes `index.docker.io/library/ubuntu:latest`).
+This lets a short or differently-formed alias and its fully qualified
+equivalent converge on the same record. It maps a human ref to what it
+resolved to, for `ls`, provenance, and tag→digest naming — it is **not** a
+trust anchor:
 
 ```json
 {

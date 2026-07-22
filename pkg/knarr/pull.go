@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -64,7 +65,11 @@ func (e *engine) pull(ctx context.Context, ref string, opts ...PullOption) (*Ima
 	if cached, ok, err := verifiedPulledImage(ctx, e.obj, e.img, root, platform); err != nil {
 		return nil, err
 	} else if ok {
-		if err := e.refs.Put(ref, cached.rootDesc, time.Now(), []string{ocilayout.PlatformString(&cached.platform)}); err != nil {
+		normalized, err := normalizeRef(ref)
+		if err != nil {
+			return nil, err
+		}
+		if err := e.refs.Put(normalized, cached.rootDesc, time.Now(), []string{ocilayout.PlatformString(&cached.platform)}); err != nil {
 			return nil, err
 		}
 		return &Image{
@@ -78,7 +83,11 @@ func (e *engine) pull(ctx context.Context, ref string, opts ...PullOption) (*Ima
 	if err != nil {
 		return nil, err
 	}
-	if err := e.refs.Put(ref, built.RootDesc, time.Now(), []string{ocilayout.PlatformString(&built.Platform)}); err != nil {
+	normalized, err := normalizeRef(ref)
+	if err != nil {
+		return nil, err
+	}
+	if err := e.refs.Put(normalized, built.RootDesc, time.Now(), []string{ocilayout.PlatformString(&built.Platform)}); err != nil {
 		return nil, err
 	}
 
@@ -130,10 +139,11 @@ func verifiedPulledImage(ctx context.Context, obj *objectstore.Store, imgStore *
 }
 
 // resolveLocalRef returns the root digest ref names. A digest-pinned ref
-// carries the digest itself; any other ref string resolves through the local
-// reference store to the digest its most recent pull recorded, so a pulled tag
-// works with the verbs that read only local state. Resolution is by exact ref
-// string and never touches the network; the returned digest, not the ref, is
+// carries the digest itself; any other ref string is normalized and resolves
+// through the local reference store to the digest its most recent pull
+// recorded under that normalized form, so a pulled tag works with the verbs
+// that read only local state regardless of which equivalent alias named it.
+// Resolution never touches the network; the returned digest, not the ref, is
 // what every subsequent lookup and verification keys on. A ref that reads as a
 // digest-pin attempt (it contains "@" or is a bare digest) reports its parse
 // error instead of falling through, because pull can never have recorded such
@@ -146,7 +156,11 @@ func (e *engine) resolveLocalRef(ref string) (digest.Digest, error) {
 	if strings.ContainsRune(ref, '@') || looksLikeBareDigest(ref) {
 		return "", perr
 	}
-	rec, err := e.refs.Get(ref)
+	normalized, err := normalizeRef(ref)
+	if err != nil {
+		return "", err
+	}
+	rec, err := e.refs.Get(normalized)
 	if errors.Is(err, refstore.ErrNotFound) {
 		return "", fmt.Errorf("not digest-pinned and not recorded by a pull; run `knarr pull` first or pin a digest (name@sha256:…): %w", errors.Join(ErrNotFound, err))
 	}
@@ -154,6 +168,24 @@ func (e *engine) resolveLocalRef(ref string) (digest.Digest, error) {
 		return "", err
 	}
 	return rec.Resolved.Digest, nil
+}
+
+// normalizeRef canonicalizes ref for use as the refstore lookup key, so a ref
+// stored by one caller and looked up under a differently-formed but
+// equivalent ref (a short name, a missing tag, a non-Docker-Hub host, or
+// name@digest) resolves to the same record. A bare digest is already
+// canonical and passes through unchanged; everything else is canonicalized
+// through the OCI reference grammar, which folds a short name like "ubuntu"
+// to its fully qualified form (e.g. "index.docker.io/library/ubuntu:latest").
+func normalizeRef(ref string) (string, error) {
+	if looksLikeBareDigest(ref) {
+		return ref, nil
+	}
+	r, err := name.ParseReference(ref)
+	if err != nil {
+		return "", fmt.Errorf("normalize ref %s: %w", ref, err)
+	}
+	return r.Name(), nil
 }
 
 func parseDigestPinnedRef(ref string) (digest.Digest, error) {

@@ -68,6 +68,130 @@ func TestParseDigestPinnedRef(t *testing.T) {
 	}
 }
 
+func TestNormalizeRef(t *testing.T) {
+	hex256 := strings.Repeat("a", 64)
+	bareDigest := "sha256:" + hex256
+	tests := []struct {
+		name    string
+		ref     string
+		want    string
+		wantErr string
+	}{
+		{"short name", "ubuntu", "index.docker.io/library/ubuntu:latest", ""},
+		{"missing tag", "registry.example.com/team/app", "registry.example.com/team/app:latest", ""},
+		{"host with port", "registry.example.com:5000/team/app:v1", "registry.example.com:5000/team/app:v1", ""},
+		{"non-docker-hub host", "quay.io/team/app:v1", "quay.io/team/app:v1", ""},
+		{"name at digest", "registry.example.com/team/app@" + bareDigest, "registry.example.com/team/app@" + bareDigest, ""},
+		{"bare digest passes through", bareDigest, bareDigest, ""},
+		{"malformed", "not a ref", "", "normalize ref"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeRef(tt.ref)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error = %v, want it to contain %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalizeRef: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("normalizeRef(%q) = %q, want %q", tt.ref, got, tt.want)
+			}
+		})
+	}
+}
+
+// mustNormalizeRef computes the canonical refstore key for ref, the same
+// transform pull() applies before storing and resolveLocalRef()/remove()
+// apply before looking up, so a test can predict the stored form of a ref
+// built from a short or unqualified name.
+func mustNormalizeRef(t *testing.T, ref string) string {
+	t.Helper()
+	normalized, err := normalizeRef(ref)
+	if err != nil {
+		t.Fatalf("normalizeRef(%q): %v", ref, err)
+	}
+	return normalized
+}
+
+// TestPullInspectRemoveDifferentAliasE2E pulls an image under one non-digest
+// alias and confirms Inspect and Remove both succeed when called with a
+// differently formed but equivalent alias, proving pull and lookup converge
+// on the same normalized refstore key rather than keying on the exact string
+// typed at pull time. Both aliases omit a digest pin, so resolveLocalRef must
+// take its named-ref branch (through e.refs.Get(normalized)) rather than the
+// digest-pinned branch, exercising the exact lookup path a normalizing
+// admission gate exercises. Neither alias is itself the canonical form the
+// image is stored under, so the test fails if normalization is missing on
+// either the pull or the lookup side.
+func TestPullInspectRemoveDifferentAliasE2E(t *testing.T) {
+	storeRoot, cleanup, err := devtest.VerityRoot()
+	if errors.Is(err, devtest.ErrNoVerity) {
+		t.Skipf("verity-capable store root unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("VerityRoot: %v", err)
+	}
+	t.Cleanup(cleanup)
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+
+	reg := octest.NewRegistry()
+	t.Cleanup(reg.Close)
+	tr := reg.Transport()
+	useRemoteDefaultTransport(t, tr)
+
+	// Images on the default registry canonicalize to
+	// "index.docker.io/library/<name>:tag" regardless of which host alias or
+	// short name names them; push under that canonical host so both a short
+	// name and an explicit "docker.io" alias resolve here.
+	remoteImage, _ := registryHostImage(t, 1)
+	root := pushRegistryImage(t, "index.docker.io", "library/app", remoteImage, tr)
+
+	eng, err := New(Config{Root: storeRoot})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// "app" is short for "index.docker.io/library/app:latest".
+	pullRef := "app"
+	if _, err := eng.Pull(context.Background(), pullRef); devtest.IsVerityUnsupported(err) {
+		t.Skipf("fs-verity unsupported on the test filesystem: %v", err)
+	} else if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+
+	// A caller that normalizes refs before lookup (e.g. an admission gate)
+	// resolves this image under the explicit "docker.io" host and tag, a
+	// different string from "app" that folds to the same canonical form.
+	lookupRef := "docker.io/library/app:latest"
+	if lookupRef == pullRef {
+		t.Fatal("fixture refs must differ to test alias convergence")
+	}
+
+	info, err := eng.Inspect(context.Background(), lookupRef)
+	if err != nil {
+		t.Fatalf("Inspect(%q): %v", lookupRef, err)
+	}
+	if info.Root != root {
+		t.Fatalf("Inspect Root = %s, want %s", info.Root, root)
+	}
+
+	if err := eng.Remove(context.Background(), lookupRef); err != nil {
+		t.Fatalf("Remove(%q): %v", lookupRef, err)
+	}
+	if _, err := eng.Inspect(context.Background(), lookupRef); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Inspect after remove: got %v, want ErrNotFound", err)
+	}
+}
+
 func TestPullRegistryRejectsBareDigestAndMalformedRef(t *testing.T) {
 	eng, err := New(Config{Root: t.TempDir()})
 	if err != nil {
@@ -204,9 +328,10 @@ func TestPullFromDirE2E(t *testing.T) {
 	assertObjectExists(t, storeRoot, lay.Config)
 	assertObjectExists(t, storeRoot, lay.FileDigest)
 
-	ref := readPullRef(t, storeRoot, lay.Ref)
-	if ref.Ref != lay.Ref {
-		t.Fatalf("stored ref = %q, want %q", ref.Ref, lay.Ref)
+	wantRef := mustNormalizeRef(t, lay.Ref)
+	ref := readPullRef(t, storeRoot, wantRef)
+	if ref.Ref != wantRef {
+		t.Fatalf("stored ref = %q, want %q", ref.Ref, wantRef)
 	}
 	if ref.Resolved.Digest != lay.Root {
 		t.Fatalf("resolved digest = %s, want %s", ref.Resolved.Digest, lay.Root)

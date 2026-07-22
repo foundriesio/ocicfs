@@ -66,7 +66,7 @@ func TestEngineRemoveDeletesRefAndBindingOnly(t *testing.T) {
 	root := t.TempDir()
 	imageRoot := digest.SHA256.FromString("root")
 	composefs := digest.SHA256.FromString("composefs")
-	ref := "app@" + imageRoot.String()
+	ref := "registry.example.com/app@" + imageRoot.String()
 	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
 	putEngineRef(t, root, ref, imageRoot, 45, platform)
 	putEngineBinding(t, root, imageRoot, platform, composefs)
@@ -97,8 +97,8 @@ func TestEngineRemoveKeepsSharedBinding(t *testing.T) {
 	root := t.TempDir()
 	imageRoot := digest.SHA256.FromString("root")
 	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
-	firstRef := "first@" + imageRoot.String()
-	secondRef := "second@" + imageRoot.String()
+	firstRef := "registry.example.com/first@" + imageRoot.String()
+	secondRef := "registry.example.com/second@" + imageRoot.String()
 	putEngineRef(t, root, firstRef, imageRoot, 45, platform)
 	putEngineRef(t, root, secondRef, imageRoot, 45, platform)
 	putEngineBinding(t, root, imageRoot, platform, digest.SHA256.FromString("composefs"))
@@ -138,7 +138,7 @@ func TestEngineRemoveRejectsMalformedPlatform(t *testing.T) {
 	root := t.TempDir()
 	imageRoot := digest.SHA256.FromString("root")
 	refStore := newRefStore(t, root)
-	if err := refStore.Put("app@"+imageRoot.String(), ocispec.Descriptor{
+	if err := refStore.Put("registry.example.com/app@"+imageRoot.String(), ocispec.Descriptor{
 		Digest: imageRoot,
 		Size:   45,
 	}, time.Unix(0, 0).UTC(), []string{"linux"}); err != nil {
@@ -149,7 +149,7 @@ func TestEngineRemoveRejectsMalformedPlatform(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	err = eng.Remove(context.Background(), "app@"+imageRoot.String())
+	err = eng.Remove(context.Background(), "registry.example.com/app@"+imageRoot.String())
 	if err == nil || !strings.Contains(err.Error(), "invalid platform") {
 		t.Fatalf("error = %v, want invalid platform", err)
 	}
@@ -192,7 +192,8 @@ func TestPullListRemoveE2E(t *testing.T) {
 		t.Fatalf("List: %v", err)
 	}
 	binding := readPullBinding(t, storeRoot, lay.Root, lay.Platform)
-	if len(images) != 1 || images[0].Ref != lay.Ref || images[0].Digest != lay.Root.String() ||
+	wantRef := mustNormalizeRef(t, lay.Ref)
+	if len(images) != 1 || images[0].Ref != wantRef || images[0].Digest != lay.Root.String() ||
 		images[0].Size != binding.RootFS.Descriptor.Size {
 		t.Fatalf("List = %#v, want pulled ref/root and the composefs object size", images)
 	}

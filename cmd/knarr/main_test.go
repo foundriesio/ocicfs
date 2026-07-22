@@ -184,7 +184,7 @@ func TestRunLsJSON(t *testing.T) {
 func TestRunRemoveDispatchesToEngine(t *testing.T) {
 	root := t.TempDir()
 	imageRoot := digest.SHA256.FromString("root")
-	ref := "app@" + imageRoot.String()
+	ref := "registry.example.com/app@" + imageRoot.String()
 	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
 	writeCLIImage(t, root, ref, imageRoot, 72, platform)
 

@@ -9,8 +9,11 @@
 // a record is checked on use: its stored ref must equal the reference looked up,
 // its refKey must equal sha256(ref), and its stored digests must be valid
 // sha256 digests. Each record is a JSON file keyed by the SHA-256 of the
-// reference string exactly as given -- never canonicalized, so "app:v1" and
-// "docker.io/library/app:v1" key to different files:
+// reference string exactly as given to Put -- refstore stores and compares
+// refs verbatim and never canonicalizes them itself; the engine normalizes a
+// ref before it reaches Put or Get, so equivalent refs (e.g. "app:v1" and
+// "docker.io/library/app:v1") converge on the same key by the time refstore
+// sees them:
 //
 //	refKey = sha256(ref)
 //	<root>/refs/sha256/<refkey-xx>/<refkey-rest>.json
