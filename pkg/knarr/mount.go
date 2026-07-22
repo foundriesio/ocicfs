@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/foundriesio/knarr/internal/imagestore"
 	"github.com/foundriesio/knarr/internal/mount"
@@ -23,9 +24,10 @@ func (e *engine) Mount(ctx context.Context, ref, target string, opts ...MountOpt
 	return nil
 }
 
-// ObjectsDir returns the store's composefs backing-object directory.
+// ObjectsDir returns the store's fs-verity view directory, the data plane a
+// merged image's redirects resolve through.
 func (e *engine) ObjectsDir() (string, error) {
-	return e.obj.ObjectsDir(), nil
+	return e.obj.ViewDir(), nil
 }
 
 // Unmount tears down the mount at target. A target with no mount returns an
@@ -89,7 +91,7 @@ func (e *engine) mount(ctx context.Context, ref, target string, opts ...MountOpt
 
 	spec := mount.Spec{
 		ImagePath:      imagePath,
-		Basedir:        e.obj.ObjectsDir(),
+		Basedir:        filepath.Join(e.root, b.ObjectStorePath),
 		Target:         target,
 		FsverityDigest: b.FsverityDigest,
 	}

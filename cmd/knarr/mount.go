@@ -40,6 +40,6 @@ func newMountCommand(g *globalOptions) *cobra.Command {
 	}
 
 	cmd.Flags().BoolVar(&rw, "rw", false, "mount a writable overlay over the read-only composefs base, with the upperdir and workdir allocated under the overlay root")
-	cmd.Flags().BoolVar(&metadataOnly, "metadata-only", false, "mount only the image's verified EROFS metadata, without file data; the caller assembles its own overlay with the store's objects/sha256 directory as a data-only lowerdir and verity=require")
+	cmd.Flags().BoolVar(&metadataOnly, "metadata-only", false, "mount only the image's verified EROFS metadata, without file data; the caller assembles its own overlay with the store's objects/fsverity-sha256-12 view as a data-only lowerdir and verity=require")
 	return cmd
 }

@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sys/unix"
 
 	"github.com/foundriesio/knarr/internal/devtest"
@@ -214,6 +215,108 @@ func TestMountUnpulledReturnsErrNotFound(t *testing.T) {
 	}
 }
 
+// TestMountOldTupleBindingReportsNotPulled: a binding carrying the superseded
+// object-store tuple must surface the same "run knarr pull" guidance as a
+// missing binding, not a raw validation error, so an old cached image reads as a
+// cache miss to be rebuilt. It needs no verity: mount reports it before touching
+// the object store.
+func TestMountOldTupleBindingReportsNotPulled(t *testing.T) {
+	storeRoot := t.TempDir()
+	eng, err := New(Config{Root: storeRoot})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	img, err := imagestore.New(storeRoot)
+	if err != nil {
+		t.Fatalf("imagestore.New: %v", err)
+	}
+	root := digest.SHA256.FromString("img")
+	platform := hostPlatform()
+	if err := img.Put(root, platform, imagestore.Binding{
+		Descriptor:     ocispec.Descriptor{Digest: digest.SHA256.FromString("cfs"), Size: 1},
+		FsverityDigest: digest.SHA256.FromString("verity").String(),
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	downgradeBindingTuple(t, octest.BindingPath(storeRoot, root, platform))
+
+	err = eng.Mount(context.Background(), "app@"+root.String(), t.TempDir())
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Mount = %v, want an ErrNotFound match", err)
+	}
+	if !strings.Contains(err.Error(), "knarr pull") {
+		t.Fatalf("Mount = %v, want the run-pull hint", err)
+	}
+}
+
+// TestPullRebuildsOldTupleBindingE2E: a re-pull over a binding written under the
+// superseded object-store tuple treats it as a cache miss and rebuilds a fresh
+// binding under the current tuple.
+func TestPullRebuildsOldTupleBindingE2E(t *testing.T) {
+	storeRoot, cleanup, err := devtest.VerityRoot()
+	if errors.Is(err, devtest.ErrNoVerity) {
+		t.Skipf("verity-capable store root unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("VerityRoot: %v", err)
+	}
+	t.Cleanup(cleanup)
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+
+	lay, err := octest.BuildSingleLayerGzip(t.TempDir(), hostPlatform(),
+		octest.File{Name: "etc/config.txt", Mode: 0o644, Body: "hello from knarr\n"},
+	)
+	if err != nil {
+		t.Fatalf("build layout: %v", err)
+	}
+	eng, err := New(Config{Root: storeRoot})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := eng.Pull(context.Background(), lay.Ref, WithFromDir(lay.Dir)); devtest.IsVerityUnsupported(err) {
+		t.Skipf("fs-verity unsupported on the test filesystem: %v", err)
+	} else if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+
+	downgradeBindingTuple(t, octest.BindingPath(storeRoot, lay.Root, lay.Platform))
+	if _, err := eng.Pull(context.Background(), lay.Ref, WithFromDir(lay.Dir)); err != nil {
+		t.Fatalf("re-pull over old-tuple binding: %v", err)
+	}
+
+	img, err := imagestore.New(storeRoot)
+	if err != nil {
+		t.Fatalf("imagestore.New: %v", err)
+	}
+	b, err := img.Get(lay.Root, lay.Platform)
+	if err != nil {
+		t.Fatalf("Get after rebuild: %v", err)
+	}
+	if b.ObjectStorePath != "objects/fsverity-sha256-12" {
+		t.Fatalf("object store path = %q after rebuild, want the current tuple", b.ObjectStorePath)
+	}
+}
+
+// downgradeBindingTuple rewrites the binding at path to carry the superseded
+// sha256 object-store tuple, simulating a cache entry from before the fs-verity
+// view scheme.
+func downgradeBindingTuple(t *testing.T, path string) {
+	t.Helper()
+	data, err := os.ReadFile(path) // #nosec G304 -- test rewrites a path it wrote
+	if err != nil {
+		t.Fatalf("read binding: %v", err)
+	}
+	data = []byte(strings.NewReplacer(
+		`"algorithm":"fsverity-sha256-12"`, `"algorithm":"sha256"`,
+		`"path":"objects/fsverity-sha256-12"`, `"path":"objects/sha256"`,
+	).Replace(string(data)))
+	if err := os.WriteFile(path, data, 0o644); err != nil { // #nosec G703 -- test rewrites a path it wrote
+		t.Fatalf("write binding: %v", err)
+	}
+}
+
 // TestMountMissingObjectReturnsErrNotFound: a binding whose composefs object
 // was removed from the store must fail with an ErrNotFound match, not a bare
 // stat error.
@@ -327,7 +430,7 @@ func TestMountMetadataOnlyConsumerOverlayE2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ObjectsDir: %v", err)
 	}
-	if want := filepath.Join(storeRoot, "objects", "sha256"); objects != want {
+	if want := filepath.Join(storeRoot, "objects", "fsverity-sha256-12"); objects != want {
 		t.Fatalf("ObjectsDir = %q, want %q", objects, want)
 	}
 

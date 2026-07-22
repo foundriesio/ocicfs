@@ -71,12 +71,12 @@ func TestWriteImageMatchesUpstream(t *testing.T) {
 // byte-compatible with upstream tooling for files small enough that directory-mode
 // mkcomposefs inlines them (<=64 bytes). The reference image is built with upstream
 // tools ONLY — never WriteImage: a directory-mode build (which inlines the small
-// files) is dumped, every regular-file line is rewritten into knarr's content-keyed
-// by-digest form (PAYLOAD = content sha256, DIGEST = fs-verity from composefs-info
+// files) is dumped, every regular-file line is rewritten into knarr's by-digest
+// form (PAYLOAD and DIGEST both the file's fs-verity digest from composefs-info
 // measure-file), and mkcomposefs --from-file rebuilds a no-inline image from that
 // dump. WriteImage then rebuilds the same dump and must reproduce the reference
-// byte-for-byte, with the small file stored by digest (PAYLOAD != DIGEST) rather
-// than re-inlined. Needs mkcomposefs and composefs-info on PATH.
+// byte-for-byte, with the small file stored by digest rather than re-inlined.
+// Needs mkcomposefs and composefs-info on PATH.
 func TestWriteImageNoInlineMatchesUpstream(t *testing.T) {
 	mkcomposefs := lookPathOrSkip(t, "mkcomposefs")
 	cfsInfo := lookPathOrSkip(t, "composefs-info")
@@ -96,12 +96,11 @@ func TestWriteImageNoInlineMatchesUpstream(t *testing.T) {
 		t.Fatalf("directory-mode build did not inline a small file, so the test is not exercising the no-inline path:\n%s", inlinedDump)
 	}
 
-	// Upstream-only no-inline reference: rewrite every file to knarr's content-keyed
-	// by-digest form and rebuild via --from-file. No WriteImage is involved in
-	// producing it. Confirm the once-inlined small file is now by-digest with
-	// PAYLOAD (content) distinct from DIGEST (fs-verity) — knarr's CAS invariant.
-	noinlineDump := rewriteToContentKeyed(t, cfsInfo, src, inlinedDump)
-	assertContentKeyed(t, noinlineDump, "/small")
+	// Upstream-only no-inline reference: rewrite every file to knarr's by-digest
+	// form and rebuild via --from-file. No WriteImage is involved in producing it.
+	// Confirm the once-inlined small file is now by-digest.
+	noinlineDump := rewriteToByDigest(t, cfsInfo, src, inlinedDump)
+	assertByDigest(t, noinlineDump, "/small")
 	dumpPath := filepath.Join(out, "noinline.dump")
 	mustWriteFile(t, dumpPath, []byte(noinlineDump))
 	ref := filepath.Join(out, "ref.cfs")
@@ -242,10 +241,10 @@ func parseDump(t *testing.T, dump string) []Entry {
 			if content != "-" {
 				t.Fatalf("regular file %q carries inline content; the fixture must exceed the inline threshold", e.Path)
 			}
-			// payload is "<2>/<rest>" of the object's content digest and seeds
-			// Digest (WriteDump re-derives the payload from it); the DIGEST column is
-			// the fs-verity digest and seeds Verity. The two are equal for an
-			// upstream fs-verity-keyed dump but differ for knarr's content-keyed one.
+			// payload is "<2>/<rest>" of the fs-verity digest and seeds Digest, so
+			// the entry carries the content key WriteDump requires; the DIGEST column,
+			// also the fs-verity digest, seeds Verity, from which WriteDump derives
+			// the emitted payload. In these fs-verity-keyed dumps the two coincide.
 			e.Digest = digestFromPayload(t, payload)
 			e.Verity = digest.NewDigestFromEncoded(digest.SHA256, dig)
 		case mode&os.ModeDevice != 0:
@@ -352,15 +351,13 @@ func hasInlinedRegularFile(dump string) bool {
 	return false
 }
 
-// rewriteToContentKeyed turns a composefs-info dump into knarr's content-keyed,
-// no-inline form using only upstream tools. Every regular-file line — inlined or
-// already by-digest — is rewritten so PAYLOAD is the "<2>/<rest>" redirect for the
-// file's content sha256, CONTENT is "-", and DIGEST is its fs-verity digest (from
-// composefs-info measure-file). Content sha256 and fs-verity are different hashes,
-// so PAYLOAD != DIGEST: this is knarr's CAS invariant, which the upstream
-// fs-verity-keyed form (PAYLOAD == DIGEST) would never exercise. Directories,
-// symlinks, and other non-regular lines pass through unchanged.
-func rewriteToContentKeyed(t *testing.T, cfsInfo, srcDir, dump string) string {
+// rewriteToByDigest turns a composefs-info dump into knarr's no-inline by-digest
+// form using only upstream tools. Every regular-file line — inlined or already
+// by-digest — is rewritten so PAYLOAD is the "<2>/<rest>" redirect for the file's
+// fs-verity digest (from composefs-info measure-file), CONTENT is "-", and DIGEST
+// is that same fs-verity digest — the fs-verity-keyed form WriteImage emits.
+// Directories, symlinks, and other non-regular lines pass through unchanged.
+func rewriteToByDigest(t *testing.T, cfsInfo, srcDir, dump string) string {
 	t.Helper()
 	var b strings.Builder
 	for _, line := range strings.Split(strings.TrimRight(dump, "\n"), "\n") {
@@ -373,12 +370,11 @@ func rewriteToContentKeyed(t *testing.T, cfsInfo, srcDir, dump string) string {
 		}
 		src := filepath.Join(srcDir, strings.TrimPrefix(unescaped(t, f[0]), "/"))
 		if fi, err := os.Lstat(src); err == nil && fi.Mode().IsRegular() {
-			csum := digest.FromBytes(mustRead(t, src)).Encoded() // content sha256 -> PAYLOAD
-			fsv := measure(t, cfsInfo, src)                      // fs-verity -> DIGEST
+			fsv := measure(t, cfsInfo, src) // fs-verity -> PAYLOAD and DIGEST
 			if len(fsv) != 2*32 {
 				t.Fatalf("measure-file %q returned %q, want a 64-hex sha256 digest", src, fsv)
 			}
-			f[8] = csum[:2] + "/" + csum[2:]
+			f[8] = fsv[:2] + "/" + fsv[2:]
 			f[9] = "-"
 			f[10] = fsv
 		}
@@ -388,10 +384,10 @@ func rewriteToContentKeyed(t *testing.T, cfsInfo, srcDir, dump string) string {
 	return b.String()
 }
 
-// assertContentKeyed fails unless dump holds a by-digest line for path whose
-// PAYLOAD (content redirect) differs from its DIGEST (fs-verity) — the property
-// that distinguishes knarr's content-keyed CAS from upstream's fs-verity-keyed one.
-func assertContentKeyed(t *testing.T, dump, path string) {
+// assertByDigest fails unless dump holds a by-digest line for path: CONTENT is
+// "-" and the PAYLOAD redirect reconstructs the DIGEST column (the file's
+// fs-verity digest) — the fs-verity-keyed form knarr shares with upstream.
+func assertByDigest(t *testing.T, dump, path string) {
 	t.Helper()
 	for _, line := range strings.Split(strings.TrimRight(dump, "\n"), "\n") {
 		f := strings.Split(line, " ")
@@ -401,8 +397,8 @@ func assertContentKeyed(t *testing.T, dump, path string) {
 		if f[9] != "-" {
 			t.Fatalf("%s is inlined (CONTENT=%q), want by-digest", path, f[9])
 		}
-		if payload := strings.Replace(f[8], "/", "", 1); payload == f[10] {
-			t.Fatalf("%s has PAYLOAD == DIGEST (%s); expected a content redirect distinct from the fs-verity digest", path, f[10])
+		if payload := strings.Replace(f[8], "/", "", 1); payload != f[10] {
+			t.Fatalf("%s PAYLOAD %q does not reconstruct DIGEST %q; expected the fs-verity redirect", path, f[8], f[10])
 		}
 		return
 	}

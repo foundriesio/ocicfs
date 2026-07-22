@@ -25,9 +25,10 @@ func d(b byte) digest.Digest {
 func TestWriteDump(t *testing.T) {
 	// Deliberately unsorted, and without a "/" record, to exercise both the
 	// stable sort and the synthetic-root injection.
-	// Regular files carry distinct content and fs-verity digests so the dump's
-	// PAYLOAD (content redirect) and DIGEST (fs-verity) columns are exercised
-	// independently: a swap or reuse of one for the other would fail this golden.
+	// Regular files carry distinct content and fs-verity digests so the golden
+	// pins that the PAYLOAD redirect and the DIGEST column both derive from the
+	// fs-verity digest (Verity), not the content digest (Digest): emitting Digest
+	// in either column would fail this golden.
 	entries := []Entry{
 		{Path: "/app", Mode: os.ModeDir | 0o755},
 		{Path: "/app/run", Mode: 0o644, Size: 5, Digest: d('1'), Verity: d('a')},
@@ -41,16 +42,14 @@ func TestWriteDump(t *testing.T) {
 	// /app/run is hardlinked by /app/run2, so its entry carries Nlink 2.
 	entries[1].Nlink = 2
 
-	const ones = "1111111111111111111111111111111111111111111111111111111111111111" // /app/run content
-	const twos = "2222222222222222222222222222222222222222222222222222222222222222" // /app/cfg content
 	const aaas = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" // /app/run fs-verity
 	const bbbs = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" // /app/cfg fs-verity
 	want := "/ 0 40755 1 0 0 0 0.000000000 - - -\n" +
 		"/app 0 40755 1 0 0 0 0.000000000 - - -\n" +
-		"/app/cfg 2 100600 1 0 0 0 0.000000000 " + twos[:2] + "/" + twos[2:] + " - " + bbbs + " user.foo=bar\n" +
+		"/app/cfg 2 100600 1 0 0 0 0.000000000 " + bbbs[:2] + "/" + bbbs[2:] + " - " + bbbs + " user.foo=bar\n" +
 		"/app/fifo 0 10644 1 0 0 0 0.000000000 - - -\n" +
 		"/app/link 0 120777 1 0 0 0 0.000000000 run - -\n" +
-		"/app/run 5 100644 2 0 0 0 0.000000000 " + ones[:2] + "/" + ones[2:] + " - " + aaas + "\n" +
+		"/app/run 5 100644 2 0 0 0 0.000000000 " + aaas[:2] + "/" + aaas[2:] + " - " + aaas + "\n" +
 		"/app/run2 0 @120000 - - - - 0.0 /app/run - -\n" +
 		"/dev 0 40755 1 0 0 0 0.000000000 - - -\n" +
 		"/dev/null 0 20666 1 0 0 259 0.000000000 - - -\n"

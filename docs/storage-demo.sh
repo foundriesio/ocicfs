@@ -7,8 +7,9 @@
 #
 # Plays both sides of knarr's trust model on one machine using only the upstream
 # mkcomposefs and composefs-info tools:
-#   [publisher] builds a content-addressed, no-inline composefs image from a sample
-#               tree and seals its fs-verity digest;
+#   [publisher] builds a no-inline composefs image from a sample tree — objects
+#               stored by content sha256 with an fs-verity-keyed hardlink view,
+#               redirects keyed by fs-verity — and seals its fs-verity digest;
 #   [device]    rebuilds the image from the same dump + objects and verifies the
 #               measured digest matches the seal.
 #
@@ -44,8 +45,8 @@ mkcomposefs --use-epoch --skip-xattrs --min-version=1 --max-version=1 tree inlin
 composefs-info dump inlined.cfs
 
 echo
-echo "== [publisher] rewrite to a content-addressed, no-inline dump (+ build object store) =="
-mkdir -p objects/sha256
+echo "== [publisher] rewrite to a no-inline dump (+ build object store and fs-verity view) =="
+mkdir -p objects/sha256 objects/fsverity-sha256-12
 to_knarr() {
 	while IFS= read -r line; do
 		# shellcheck disable=SC2086 # dump fields are space-separated and unescaped here
@@ -61,11 +62,13 @@ to_knarr() {
 		esac
 		f="tree$1"
 		if [ -f "$f" ] && [ ! -L "$f" ]; then
-			csum=$(sha256sum "$f" | cut -d' ' -f1)                    # content digest -> PAYLOAD
+			csum=$(sha256sum "$f" | cut -d' ' -f1)                    # content digest -> CAS name
 			install -D -m0644 "$f" "objects/sha256/${csum:0:2}/${csum:2}" # store the object
-			fsv=$(composefs-info measure-file "$f")                   # fs-verity digest -> DIGEST
+			fsv=$(composefs-info measure-file "$f")                   # fs-verity digest -> PAYLOAD + DIGEST
+			mkdir -p "objects/fsverity-sha256-12/${fsv:0:2}"
+			ln -f "objects/sha256/${csum:0:2}/${csum:2}" "objects/fsverity-sha256-12/${fsv:0:2}/${fsv:2}" # view hardlink
 			printf '%s %s %s %s %s %s %s %s %s/%s - %s\n' \
-				"$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "${csum:0:2}" "${csum:2}" "$fsv"
+				"$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "${fsv:0:2}" "${fsv:2}" "$fsv"
 		else
 			printf '%s\n' "$line"
 		fi
@@ -96,5 +99,5 @@ echo
 echo "== [device] delta view =="
 echo "objects this image references:"
 composefs-info objects device.cfs
-missing="$(composefs-info missing-objects --basedir=objects/sha256 device.cfs)"
+missing="$(composefs-info missing-objects --basedir=objects/fsverity-sha256-12 device.cfs)"
 echo "missing from the object store: ${missing:-(none)}"

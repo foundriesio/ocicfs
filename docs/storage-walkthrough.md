@@ -15,7 +15,7 @@ belongs to:
   measured fs-verity equals the sealed value.
 
 The seal only works if both sides build a **byte-identical** image, so the recipe
-(V1 format, zeroed mtimes, no inline, content-addressed objects) is fixed. This
+(V1 format, zeroed mtimes, no inline, fs-verity-keyed redirects) is fixed. This
 walkthrough plays both roles on one machine.
 
 For *why* the format looks like this, see [why.md](why.md) and
@@ -42,12 +42,14 @@ walk through what it does.
 ## The format in one paragraph
 
 A regular file's bytes are stored once, as an object named by the sha256 of its
-*content*, under `objects/sha256/<aa>/<rest>`. The composefs image is an EROFS that, for
-each file, records a **PAYLOAD** (a redirect to that object) and a **DIGEST** (the
-file's fs-verity digest, which the kernel validates the object against). knarr keys
-the store by content sha256, so PAYLOAD and DIGEST are *different* hashes of the same
-file. The image holds no file content — only structure plus redirects — so one
-decompressed copy of each object is shared across every image that references it.
+*content*, under `objects/sha256/<aa>/<rest>`, with a second hardlink name under
+`objects/fsverity-sha256-12/<vv>/<rest>` keyed by the file's fs-verity digest (the
+view). The composefs image is an EROFS that, for each file, records a **PAYLOAD**
+(a redirect resolved through the view) and a **DIGEST** (the same fs-verity digest,
+which the kernel validates the object against) — both columns derive from the
+fs-verity digest, matching upstream composefs. The image holds no file content —
+only structure plus redirects — so one decompressed copy of each object is shared
+across every image that references it.
 
 ## Publisher: build and seal
 
@@ -86,22 +88,25 @@ composefs-info dump inlined.cfs
 
 knarr never inlines: every file is a by-digest object in the object store. This filter turns
 each regular-file line into knarr's form — it stores the file under its content
-sha256, then emits `PAYLOAD` = the `<aa>/<rest>` content redirect, `CONTENT` = `-`,
-and `DIGEST` = the file's fs-verity digest. Directories and symlinks pass through:
+sha256, hardlinks it into the fs-verity view, then emits `PAYLOAD` = the
+`<vv>/<rest>` fs-verity redirect, `CONTENT` = `-`, and `DIGEST` = the same
+fs-verity digest. Directories and symlinks pass through:
 
 ```sh
-mkdir -p objects/sha256
+mkdir -p objects/sha256 objects/fsverity-sha256-12
 to_knarr() {
   while IFS= read -r line; do
     set -- $line                       # PATH SIZE MODE NLINK UID GID RDEV MTIME PAYLOAD CONTENT DIGEST
     case $1 in *\\*) echo "escaped PATH unsupported: $1" >&2; exit 1;; esac
     f="tree$1"
     if [ -f "$f" ] && [ ! -L "$f" ]; then
-      csum=$(sha256sum "$f" | cut -d' ' -f1)                       # content digest -> PAYLOAD
+      csum=$(sha256sum "$f" | cut -d' ' -f1)                       # content digest -> CAS name
       install -D -m0644 "$f" "objects/sha256/${csum:0:2}/${csum:2}"    # store the object
-      fsv=$(composefs-info measure-file "$f")                      # fs-verity digest -> DIGEST
+      fsv=$(composefs-info measure-file "$f")                      # fs-verity digest -> PAYLOAD + DIGEST
+      mkdir -p "objects/fsverity-sha256-12/${fsv:0:2}"
+      ln -f "objects/sha256/${csum:0:2}/${csum:2}" "objects/fsverity-sha256-12/${fsv:0:2}/${fsv:2}"
       printf '%s %s %s %s %s %s %s %s %s/%s - %s\n' \
-        "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "${csum:0:2}" "${csum:2}" "$fsv"
+        "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "${fsv:0:2}" "${fsv:2}" "$fsv"
     else
       printf '%s\n' "$line"
     fi
@@ -112,18 +117,19 @@ cat image.dump
 ```
 
 ```
-/bin/tool 200 100644 1 0 0 0 0.0 aa/20c2..486d - 284c22bb..20c7
-/etc/app.conf 4 100644 1 0 0 0 0.0 af/33f4..274da - eed448e7..ba535
-/hello 16 100644 1 0 0 0 0.0 62/531b..501b - 892bd692..4c429
+/bin/tool 200 100644 1 0 0 0 0.0 28/4c22bb..20c7 - 284c22bb..20c7
+/etc/app.conf 4 100644 1 0 0 0 0.0 ee/d448e7..ba535 - eed448e7..ba535
+/hello 16 100644 1 0 0 0 0.0 89/2bd692..4c429 - 892bd692..4c429
 ```
 
-The two formerly-inlined files are now by-digest, and you can see knarr's key point on
-`tool`: `PAYLOAD` (`aa/20c2…`, the content sha256) differs from `DIGEST` (`284c22…`,
-the fs-verity digest). This is the `internal/composefs` `Entry`/`WriteDump` format,
-and the lines map one-to-one onto the [composefs-dump(5)](https://github.com/composefs/composefs/blob/v1.0.8/man/composefs-dump.md)
-columns. (Upstream's own `--digest-store` keys objects by fs-verity instead, making
-those two columns coincide — knarr keys by content so it can dedup and delta using the
-digests the OCI layer TOC already carries.)
+The two formerly-inlined files are now by-digest, and `PAYLOAD` and `DIGEST` both
+derive from the file's fs-verity digest — the redirect resolves through the
+fs-verity view, exactly like upstream's `--digest-store` layout. This is the
+`internal/composefs` `Entry`/`WriteDump` format, and the lines map one-to-one onto
+the [composefs-dump(5)](https://github.com/composefs/composefs/blob/v1.0.8/man/composefs-dump.md)
+columns. (knarr still *stores* each object under its content sha256 — the name the
+OCI layer TOC already carries, which is what dedup and delta fetch key on — and the
+view hardlink gives the same inode its fs-verity name for the mount data plane.)
 
 ### 4. [publisher] Build the canonical image and seal it
 
@@ -167,8 +173,8 @@ integrity guarantee.
 ### 7. [device] The delta view
 
 ```sh
-composefs-info objects device.cfs                              # objects this image needs
-composefs-info missing-objects --basedir=objects/sha256 device.cfs # what the object store still lacks
+composefs-info objects device.cfs                              # objects this image needs (fs-verity names)
+composefs-info missing-objects --basedir=objects/fsverity-sha256-12 device.cfs # what the view still lacks
 ```
 
 `missing-objects` prints nothing here (the object store is complete); against a partial object store it
@@ -194,7 +200,7 @@ go test -v -run TestWriteImage ./internal/composefs/
 
 The publisher seal verifies on the device only because both builds use the same
 recipe: V1 format (`--min-version=1`), zeroed mtimes (`MTIME=0`, i.e. `--use-epoch`),
-no inline (`CONTENT="-"`), content-addressed objects, sorted entries, and consistent
+no inline (`CONTENT="-"`), fs-verity-keyed redirects, sorted entries, and consistent
 xattr handling. Byte-identical inputs give a byte-identical EROFS, hence an identical
 fs-verity digest. A directory-mode publisher build would inline small files and seal a
 digest the device's no-inline rebuild could never match — which is why both sides use
@@ -203,7 +209,7 @@ the `--from-file` path.
 ## Mounting (not covered here)
 
 This walkthrough stops at building and verifying. Mounting an image
-(`mount.composefs publisher.cfs --basedir objects/sha256 /mnt`) needs root
+(`mount.composefs publisher.cfs --basedir objects/fsverity-sha256-12 /mnt`) needs root
 privilege and composefs kernel support. The `mount.composefs` helper is in the
 dev image, but mounting is knarr's `mount` verb — see [mount.md](mount.md) —
 and is exercised there rather than in this substrate walkthrough.

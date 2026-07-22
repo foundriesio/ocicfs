@@ -81,7 +81,7 @@ folds the store's object directory into that overlay as a data-only lower:
 ```sh
 sudo knarr mount --metadata-only "app@$digest" /mnt/app-meta
 sudo mount -t overlay overlay -o \
-  "lowerdir=/mnt/app-meta::/var/lib/knarr/objects/sha256,upperdir=$upper,workdir=$work,redirect_dir=on,metacopy=on,verity=require" \
+  "lowerdir=/mnt/app-meta::/var/lib/knarr/objects/fsverity-sha256-12,upperdir=$upper,workdir=$work,redirect_dir=on,metacopy=on,verity=require" \
   /mnt/app
 ```
 

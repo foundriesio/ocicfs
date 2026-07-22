@@ -17,17 +17,20 @@
 //	<root>/images/sha256/<root-xx>/<root-rest>/<os>[-<arch>[-<variant>]].json
 //
 // It records the composefs blob descriptor, the object store backing it
-// (objects/sha256), the fs-verity digest the mount enforces -- always mode
-// "required" with a "local-measurement" source -- and the merged rootfs's
-// apparent size as display metadata (optional; absent in bindings written
-// before it existed). The file is written atomically and durably.
+// (objects/fsverity-sha256-12, the fs-verity view the image's redirects resolve
+// through), the fs-verity digest the mount enforces -- always mode "required"
+// with a "local-measurement" source -- whether the merged image was built by the
+// upstream-reproducible construction (the canonical flag), and the merged
+// rootfs's apparent size as display metadata (optional; absent in bindings
+// written before it existed). The file is written atomically and durably.
 //
 //	{ "schema": "application/vnd.knarr.cfs-binding.v1+json",
 //	  "platform": {"os":"linux","architecture":"arm64","variant":"v8"},
 //	  "rootfs": { "type":"composefs",
 //	    "descriptor":  {"mediaType":"...composefs.image.v1+erofs","digest":"sha256:...","size":N},
-//	    "objectStore": {"type":"composefs-digest-store","algorithm":"sha256","path":"objects/sha256"},
+//	    "objectStore": {"type":"composefs-digest-store","algorithm":"fsverity-sha256-12","path":"objects/fsverity-sha256-12"},
 //	    "fsverity":    {"mode":"required","digest":"sha256:...","source":"local-measurement"},
+//	    "canonical":   false,
 //	    "size":        N } }
 package imagestore
 
@@ -57,10 +60,18 @@ type Store struct {
 // once); it is display metadata, and 0 when the binding predates the field
 // (recorded when the image is next actually built — a pull that verifies
 // the image as already present does not rewrite the binding).
+// Canonical reports whether the merged image was built by the
+// upstream-reproducible construction; it is persisted so a cached pull can
+// apply the same decision after restart.
+// ObjectStorePath is the store-relative directory the mount's data plane reads.
+// It is populated by Get from the recorded tuple; Put always writes the current
+// scheme's path and ignores this field.
 type Binding struct {
-	Descriptor     ocispec.Descriptor
-	FsverityDigest string
-	RootfsSize     int64
+	Descriptor      ocispec.Descriptor
+	FsverityDigest  string
+	RootfsSize      int64
+	Canonical       bool
+	ObjectStorePath string
 }
 
 // ErrNotFound reports that no prepared-image binding exists for a root digest
@@ -93,16 +104,17 @@ func (s *Store) Put(root digest.Digest, p ocispec.Platform, b Binding) error {
 			Type:       "composefs",
 			Descriptor: descriptorDoc{MediaType: b.Descriptor.MediaType, Digest: b.Descriptor.Digest, Size: b.Descriptor.Size},
 			ObjectStore: objectStoreDoc{
-				Type:      "composefs-digest-store",
-				Algorithm: "sha256",
-				Path:      "objects/sha256",
+				Type:      objectStoreType,
+				Algorithm: objectStoreAlgorithm,
+				Path:      objectStorePath,
 			},
 			Fsverity: fsverityDoc{
 				Mode:   "required",
 				Digest: fsv,
 				Source: "local-measurement",
 			},
-			Size: b.RootfsSize,
+			Canonical: b.Canonical,
+			Size:      b.RootfsSize,
 		},
 	}
 	data, err := json.Marshal(doc)
@@ -147,8 +159,10 @@ func (s *Store) Get(root digest.Digest, p ocispec.Platform) (Binding, error) {
 			Digest:    doc.RootFS.Descriptor.Digest,
 			Size:      doc.RootFS.Descriptor.Size,
 		},
-		FsverityDigest: doc.RootFS.Fsverity.Digest.String(),
-		RootfsSize:     doc.RootFS.Size,
+		FsverityDigest:  doc.RootFS.Fsverity.Digest.String(),
+		RootfsSize:      doc.RootFS.Size,
+		Canonical:       doc.RootFS.Canonical,
+		ObjectStorePath: doc.RootFS.ObjectStore.Path,
 	}, nil
 }
 
@@ -169,6 +183,13 @@ func (s *Store) Delete(root digest.Digest, p ocispec.Platform) error {
 
 const (
 	bindingSchema = "application/vnd.knarr.cfs-binding.v1+json"
+
+	// The object-store tuple is the binding's compatibility key: a binding
+	// carrying any other tuple is rejected as a cache miss, so the schema string
+	// need not change when the tuple does.
+	objectStoreType      = "composefs-digest-store"
+	objectStoreAlgorithm = "fsverity-sha256-12"
+	objectStorePath      = "objects/fsverity-sha256-12"
 )
 
 // The on-disk binding JSON documents.
@@ -190,6 +211,11 @@ type (
 		Descriptor  descriptorDoc  `json:"descriptor"`
 		ObjectStore objectStoreDoc `json:"objectStore"`
 		Fsverity    fsverityDoc    `json:"fsverity"`
+		// Canonical records whether the merged image was built by the
+		// upstream-reproducible construction. Always written; absent (false) in
+		// bindings from an object-store scheme that predates it, which the tuple
+		// check rejects as a cache miss anyway.
+		Canonical bool `json:"canonical"`
 		// Size is the merged rootfs's apparent size: display metadata, not
 		// part of the trust chain, absent in bindings written before it
 		// existed.
@@ -237,10 +263,15 @@ func validateBinding(doc bindingDoc, wantPlatform platformDoc) error {
 	if doc.RootFS.Type != "composefs" {
 		return fmt.Errorf("imagestore: unsupported rootfs type %q", doc.RootFS.Type)
 	}
-	if doc.RootFS.ObjectStore.Type != "composefs-digest-store" ||
-		doc.RootFS.ObjectStore.Algorithm != "sha256" ||
-		doc.RootFS.ObjectStore.Path != "objects/sha256" {
-		return fmt.Errorf("imagestore: unsupported object store %#v", doc.RootFS.ObjectStore)
+	if doc.RootFS.ObjectStore.Type != objectStoreType ||
+		doc.RootFS.ObjectStore.Algorithm != objectStoreAlgorithm ||
+		doc.RootFS.ObjectStore.Path != objectStorePath {
+		// A binding written under a superseded object-store scheme (or any other
+		// tuple) is a cache miss: the caller rebuilds it rather than reusing a
+		// binding whose redirects resolve through a different view. Joining
+		// ErrNotFound routes it through the same "run knarr pull" guidance a
+		// missing binding gets.
+		return fmt.Errorf("imagestore: unsupported object store %#v: %w", doc.RootFS.ObjectStore, ErrNotFound)
 	}
 	if doc.RootFS.Fsverity.Mode != "required" || doc.RootFS.Fsverity.Source != "local-measurement" {
 		return fmt.Errorf("imagestore: unsupported fs-verity policy %#v", doc.RootFS.Fsverity)

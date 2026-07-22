@@ -27,7 +27,8 @@ and sealed with fs-verity. One pull writes three kinds of object here:
 - **Per-file content** — one object per regular file across all layers, so
   identical files across images and layers are stored once.
 - **The composefs image** — the EROFS image that `mount -t composefs` mounts,
-  referencing the per-file objects by digest.
+  whose per-file redirects reference the objects by their fs-verity digest
+  through the view below.
 
 Alongside the sha256 tree, `objects/fsverity-sha256-12/` holds a second name for
 every object committed under this scheme: a hardlink sharded and keyed by the
@@ -61,12 +62,18 @@ or rebuilding, and records the locally measured fs-verity digest:
     "type": "composefs",
     "descriptor": { "mediaType": "application/vnd.knarr.composefs.image.v1+erofs",
                     "digest": "sha256:…", "size": 12288 },
-    "objectStore": { "type": "composefs-digest-store", "algorithm": "sha256", "path": "objects/sha256" },
+    "objectStore": { "type": "composefs-digest-store", "algorithm": "fsverity-sha256-12", "path": "objects/fsverity-sha256-12" },
     "fsverity": { "mode": "required", "digest": "sha256:…", "source": "local-measurement" },
+    "canonical": false,
     "size": 123456789
   }
 }
 ```
+
+`rootfs.objectStore` names the view a mount resolves the image's redirects
+through, and is the binding's **compatibility key**: a binding carrying any other
+tuple is treated as a cache miss and rebuilt. `rootfs.canonical` records whether
+the merged image was built by the upstream-reproducible construction.
 
 `rootfs.size` is display metadata recorded at build time — the merged tree's
 regular-file content bytes, hardlink groups counted once. It is not part of the
@@ -78,9 +85,10 @@ ref is removed, or on an image update).
 At mount time, knarr reads the host-platform binding for the pinned root digest,
 opens the referenced composefs image from `objects/sha256`, re-measures that
 image object's fs-verity digest, and requires it to match `rootfs.fsverity.digest`
-before mounting. The mount uses `objects/sha256` as the composefs basedir, so
-regular-file redirects in the image resolve to the same content-addressed objects
-written by pull.
+before mounting. The mount uses the binding's `objectStore.path`
+(`objects/fsverity-sha256-12`, the fs-verity view) as the composefs basedir, so
+the image's fs-verity-keyed redirects resolve to the sealed objects written by
+pull.
 
 ## `refs/` — reference records (auxiliary)
 

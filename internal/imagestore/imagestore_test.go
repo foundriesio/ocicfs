@@ -31,6 +31,9 @@ func TestPutWritesBinding(t *testing.T) {
 		},
 		FsverityDigest: fsv.String(),
 		RootfsSize:     456,
+		Canonical:      true,
+		// Put must write the current scheme's tuple, not whatever a caller puts here.
+		ObjectStorePath: "objects/bogus",
 	}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -54,8 +57,13 @@ func TestPutWritesBinding(t *testing.T) {
 	if got.RootFS.Type != "composefs" || got.RootFS.Descriptor.Digest != cfs || got.RootFS.Descriptor.Size != 123 {
 		t.Fatalf("rootfs descriptor = %#v", got.RootFS)
 	}
-	if got.RootFS.ObjectStore.Path != "objects/sha256" {
-		t.Fatalf("object store path = %q", got.RootFS.ObjectStore.Path)
+	if got.RootFS.ObjectStore.Type != "composefs-digest-store" ||
+		got.RootFS.ObjectStore.Algorithm != "fsverity-sha256-12" ||
+		got.RootFS.ObjectStore.Path != "objects/fsverity-sha256-12" {
+		t.Fatalf("object store = %#v", got.RootFS.ObjectStore)
+	}
+	if !got.RootFS.Canonical {
+		t.Fatalf("canonical = %v, want true", got.RootFS.Canonical)
 	}
 	if got.RootFS.Fsverity.Mode != "required" || got.RootFS.Fsverity.Digest != fsv || got.RootFS.Fsverity.Source != "local-measurement" {
 		t.Fatalf("fsverity = %#v", got.RootFS.Fsverity)
@@ -68,8 +76,52 @@ func TestPutWritesBinding(t *testing.T) {
 	if binding.Descriptor.Digest != cfs || binding.Descriptor.Size != 123 || binding.FsverityDigest != fsv.String() {
 		t.Fatalf("Get = %#v", binding)
 	}
+	if !binding.Canonical {
+		t.Fatalf("Get canonical = %v, want true", binding.Canonical)
+	}
+	if binding.ObjectStorePath != "objects/fsverity-sha256-12" {
+		t.Fatalf("Get object store path = %q", binding.ObjectStorePath)
+	}
 	if binding.RootfsSize != 456 || got.RootFS.Size != 456 {
 		t.Fatalf("rootfs size = %d (doc %d), want 456", binding.RootfsSize, got.RootFS.Size)
+	}
+}
+
+// TestGetRejectsOldObjectStoreTuple asserts a binding carrying the superseded
+// sha256 object-store tuple is rejected as a cache miss (ErrNotFound), so the
+// caller rebuilds it rather than resolving its redirects through the wrong view.
+func TestGetRejectsOldObjectStoreTuple(t *testing.T) {
+	root := digest.SHA256.FromString("root")
+	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.Put(root, platform, Binding{
+		Descriptor:     ocispec.Descriptor{Digest: digest.SHA256.FromString("composefs")},
+		FsverityDigest: digest.SHA256.FromString("verity").String(),
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	path, _, err := s.bindingPath(root, platform)
+	if err != nil {
+		t.Fatalf("bindingPath: %v", err)
+	}
+	data, err := os.ReadFile(path) // #nosec G304 -- test reads a path it wrote
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	data = []byte(strings.NewReplacer(
+		`"algorithm":"fsverity-sha256-12"`, `"algorithm":"sha256"`,
+		`"path":"objects/fsverity-sha256-12"`, `"path":"objects/sha256"`,
+	).Replace(string(data)))
+	if err := os.WriteFile(path, data, 0o644); err != nil { // #nosec G703 -- test rewrites a path it wrote
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := s.Get(root, platform); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -260,5 +312,30 @@ func TestGetRejectsInvalidBinding(t *testing.T) {
 
 	if _, err := s.Get(root, ocispec.Platform{OS: "linux", Architecture: "amd64"}); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+// TestPutSerializesCanonicalFalse pins that the canonical flag is written even
+// in its default false state: a reader must see an explicit value, not infer
+// one from an omitted key.
+func TestPutSerializesCanonicalFalse(t *testing.T) {
+	root := digest.SHA256.FromString("root-canonical-false")
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.Put(root, ocispec.Platform{OS: "linux", Architecture: "amd64"}, Binding{
+		Descriptor:     ocispec.Descriptor{MediaType: "application/vnd.knarr.composefs.image.v1+erofs", Digest: digest.SHA256.FromString("cfs"), Size: 1},
+		FsverityDigest: digest.SHA256.FromString("fsv").String(),
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	path := filepath.Join(s.root, "images", "sha256", root.Hex()[:2], root.Hex()[2:], "linux-amd64.json")
+	data, err := os.ReadFile(path) // #nosec G304 -- test reads a path it wrote
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(data), `"canonical":false`) {
+		t.Fatalf("binding JSON must carry an explicit canonical:false, got:\n%s", data)
 	}
 }

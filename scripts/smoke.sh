@@ -7,7 +7,7 @@
 #
 # Drives the built knarr binary through the full lifecycle -- pull -> ls ->
 # inspect -> mount -> unmount, then mount --metadata-only with the overlay a
-# writable consumer assembles over it (objects/sha256 as the data-only
+# writable consumer assembles over it (the objects/fsverity-sha256-12 view as
 # lowerdir, verity=require), and finally remove -- three times: for an image
 # sideloaded with pull --from-dir, for the same image pulled digest-pinned from
 # a loopback HTTP registry (crane registry serve), and for the same image
@@ -116,7 +116,7 @@ run_lifecycle() {
 	mkdir "$OVL/meta" "$OVL/merged" "$OVL/upper" "$OVL/work"
 	"${KN[@]}" mount --metadata-only "$ref" "$OVL/meta"
 	mount -t overlay overlay -o \
-		"lowerdir=$OVL/meta::$STORE/objects/sha256,upperdir=$OVL/upper,workdir=$OVL/work,redirect_dir=on,metacopy=on,verity=require" \
+		"lowerdir=$OVL/meta::$STORE/objects/fsverity-sha256-12,upperdir=$OVL/upper,workdir=$OVL/work,redirect_dir=on,metacopy=on,verity=require" \
 		"$OVL/merged"
 
 	echo "== merged rootfs (expect file data served from the object store) =="

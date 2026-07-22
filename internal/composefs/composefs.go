@@ -44,10 +44,11 @@ const InlineContentMax = 64
 // st_nlink from the NLINK column, so a multiply-linked entry must carry its
 // name count in Nlink for the mounted inode to report it.
 //
-// PAYLOAD and DIGEST are distinct in knarr: PAYLOAD redirects into the
-// content-sha256-keyed CAS (derived from Digest) while DIGEST is the fs-verity
-// value (Verity). Upstream composefs keys its store by fs-verity digest, so for it
-// the two coincide; knarr's content-addressed store makes them different values.
+// Both PAYLOAD and DIGEST are the fs-verity value (Verity): PAYLOAD redirects
+// through the object store's fs-verity view and DIGEST is what the kernel
+// validates the backing object against, matching upstream composefs, which keys
+// its store by fs-verity digest. Digest, the object's content sha256, stays the
+// store's content-addressed key but is not part of the emitted line.
 type Entry struct {
 	Path     string            // PATH: absolute path of the node in the image
 	Mode     os.FileMode       // MODE: Go file-type + permission bits, mapped to the st_mode column
@@ -56,8 +57,8 @@ type Entry struct {
 	Linkname string            // PAYLOAD, for symlinks: the link target
 	Hardlink string            // PAYLOAD, for hardlinks: absolute path of the earlier entry this name shares an inode with; when set every other field except Path is ignored
 	Content  []byte            // CONTENT, for regular files: inline file bytes; when non-nil the file is inlined and carries no Digest or Verity
-	Digest   digest.Digest     // PAYLOAD, for regular files: content digest of the backing CAS object, emitted as the "<2>/<rest>" redirect
-	Verity   digest.Digest     // DIGEST: fs-verity digest the kernel validates the backing object against; required for by-digest regular files
+	Digest   digest.Digest     // content digest of the backing CAS object (the store's content-addressed key); required for a by-digest regular file but not emitted in the dump line
+	Verity   digest.Digest     // PAYLOAD and DIGEST, for by-digest regular files: the fs-verity digest, emitted both as the "<2>/<rest>" view redirect and as the value the kernel validates
 	Size     int64             // SIZE: file size (ignored for directories)
 	Devmajor int64             // RDEV (major): device number for device nodes
 	Devminor int64             // RDEV (minor): device number for device nodes
@@ -207,20 +208,20 @@ func writeDumpLine(w io.Writer, e *Entry) error {
 			return err
 		}
 	case e.Mode&os.ModeType == 0:
-		// By-digest regular file: PAYLOAD = "<2>/<rest>" of the content digest (the
-		// redirect into the CAS object store), CONTENT = "-", DIGEST = the fs-verity
-		// digest the kernel validates the backing object against. Both are required:
-		// a content object with no fs-verity digest is rejected, since an image must
-		// not carry a backing file the kernel will not enforce.
+		// By-digest regular file: PAYLOAD = "<2>/<rest>" of the fs-verity digest (the
+		// redirect into the object store's fs-verity view), CONTENT = "-", DIGEST = the
+		// same fs-verity digest the kernel validates the backing object against. Digest,
+		// the content-addressed store key, must be present so a backing object exists,
+		// but it is not emitted in the line.
 		if e.Digest == "" {
 			return errors.New("regular file missing Digest")
 		}
 		if e.Verity == "" {
 			return fmt.Errorf("regular file %q missing fs-verity Verity digest", e.Path)
 		}
-		enc := e.Digest.Encoded()
+		enc := e.Verity.Encoded()
 		if len(enc) < 2 {
-			return fmt.Errorf("digest too short: %s", e.Digest)
+			return fmt.Errorf("verity digest too short: %s", e.Verity)
 		}
 		if _, err := fmt.Fprintf(w, "%s/%s - %s", enc[:2], enc[2:], e.Verity.Encoded()); err != nil {
 			return err
