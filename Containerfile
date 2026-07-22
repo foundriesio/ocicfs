@@ -7,13 +7,16 @@
 # so the Go toolchain and lint tooling are identical for developers and CI.
 #
 # Stage 1 (composefs-builder) compiles composefs tools from a pinned composefs
-# release. Stage 2 (the dev image) inherits the Go toolchain base, copies the
-# composefs artifacts across, and adds the loop-device / ext4 tooling the
-# privileged fs-verity end-to-end tests need. The entrypoint mounts a
+# release. Stage 2 (cfsctl-builder) compiles cfsctl from a pinned composefs-rs
+# commit — the cross-implementation oracle the canonical-EROFS conformance test
+# measures knarr against. Stage 3 (the dev image) inherits the Go toolchain base,
+# copies both sets of artifacts across, and adds the loop-device / ext4 tooling
+# the privileged fs-verity end-to-end tests need. The entrypoint mounts a
 # loop-backed ext4 filesystem with the verity feature so those tests get real
 # fs-verity; run the container privileged for that to succeed.
 
 ARG GO_VERSION=1.26.1
+ARG RUST_VERSION=1.88.0
 ARG DEBIAN_RELEASE=bookworm
 
 # ------------------------------------------------------------------
@@ -52,7 +55,43 @@ RUN MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH)" \
  && DESTDIR=/out meson install -C /tmp/composefs/build
 
 # ------------------------------------------------------------------
-# Stage 2 — dev image.
+# Stage 2 — cfsctl-builder: build cfsctl from a pinned composefs-rs commit.
+# ------------------------------------------------------------------
+# cfsctl is the cross-implementation oracle for the canonical merged-EROFS
+# construction: the conformance test compares its `oci compute-id` against the
+# merged image knarr builds for the same layers. The commit is pinned (an
+# arbitrary SHA, fetched directly) so the oracle cannot drift, and the build
+# asserts the checkout landed on it. Only the `oci` feature is enabled — no
+# containers-storage / ostree / fuse — to keep the stage light; the `oci:`
+# transport reads local OCI layouts without skopeo. Rust exists only in this
+# build stage; the dev image copies just the binary, so the device stays
+# Rust-free.
+FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS cfsctl-builder
+
+ARG COMPOSEFS_RS_COMMIT=e836ce4f0f944663e6afdad1817c6061bd548751
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        git \
+        pkg-config \
+        libssl-dev \
+        zlib1g-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN git init /tmp/composefs-rs \
+ && git -C /tmp/composefs-rs remote add origin https://github.com/composefs/composefs-rs.git \
+ && git -C /tmp/composefs-rs fetch --depth 1 origin "${COMPOSEFS_RS_COMMIT}" \
+ && git -C /tmp/composefs-rs checkout --quiet FETCH_HEAD \
+ && test "$(git -C /tmp/composefs-rs rev-parse HEAD)" = "${COMPOSEFS_RS_COMMIT}"
+
+RUN cargo build --release \
+        --manifest-path /tmp/composefs-rs/Cargo.toml \
+        -p composefs-ctl --no-default-features --features oci \
+ && cp /tmp/composefs-rs/target/release/cfsctl /usr/bin/cfsctl
+
+# ------------------------------------------------------------------
+# Stage 3 — dev image.
 # ------------------------------------------------------------------
 FROM golang:${GO_VERSION}-${DEBIAN_RELEASE}
 
@@ -101,6 +140,13 @@ RUN ldconfig \
 # image rather than building skopeo, which is far heavier (C deps, ~2x the size).
 COPY --from=gcr.io/go-containerregistry/crane:v0.21.7 /ko-app/crane /usr/bin/crane
 RUN command -v crane >/dev/null
+
+# cfsctl: the pinned composefs-rs oracle the canonical-EROFS conformance test
+# compares knarr's merged image against. Built with only the `oci` feature; every
+# shared library it links (zlib, pcre2, libgcc, libm, libc) is already present in
+# the base image, so no extra runtime packages are needed.
+COPY --from=cfsctl-builder /usr/bin/cfsctl /usr/bin/cfsctl
+RUN command -v cfsctl >/dev/null
 
 # Share the toolchain caches with bind-mounted workspaces.
 ENV GOMODCACHE=/go/pkg/mod
