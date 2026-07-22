@@ -12,8 +12,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/opencontainers/go-digest"
 
@@ -212,14 +214,14 @@ func TestBuildEntriesWithStore(t *testing.T) {
 	store := newVerityStore(t)
 	layer1 := tarBytes(t,
 		tarEntry{name: "etc/config", typ: tar.TypeReg, mode: 0o644, body: "v1"},
-		tarEntry{name: "usr/bin/app", typ: tar.TypeReg, mode: 0o755, body: "app"},
+		tarEntry{name: "usr/bin/app", typ: tar.TypeReg, mode: 0o755, body: large("app")},
 		tarEntry{name: "var/lib", typ: tar.TypeDir, mode: 0o755},
 		tarEntry{name: "var/lib/old", typ: tar.TypeReg, mode: 0o644, body: "old"},
 		tarEntry{name: "link", typ: tar.TypeSymlink, mode: 0o777, link: "etc/config"},
 	)
 	layer2 := tarBytes(t,
 		tarEntry{name: "etc/.wh.config", typ: tar.TypeReg, mode: 0o000},
-		tarEntry{name: "etc/config", typ: tar.TypeReg, mode: 0o600, body: "v2", pax: map[string]string{"SCHILY.xattr.user.test": "yes"}},
+		tarEntry{name: "etc/config", typ: tar.TypeReg, mode: 0o600, body: large("v2"), pax: map[string]string{"SCHILY.xattr.user.test": "yes"}},
 		tarEntry{name: "app-copy", typ: tar.TypeLink, link: "usr/bin/app"},
 		tarEntry{name: "var/lib/.wh..wh..opq", typ: tar.TypeReg, mode: 0o000},
 		tarEntry{name: "var/lib/new", typ: tar.TypeReg, mode: 0o644, body: "new"},
@@ -237,7 +239,7 @@ func TestBuildEntriesWithStore(t *testing.T) {
 		t.Fatal("opaque marker did not remove lower file")
 	}
 	cfg := byPath["/etc/config"]
-	if cfg.Digest != digest.FromBytes([]byte("v2")) {
+	if cfg.Digest != digest.FromBytes([]byte(large("v2"))) {
 		t.Fatalf("/etc/config digest = %s", cfg.Digest)
 	}
 	if cfg.Verity == "" {
@@ -249,7 +251,7 @@ func TestBuildEntriesWithStore(t *testing.T) {
 	// "/app-copy" sorts before "/usr/bin/app", so it carries the shared inode's
 	// payload and the original name is emitted as the hardlink entry.
 	appCopy := byPath["/app-copy"]
-	if appCopy.Digest != digest.FromBytes([]byte("app")) || appCopy.Verity == "" || appCopy.Hardlink != "" || appCopy.Nlink != 2 {
+	if appCopy.Digest != digest.FromBytes([]byte(large("app"))) || appCopy.Verity == "" || appCopy.Hardlink != "" || appCopy.Nlink != 2 {
 		t.Fatalf("/app-copy = %#v, want the shared inode payload with Nlink 2", appCopy)
 	}
 	if got := byPath["/usr/bin/app"]; got.Hardlink != "/app-copy" {
@@ -298,7 +300,7 @@ func TestContentSizeMergedTree(t *testing.T) {
 func TestBuildEntriesHardlinkSurvivesTargetWhiteout(t *testing.T) {
 	store := newVerityStore(t)
 	layer1 := tarBytes(t,
-		tarEntry{name: "bin/app", typ: tar.TypeReg, mode: 0o755, body: "app"},
+		tarEntry{name: "bin/app", typ: tar.TypeReg, mode: 0o755, body: large("app")},
 		tarEntry{name: "bin/alias1", typ: tar.TypeLink, link: "bin/app"},
 		tarEntry{name: "bin/alias2", typ: tar.TypeLink, link: "bin/alias1"},
 	)
@@ -317,7 +319,7 @@ func TestBuildEntriesHardlinkSurvivesTargetWhiteout(t *testing.T) {
 	if _, ok := byPath["/bin/app"]; ok {
 		t.Fatal("whiteout did not remove the target name")
 	}
-	if got := byPath["/bin/alias1"]; got.Digest != digest.FromBytes([]byte("app")) || got.Mode.Perm() != 0o755 || got.Hardlink != "" || got.Nlink != 2 {
+	if got := byPath["/bin/alias1"]; got.Digest != digest.FromBytes([]byte(large("app"))) || got.Mode.Perm() != 0o755 || got.Hardlink != "" || got.Nlink != 2 {
 		t.Fatalf("/bin/alias1 = %#v, want the surviving payload entry with Nlink 2", got)
 	}
 	if got := byPath["/bin/alias2"]; got.Hardlink != "/bin/alias1" {
@@ -332,11 +334,11 @@ func TestBuildEntriesHardlinkSurvivesTargetWhiteout(t *testing.T) {
 func TestBuildEntriesHardlinkTargetReplaced(t *testing.T) {
 	store := newVerityStore(t)
 	layer1 := tarBytes(t,
-		tarEntry{name: "bin/app", typ: tar.TypeReg, mode: 0o755, body: "v1"},
+		tarEntry{name: "bin/app", typ: tar.TypeReg, mode: 0o755, body: large("v1")},
 		tarEntry{name: "bin/alias", typ: tar.TypeLink, link: "bin/app"},
 	)
 	layer2 := tarBytes(t,
-		tarEntry{name: "bin/app", typ: tar.TypeReg, mode: 0o755, body: "v2"},
+		tarEntry{name: "bin/app", typ: tar.TypeReg, mode: 0o755, body: large("v2")},
 	)
 	entries, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
 		digest.FromBytes(layer1),
@@ -347,10 +349,10 @@ func TestBuildEntriesHardlinkTargetReplaced(t *testing.T) {
 		t.Fatalf("buildEntries: %v", err)
 	}
 	byPath := entriesByPath(entries)
-	if got := byPath["/bin/app"]; got.Digest != digest.FromBytes([]byte("v2")) || got.Hardlink != "" {
+	if got := byPath["/bin/app"]; got.Digest != digest.FromBytes([]byte(large("v2"))) || got.Hardlink != "" {
 		t.Fatalf("/bin/app = %#v, want the replacing v2 payload", got)
 	}
-	if got := byPath["/bin/alias"]; got.Digest != digest.FromBytes([]byte("v1")) || got.Hardlink != "" {
+	if got := byPath["/bin/alias"]; got.Digest != digest.FromBytes([]byte(large("v1"))) || got.Hardlink != "" {
 		t.Fatalf("/bin/alias = %#v, want the original v1 payload", got)
 	}
 }
@@ -361,10 +363,10 @@ func TestBuildEntriesHardlinkTargetReplaced(t *testing.T) {
 func TestBuildEntriesModifyWithoutWhiteout(t *testing.T) {
 	store := newVerityStore(t)
 	layer1 := tarBytes(t,
-		tarEntry{name: "etc/config", typ: tar.TypeReg, mode: 0o644, body: "v1"},
+		tarEntry{name: "etc/config", typ: tar.TypeReg, mode: 0o644, body: large("v1")},
 	)
 	layer2 := tarBytes(t,
-		tarEntry{name: "etc/config", typ: tar.TypeReg, mode: 0o600, body: "v2", pax: map[string]string{"SCHILY.xattr.user.test": "yes"}},
+		tarEntry{name: "etc/config", typ: tar.TypeReg, mode: 0o600, body: large("v2"), pax: map[string]string{"SCHILY.xattr.user.test": "yes"}},
 	)
 	entries, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
 		digest.FromBytes(layer1),
@@ -375,7 +377,7 @@ func TestBuildEntriesModifyWithoutWhiteout(t *testing.T) {
 		t.Fatalf("buildEntries: %v", err)
 	}
 	cfg := entriesByPath(entries)["/etc/config"]
-	if cfg.Digest != digest.FromBytes([]byte("v2")) {
+	if cfg.Digest != digest.FromBytes([]byte(large("v2"))) {
 		t.Fatalf("/etc/config digest = %s, want v2 content", cfg.Digest)
 	}
 	if cfg.Mode.Perm() != 0o600 || cfg.Xattrs["user.test"] != "yes" {
@@ -410,6 +412,137 @@ func TestBuildEntriesReplaceDirWithFile(t *testing.T) {
 	}
 	if lib := byPath["/lib"]; lib.Linkname != "usr/lib" {
 		t.Fatalf("/lib not replaced by symlink: %#v", lib)
+	}
+}
+
+// TestBuildEntriesInlinesSmallFiles asserts the inline boundary: files of 0, 1,
+// and exactly InlineContentMax bytes carry their bytes in Content and are not
+// written to the object store, while a file one byte larger is stored by digest.
+func TestBuildEntriesInlinesSmallFiles(t *testing.T) {
+	store := newVerityStore(t)
+	files := []struct {
+		name   string
+		body   string
+		inline bool
+	}{
+		{"empty", "", true},
+		{"one", "a", true},
+		{"max", strings.Repeat("b", composefs.InlineContentMax), true},
+		{"over", strings.Repeat("c", composefs.InlineContentMax+1), false},
+	}
+	te := make([]tarEntry, 0, len(files))
+	for _, f := range files {
+		te = append(te, tarEntry{name: f.name, typ: tar.TypeReg, mode: 0o644, body: f.body})
+	}
+	layer := tarBytes(t, te...)
+	entries, err := buildEntries(context.Background(), store, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("buildEntries: %v", err)
+	}
+	byPath := entriesByPath(entries)
+	for _, f := range files {
+		e := byPath["/"+f.name]
+		content := digest.FromBytes([]byte(f.body))
+		if f.inline {
+			if e.Content == nil || len(e.Content) != len(f.body) {
+				t.Fatalf("/%s = %#v, want %d inline bytes", f.name, e, len(f.body))
+			}
+			if e.Digest != "" || e.Verity != "" {
+				t.Fatalf("/%s inlined but carries a digest: %#v", f.name, e)
+			}
+			assertObjectAbsent(t, store, content)
+		} else {
+			if e.Content != nil {
+				t.Fatalf("/%s = %#v, want by-digest storage, not inline", f.name, e)
+			}
+			if e.Digest != content || e.Verity == "" {
+				t.Fatalf("/%s = %#v, want a stored object with a digest and fs-verity", f.name, e)
+			}
+			assertObjectPresent(t, store, content)
+		}
+	}
+}
+
+// TestBuildEntriesHardlinkToInlinedFile asserts a hardlink whose target is a
+// small inlined file round-trips: the target entry carries the inline content
+// and the shared name count, and the link entry references it.
+func TestBuildEntriesHardlinkToInlinedFile(t *testing.T) {
+	layer := tarBytes(t,
+		tarEntry{name: "cfg", typ: tar.TypeReg, mode: 0o644, body: "k=v\n"},
+		tarEntry{name: "cfg2", typ: tar.TypeLink, link: "cfg"},
+	)
+	entries, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	if err != nil {
+		t.Fatalf("buildEntries: %v", err)
+	}
+	byPath := entriesByPath(entries)
+	// "/cfg" sorts before "/cfg2", so it carries the inline payload and the count.
+	if got := byPath["/cfg"]; string(got.Content) != "k=v\n" || got.Digest != "" || got.Hardlink != "" || got.Nlink != 2 {
+		t.Fatalf("/cfg = %#v, want the inlined payload with Nlink 2", got)
+	}
+	if got := byPath["/cfg2"]; got.Hardlink != "/cfg" {
+		t.Fatalf("/cfg2 = %#v, want a hardlink entry to /cfg", got)
+	}
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		return
+	}
+	out := filepath.Join(t.TempDir(), "image.cfs")
+	if err := composefs.WriteImage(context.Background(), out, entries); err != nil {
+		t.Fatalf("WriteImage on a hardlink-to-inline image: %v", err)
+	}
+}
+
+// TestBuildEntriesPreservesMtimes asserts each node kind carries its tar
+// modification time (including sub-second precision from a PAX record) while a
+// synthesized parent directory, which has no tar header, keeps mtime 0. Device
+// nodes read their mtime through the same header path as the FIFO covered here.
+func TestBuildEntriesPreservesMtimes(t *testing.T) {
+	layer := tarBytes(t,
+		tarEntry{name: "etc/config", typ: tar.TypeReg, mode: 0o644, body: "k=v\n", mtime: time.Unix(1700000000, 123456789)},
+		tarEntry{name: "dir", typ: tar.TypeDir, mode: 0o755, mtime: time.Unix(1600000000, 0)},
+		tarEntry{name: "sym", typ: tar.TypeSymlink, mode: 0o777, link: "etc/config", mtime: time.Unix(1500000000, 0)},
+		tarEntry{name: "fifo", typ: tar.TypeFifo, mode: 0o644, mtime: time.Unix(1400000000, 0)},
+	)
+	entries, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	if err != nil {
+		t.Fatalf("buildEntries: %v", err)
+	}
+	byPath := entriesByPath(entries)
+	if e := byPath["/etc/config"]; e.Mtime != 1700000000 || e.MtimeNsec != 123456789 {
+		t.Fatalf("/etc/config mtime = %d.%09d, want 1700000000.123456789", e.Mtime, e.MtimeNsec)
+	}
+	if e := byPath["/dir"]; e.Mtime != 1600000000 || e.MtimeNsec != 0 {
+		t.Fatalf("/dir mtime = %d.%09d, want 1600000000.0", e.Mtime, e.MtimeNsec)
+	}
+	if e := byPath["/sym"]; e.Mtime != 1500000000 {
+		t.Fatalf("/sym mtime = %d, want 1500000000", e.Mtime)
+	}
+	if e := byPath["/fifo"]; e.Mtime != 1400000000 {
+		t.Fatalf("/fifo mtime = %d, want 1400000000", e.Mtime)
+	}
+	if e := byPath["/etc"]; e.Mtime != 0 || e.MtimeNsec != 0 {
+		t.Fatalf("synthesized /etc mtime = %d.%09d, want 0", e.Mtime, e.MtimeNsec)
+	}
+	var dump bytes.Buffer
+	if err := composefs.WriteDump(&dump, entries); err != nil {
+		t.Fatalf("WriteDump: %v", err)
+	}
+	if !strings.Contains(dump.String(), " 1700000000.123456789 ") {
+		t.Fatalf("dump missing nanosecond mtime column:\n%s", dump.String())
+	}
+}
+
+// TestBuildEntriesClampsPreEpochMtime asserts a pre-epoch tar mtime clamps to 0,
+// since the composefs-dump parser reads the MTIME column as unsigned.
+func TestBuildEntriesClampsPreEpochMtime(t *testing.T) {
+	layer := tarBytes(t, tarEntry{name: "f", typ: tar.TypeReg, mode: 0o644, body: "x", mtime: time.Unix(-5, 0)})
+	entries, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	if err != nil {
+		t.Fatalf("buildEntries: %v", err)
+	}
+	if e := entriesByPath(entries)["/f"]; e.Mtime != 0 || e.MtimeNsec != 0 {
+		t.Fatalf("pre-epoch mtime not clamped: %d.%09d", e.Mtime, e.MtimeNsec)
 	}
 }
 
@@ -483,6 +616,12 @@ func TestBuildEntriesOpensConsumesClosesLayerBeforeNext(t *testing.T) {
 	}
 }
 
+// large returns a body over the inline threshold, so a file carrying it is
+// stored by digest in the CAS rather than inlined into the EROFS metadata.
+func large(label string) string {
+	return label + ": " + strings.Repeat("padding ", 8)
+}
+
 func newVerityStore(t *testing.T) *objectstore.Store {
 	t.Helper()
 	root, cleanup, err := devtest.VerityRoot()
@@ -504,6 +643,28 @@ func skipIfNoVerity(t *testing.T, err error) {
 	t.Helper()
 	if devtest.IsVerityUnsupported(err) {
 		t.Skipf("fs-verity unsupported on the test filesystem: %v", err)
+	}
+}
+
+func assertObjectAbsent(t *testing.T, store *objectstore.Store, d digest.Digest) {
+	t.Helper()
+	p, err := store.ObjectPath(d)
+	if err != nil {
+		t.Fatalf("ObjectPath(%s): %v", d, err)
+	}
+	if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("object %s should be absent (inlined), stat err = %v", d, err)
+	}
+}
+
+func assertObjectPresent(t *testing.T, store *objectstore.Store, d digest.Digest) {
+	t.Helper()
+	p, err := store.ObjectPath(d)
+	if err != nil {
+		t.Fatalf("ObjectPath(%s): %v", d, err)
+	}
+	if _, err := os.Stat(p); err != nil {
+		t.Fatalf("object %s should be stored: %v", d, err)
 	}
 }
 
@@ -549,12 +710,13 @@ func openTestLayers(t *testing.T, layers ...[]byte) func(int) (io.ReadCloser, er
 }
 
 type tarEntry struct {
-	name string
-	typ  byte
-	mode int64
-	body string
-	link string
-	pax  map[string]string
+	name  string
+	typ   byte
+	mode  int64
+	body  string
+	link  string
+	pax   map[string]string
+	mtime time.Time
 }
 
 func tarBytes(t *testing.T, entries ...tarEntry) []byte {
@@ -569,6 +731,11 @@ func tarBytes(t *testing.T, entries ...tarEntry) []byte {
 			Linkname:   e.link,
 			Size:       int64(len(e.body)),
 			PAXRecords: e.pax,
+			ModTime:    e.mtime,
+		}
+		// USTAR cannot encode a sub-second or pre-epoch mtime; PAX can.
+		if !e.mtime.IsZero() && (e.mtime.Nanosecond() != 0 || e.mtime.Unix() < 0) {
+			hdr.Format = tar.FormatPAX
 		}
 		if e.typ != tar.TypeReg && e.typ != '\x00' {
 			hdr.Size = 0

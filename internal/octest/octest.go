@@ -194,7 +194,8 @@ func BuildImage(dir string, images ...ImageSpec) (Layout, error) {
 // layer holding files, a config for platform whose diff_id matches the layer, a
 // manifest, and index.json. It returns the descriptors a pull test asserts against,
 // with Ref pinning the manifest digest and FileDigest set to the content digest of
-// files[0] (a per-file object a successful pull materializes into the CAS).
+// files[0] (a per-file object a successful pull materializes into the CAS when the
+// file exceeds the inline threshold; smaller files are inlined and stored no object).
 func BuildSingleLayerGzip(dir string, platform ocispec.Platform, files ...File) (Layout, error) {
 	if len(files) == 0 {
 		return Layout{}, fmt.Errorf("octest: need at least one file")

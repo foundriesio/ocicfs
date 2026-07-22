@@ -15,8 +15,9 @@ belongs to:
   measured fs-verity equals the sealed value.
 
 The seal only works if both sides build a **byte-identical** image, so the recipe
-(V1 format, zeroed mtimes, no inline, fs-verity-keyed redirects) is fixed. This
-walkthrough plays both roles on one machine.
+(V1 format, per-file mtimes carried from the layer tar, files ≤ 64 bytes inlined,
+fs-verity-keyed redirects for larger files) is fixed. This walkthrough plays both
+roles on one machine.
 
 For *why* the format looks like this, see [why.md](why.md) and
 [adr/0001-high-level-architecture.md](adr/0001-high-level-architecture.md).
@@ -41,15 +42,18 @@ walk through what it does.
 
 ## The format in one paragraph
 
-A regular file's bytes are stored once, as an object named by the sha256 of its
-*content*, under `objects/sha256/<aa>/<rest>`, with a second hardlink name under
-`objects/fsverity-sha256-12/<vv>/<rest>` keyed by the file's fs-verity digest (the
-view). The composefs image is an EROFS that, for each file, records a **PAYLOAD**
-(a redirect resolved through the view) and a **DIGEST** (the same fs-verity digest,
-which the kernel validates the object against) — both columns derive from the
-fs-verity digest, matching upstream composefs. The image holds no file content —
-only structure plus redirects — so one decompressed copy of each object is shared
-across every image that references it.
+A regular file **larger than 64 bytes** has its bytes stored once, as an object
+named by the sha256 of its *content*, under `objects/sha256/<aa>/<rest>`, with a
+second hardlink name under `objects/fsverity-sha256-12/<vv>/<rest>` keyed by the
+file's fs-verity digest (the view). The composefs image is an EROFS that, for each
+such file, records a **PAYLOAD** (a redirect resolved through the view) and a
+**DIGEST** (the same fs-verity digest, which the kernel validates the object
+against) — both columns derive from the fs-verity digest, matching upstream
+composefs. The image holds no content for those files — only structure plus
+redirects — so one decompressed copy of each object is shared across every image
+that references it. A file of **64 bytes or fewer** is instead inlined straight
+into the EROFS metadata (its bytes in the `CONTENT` column, no object), exactly as
+`mkcomposefs` does.
 
 ## Publisher: build and seal
 
@@ -70,7 +74,8 @@ head -c 200 /dev/random   > tree/bin/tool      # 200 random bytes (a stand-in bi
 
 Rather than hand-write a dump, build one straight from the tree and let
 `composefs-info` print it. Note that `mkcomposefs` **inlines** files ≤ 64 bytes — their
-content lands in the `CONTENT` column with no backing object:
+content lands in the `CONTENT` column with no backing object. knarr inlines at the
+same threshold, so these small-file lines are already in knarr's form:
 
 ```sh
 mkcomposefs --use-epoch --skip-xattrs --min-version=1 --max-version=1 tree inlined.cfs
@@ -84,13 +89,14 @@ composefs-info dump inlined.cfs
 /hello 16 100644 1 0 0 0 0.0 - hello\x20from\x20knarr -             <- inlined (<=64 B)
 ```
 
-### 3. [publisher] Rewrite to a content-addressed, no-inline dump
+### 3. [publisher] Externalize the files over 64 bytes
 
-knarr never inlines: every file is a by-digest object in the object store. This filter turns
-each regular-file line into knarr's form — it stores the file under its content
-sha256, hardlinks it into the fs-verity view, then emits `PAYLOAD` = the
-`<vv>/<rest>` fs-verity redirect, `CONTENT` = `-`, and `DIGEST` = the same
-fs-verity digest. Directories and symlinks pass through:
+knarr keeps files ≤ 64 bytes inlined (just as `mkcomposefs` already emitted them)
+and turns only **larger** regular files into by-digest objects. This filter, for
+each regular file over 64 bytes, stores it under its content sha256, hardlinks it
+into the fs-verity view, then emits `PAYLOAD` = the `<vv>/<rest>` fs-verity
+redirect, `CONTENT` = `-`, and `DIGEST` = the same fs-verity digest. Inlined
+small files, directories, and symlinks pass through unchanged:
 
 ```sh
 mkdir -p objects/sha256 objects/fsverity-sha256-12
@@ -99,7 +105,8 @@ to_knarr() {
     set -- $line                       # PATH SIZE MODE NLINK UID GID RDEV MTIME PAYLOAD CONTENT DIGEST
     case $1 in *\\*) echo "escaped PATH unsupported: $1" >&2; exit 1;; esac
     f="tree$1"
-    if [ -f "$f" ] && [ ! -L "$f" ]; then
+    # Only externalize regular files over 64 bytes; smaller ones stay inlined ($2 = SIZE).
+    if [ -f "$f" ] && [ ! -L "$f" ] && [ "$2" -gt 64 ]; then
       csum=$(sha256sum "$f" | cut -d' ' -f1)                       # content digest -> CAS name
       install -D -m0644 "$f" "objects/sha256/${csum:0:2}/${csum:2}"    # store the object
       fsv=$(composefs-info measure-file "$f")                      # fs-verity digest -> PAYLOAD + DIGEST
@@ -117,13 +124,14 @@ cat image.dump
 ```
 
 ```
-/bin/tool 200 100644 1 0 0 0 0.0 28/4c22bb..20c7 - 284c22bb..20c7
-/etc/app.conf 4 100644 1 0 0 0 0.0 ee/d448e7..ba535 - eed448e7..ba535
-/hello 16 100644 1 0 0 0 0.0 89/2bd692..4c429 - 892bd692..4c429
+/bin/tool 200 100644 1 0 0 0 0.0 28/4c22bb..20c7 - 284c22bb..20c7   <- externalized (>64 B)
+/etc/app.conf 4 100644 1 0 0 0 0.0 - k=v\n -                        <- still inlined (<=64 B)
+/hello 16 100644 1 0 0 0 0.0 - hello\x20from\x20knarr -             <- still inlined (<=64 B)
 ```
 
-The two formerly-inlined files are now by-digest, and `PAYLOAD` and `DIGEST` both
-derive from the file's fs-verity digest — the redirect resolves through the
+Only `tool` (over 64 bytes) becomes by-digest; the two small files keep their inline
+`CONTENT`. For the externalized file `PAYLOAD` and `DIGEST` both
+derive from its fs-verity digest — the redirect resolves through the
 fs-verity view, exactly like upstream's `--digest-store` layout. This is the
 `internal/composefs` `Entry`/`WriteDump` format, and the lines map one-to-one onto
 the [composefs-dump(5)](https://github.com/composefs/composefs/blob/v1.0.8/man/composefs-dump.md)
@@ -189,8 +197,8 @@ is exactly the set the device would still need to pull — the kernel of delta f
 | dump + `mkcomposefs --from-file` | `internal/composefs` (`Entry`, `WriteDump`, `WriteImage`) | `internal/composefs/*_test.go` |
 
 The round-trip tests are the executable version of this doc — they build an image two
-ways and assert byte-identity and matching fs-verity, including the no-inline case
-verified against upstream-built reference images:
+ways and assert byte-identity and matching fs-verity, with small files inlined and
+larger ones by-digest, verified against upstream-built reference images:
 
 ```sh
 go test -v -run TestWriteImage ./internal/composefs/
@@ -199,12 +207,13 @@ go test -v -run TestWriteImage ./internal/composefs/
 ## Reproducibility
 
 The publisher seal verifies on the device only because both builds use the same
-recipe: V1 format (`--min-version=1`), zeroed mtimes (`MTIME=0`, i.e. `--use-epoch`),
-no inline (`CONTENT="-"`), fs-verity-keyed redirects, sorted entries, and consistent
-xattr handling. Byte-identical inputs give a byte-identical EROFS, hence an identical
-fs-verity digest. A directory-mode publisher build would inline small files and seal a
-digest the device's no-inline rebuild could never match — which is why both sides use
-the `--from-file` path.
+recipe: V1 format (`--min-version=1`), per-file mtimes (here pinned with
+`--use-epoch` so this hand-run reproduces; real knarr carries each file's mtime
+from the layer tar), files ≤ 64 bytes inlined (`CONTENT` = the file bytes) and
+larger files by digest (fs-verity-keyed redirects), sorted entries, and consistent
+xattr handling. Both sides feed the **same** `--from-file` dump, so every column —
+which files are inlined, their mtimes, the redirects — is identical; byte-identical
+inputs give a byte-identical EROFS, hence an identical fs-verity digest.
 
 ## Mounting (not covered here)
 

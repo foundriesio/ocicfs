@@ -19,13 +19,17 @@ Every digest is sharded by its first byte (`<aa>` = first two hex chars, `<rest>
 
 ## `objects/` — the content-addressed store (authoritative)
 
-A single decompressed copy of every piece of content, keyed by its sha256 digest
-and sealed with fs-verity. One pull writes three kinds of object here:
+A single decompressed copy of every regular file larger than 64 bytes (smaller
+files live inline in their EROFS), keyed by its sha256 digest and sealed with
+fs-verity. One pull writes three kinds of object here:
 
 - **Metadata blobs** — the verified OCI chain: the root (index or manifest),
   the image manifest, and the config, each stored under its own digest.
-- **Per-file content** — one object per regular file across all layers, so
-  identical files across images and layers are stored once.
+- **Per-file content** — one object per regular file **larger than 64 bytes**,
+  across all layers, so identical large files across images and layers are stored
+  once. Files of 64 bytes or fewer are inlined into each composefs image's EROFS
+  metadata (as `mkcomposefs` does) and keep no object here — a payload-bounded
+  duplication accepted for upstream canonicality.
 - **The composefs image** — the EROFS image that `mount -t composefs` mounts,
   whose per-file redirects reference the objects by their fs-verity digest
   through the view below.

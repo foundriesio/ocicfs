@@ -30,7 +30,8 @@ func TestMaterializeMatchesDirectoryAndMemorySources(t *testing.T) {
 		t.Skip("mkcomposefs not found in PATH")
 	}
 	lay, err := octest.BuildSingleLayerGzip(t.TempDir(), ocispec.Platform{OS: "linux", Architecture: "amd64"},
-		octest.File{Name: "etc/config.txt", Mode: 0o644, Body: "hello from knarr\n"},
+		// Over the inline threshold, so it is stored as a CAS object (FileDigest).
+		octest.File{Name: "etc/config.txt", Mode: 0o644, Body: "hello from knarr - a config payload larger than the sixty-four byte inline limit\n"},
 		octest.File{Name: "usr/bin/app", Mode: 0o755, Body: "#!/bin/sh\n"},
 	)
 	if err != nil {

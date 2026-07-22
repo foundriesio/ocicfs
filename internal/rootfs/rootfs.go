@@ -40,9 +40,10 @@ type Image struct {
 	RootfsSize     int64
 }
 
-// Assemble merges decompressed layer tar streams, writes their regular file
-// content to CAS, generates a composefs image, stores it in CAS, and returns its
-// descriptor plus measured fs-verity digest.
+// Assemble merges decompressed layer tar streams, writes regular files larger
+// than the inline threshold to CAS (smaller ones ride inline in the image),
+// generates a composefs image, stores it in CAS, and returns its descriptor
+// plus measured fs-verity digest.
 //
 // openLayer must return the decompressed tar stream of layer i, for i in
 // [0, len(diffIDs)). It is called once per layer, in order, and at most one
@@ -130,7 +131,8 @@ func tempOutput(dir string) (string, error) {
 }
 
 // node is one name in the merged tree while layers are applied: its metadata,
-// the content and fs-verity digests for a regular file, and the index of the
+// the content bytes (for a small inlined regular file) or the content and
+// fs-verity digests (for a stored one), and the index of the
 // layer that last wrote it (so an opaque marker removes only lower-layer names).
 // A hardlink name carries only link and layer: link points at the node holding
 // the shared inode's metadata and content, so every name of one inode reads the
@@ -138,18 +140,21 @@ func tempOutput(dir string) (string, error) {
 // a fresh node at it without touching the others — the semantics of link(2).
 // link always points at a payload node directly, never at another link node.
 type node struct {
-	mode     os.FileMode
-	uid      int
-	gid      int
-	xattrs   map[string]string
-	linkname string
-	digest   digest.Digest
-	verity   digest.Digest
-	size     int64
-	devmajor int64
-	devminor int64
-	layer    int
-	link     *node
+	mode      os.FileMode
+	uid       int
+	gid       int
+	xattrs    map[string]string
+	linkname  string
+	content   []byte
+	digest    digest.Digest
+	verity    digest.Digest
+	size      int64
+	mtimeSec  int64
+	mtimeNsec int64
+	devmajor  int64
+	devminor  int64
+	layer     int
+	link      *node
 }
 
 // buildEntries applies every layer in order into one tree, synthesises any
@@ -186,7 +191,7 @@ func buildEntries(ctx context.Context, store *objectstore.Store, openLayer func(
 // applyLayer walks one decompressed layer tar into tree, then verifies the whole
 // decompressed stream hashes to its diff_id at end of stream. The stream is teed
 // into the hash as the tar reader consumes it, so a regular file's content is
-// stored and hashed toward the diff_id in a single pass.
+// captured (stored, or read inline) and hashed toward the diff_id in one pass.
 func applyLayer(ctx context.Context, store *objectstore.Store, tree map[string]*node, layer io.Reader, diffID digest.Digest, idx int) error {
 	h := sha256.New()
 	teed := io.TeeReader(&ctxReader{ctx: ctx, r: layer}, h)
@@ -239,10 +244,12 @@ func applyLayer(ctx context.Context, store *objectstore.Store, tree map[string]*
 	return nil
 }
 
-// applyHeader merges a single tar entry into tree: a regular file streams from tr
-// into CAS (recording its content and fs-verity digests), a hardlink becomes
-// another name of its target's inode, and the remaining types become
-// metadata-only nodes. Whiteout and opaque markers are handled by the caller
+// applyHeader merges a single tar entry into tree: a regular file of at most
+// composefs.InlineContentMax bytes has its bytes read inline, a larger one
+// streams from tr into CAS (recording its content and fs-verity digests), a
+// hardlink becomes another name of its target's inode, and the remaining types
+// become metadata-only nodes. Every node type carries the tar entry's
+// modification time. Whiteout and opaque markers are handled by the caller
 // before this is reached.
 func applyHeader(ctx context.Context, store *objectstore.Store, tree map[string]*node, tr *tar.Reader, hdr *tar.Header, name string, idx int) error {
 	// A non-directory entry replaces whatever occupied name. If that was a
@@ -256,8 +263,29 @@ func applyHeader(ctx context.Context, store *objectstore.Store, tree map[string]
 		}
 	}
 
+	sec, nsec := mtimeFromHeader(hdr)
 	switch hdr.Typeflag {
 	case tar.TypeReg, '\x00': // '\x00' is the legacy regular-file flag (formerly tar.TypeRegA)
+		if hdr.Size <= composefs.InlineContentMax {
+			// A small file is inlined into the EROFS metadata: read its bytes (the
+			// tar reader caps the read at the entry size) and skip the object store.
+			content, err := io.ReadAll(tr)
+			if err != nil {
+				return fmt.Errorf("read inline content for %s: %w", name, err)
+			}
+			tree[name] = &node{
+				mode:      modeFromHeader(hdr, 0),
+				uid:       hdr.Uid,
+				gid:       hdr.Gid,
+				xattrs:    xattrsFromHeader(hdr),
+				content:   content,
+				size:      int64(len(content)),
+				mtimeSec:  sec,
+				mtimeNsec: nsec,
+				layer:     idx,
+			}
+			return nil
+		}
 		if store == nil {
 			return errors.New("regular file requires CAS store")
 		}
@@ -270,14 +298,16 @@ func applyHeader(ctx context.Context, store *objectstore.Store, tree map[string]
 			return fmt.Errorf("parse fs-verity digest for %s: %w", name, err)
 		}
 		tree[name] = &node{
-			mode:   modeFromHeader(hdr, 0),
-			uid:    hdr.Uid,
-			gid:    hdr.Gid,
-			xattrs: xattrsFromHeader(hdr),
-			digest: d,
-			verity: verity,
-			size:   hdr.Size,
-			layer:  idx,
+			mode:      modeFromHeader(hdr, 0),
+			uid:       hdr.Uid,
+			gid:       hdr.Gid,
+			xattrs:    xattrsFromHeader(hdr),
+			digest:    d,
+			verity:    verity,
+			size:      hdr.Size,
+			mtimeSec:  sec,
+			mtimeNsec: nsec,
+			layer:     idx,
 		}
 	case tar.TypeLink:
 		target, err := normalizeName(hdr.Linkname)
@@ -292,20 +322,24 @@ func applyHeader(ctx context.Context, store *objectstore.Store, tree map[string]
 			return fmt.Errorf("symlink %s has empty target", name)
 		}
 		tree[name] = &node{
-			mode:     modeFromHeader(hdr, os.ModeSymlink),
-			uid:      hdr.Uid,
-			gid:      hdr.Gid,
-			xattrs:   xattrsFromHeader(hdr),
-			linkname: hdr.Linkname,
-			layer:    idx,
+			mode:      modeFromHeader(hdr, os.ModeSymlink),
+			uid:       hdr.Uid,
+			gid:       hdr.Gid,
+			xattrs:    xattrsFromHeader(hdr),
+			linkname:  hdr.Linkname,
+			mtimeSec:  sec,
+			mtimeNsec: nsec,
+			layer:     idx,
 		}
 	case tar.TypeDir:
 		tree[name] = &node{
-			mode:   modeFromHeader(hdr, os.ModeDir),
-			uid:    hdr.Uid,
-			gid:    hdr.Gid,
-			xattrs: xattrsFromHeader(hdr),
-			layer:  idx,
+			mode:      modeFromHeader(hdr, os.ModeDir),
+			uid:       hdr.Uid,
+			gid:       hdr.Gid,
+			xattrs:    xattrsFromHeader(hdr),
+			mtimeSec:  sec,
+			mtimeNsec: nsec,
+			layer:     idx,
 		}
 	case tar.TypeChar:
 		tree[name] = deviceNode(hdr, os.ModeDevice|os.ModeCharDevice, idx)
@@ -321,15 +355,30 @@ func applyHeader(ctx context.Context, store *objectstore.Store, tree map[string]
 
 // deviceNode builds a metadata-only node for a character, block, or fifo special file.
 func deviceNode(hdr *tar.Header, typ os.FileMode, idx int) *node {
+	sec, nsec := mtimeFromHeader(hdr)
 	return &node{
-		mode:     modeFromHeader(hdr, typ),
-		uid:      hdr.Uid,
-		gid:      hdr.Gid,
-		xattrs:   xattrsFromHeader(hdr),
-		devmajor: hdr.Devmajor,
-		devminor: hdr.Devminor,
-		layer:    idx,
+		mode:      modeFromHeader(hdr, typ),
+		uid:       hdr.Uid,
+		gid:       hdr.Gid,
+		xattrs:    xattrsFromHeader(hdr),
+		mtimeSec:  sec,
+		mtimeNsec: nsec,
+		devmajor:  hdr.Devmajor,
+		devminor:  hdr.Devminor,
+		layer:     idx,
 	}
+}
+
+// mtimeFromHeader extracts a tar header's modification time as whole seconds and
+// a nanosecond remainder in [0, 1e9). Times before the epoch — including the
+// zero-value time a header without an mtime decodes to — clamp to 0, since the
+// composefs-dump parser reads the MTIME column as an unsigned value.
+func mtimeFromHeader(hdr *tar.Header) (int64, int64) {
+	sec := hdr.ModTime.Unix()
+	if sec < 0 {
+		return 0, 0
+	}
+	return sec, int64(hdr.ModTime.Nanosecond())
 }
 
 // normalizeName cleans a tar entry name to a root-relative path (no leading
@@ -481,18 +530,21 @@ func entriesFromTree(tree map[string]*node) []composefs.Entry {
 			canonical[n] = p
 		}
 		entries = append(entries, composefs.Entry{
-			Path:     "/" + p,
-			Mode:     n.mode,
-			UID:      n.uid,
-			GID:      n.gid,
-			Xattrs:   cloneXattrs(n.xattrs),
-			Linkname: n.linkname,
-			Digest:   n.digest,
-			Verity:   n.verity,
-			Size:     n.size,
-			Devmajor: n.devmajor,
-			Devminor: n.devminor,
-			Nlink:    nlink[n],
+			Path:      "/" + p,
+			Mode:      n.mode,
+			UID:       n.uid,
+			GID:       n.gid,
+			Xattrs:    cloneXattrs(n.xattrs),
+			Linkname:  n.linkname,
+			Content:   n.content,
+			Digest:    n.digest,
+			Verity:    n.verity,
+			Size:      n.size,
+			Mtime:     n.mtimeSec,
+			MtimeNsec: n.mtimeNsec,
+			Devmajor:  n.devmajor,
+			Devminor:  n.devminor,
+			Nlink:     nlink[n],
 		})
 	}
 	return entries

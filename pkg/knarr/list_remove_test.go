@@ -172,7 +172,8 @@ func TestPullListRemoveE2E(t *testing.T) {
 	}
 
 	lay, err := octest.BuildSingleLayerGzip(t.TempDir(), hostPlatform(),
-		octest.File{Name: "etc/config.txt", Mode: 0o644, Body: "hello from knarr\n"},
+		// Over the inline threshold, so it is stored as a CAS object (FileDigest).
+		octest.File{Name: "etc/config.txt", Mode: 0o644, Body: "hello from knarr - a config payload larger than the sixty-four byte inline limit\n"},
 	)
 	if err != nil {
 		t.Fatalf("build layout: %v", err)

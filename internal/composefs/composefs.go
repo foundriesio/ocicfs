@@ -31,8 +31,9 @@ const InlineContentMax = 64
 //
 //	PATH SIZE MODE NLINK UID GID RDEV MTIME PAYLOAD CONTENT DIGEST [xattrs...]
 //
-// The fields below map onto those columns (see the per-field comments). WriteDump
-// fixes the MTIME column at 0 (reproducible builds). A regular file is emitted one
+// The fields below map onto those columns (see the per-field comments). The MTIME
+// column carries the node's modification time (Mtime seconds and MtimeNsec
+// nanoseconds). A regular file is emitted one
 // of two ways. With Content set, its bytes are inlined into the EROFS (the CONTENT
 // column) and it carries no PAYLOAD or DIGEST. Otherwise it is stored by digest:
 // its bytes live in a separate fs-verity-sealed CAS object that PAYLOAD redirects
@@ -50,19 +51,21 @@ const InlineContentMax = 64
 // its store by fs-verity digest. Digest, the object's content sha256, stays the
 // store's content-addressed key but is not part of the emitted line.
 type Entry struct {
-	Path     string            // PATH: absolute path of the node in the image
-	Mode     os.FileMode       // MODE: Go file-type + permission bits, mapped to the st_mode column
-	UID, GID int               // UID, GID: owner ids
-	Xattrs   map[string]string // trailing KEY=VALUE xattr fields
-	Linkname string            // PAYLOAD, for symlinks: the link target
-	Hardlink string            // PAYLOAD, for hardlinks: absolute path of the earlier entry this name shares an inode with; when set every other field except Path is ignored
-	Content  []byte            // CONTENT, for regular files: inline file bytes; when non-nil the file is inlined and carries no Digest or Verity
-	Digest   digest.Digest     // content digest of the backing CAS object (the store's content-addressed key); required for a by-digest regular file but not emitted in the dump line
-	Verity   digest.Digest     // PAYLOAD and DIGEST, for by-digest regular files: the fs-verity digest, emitted both as the "<2>/<rest>" view redirect and as the value the kernel validates
-	Size     int64             // SIZE: file size (ignored for directories)
-	Devmajor int64             // RDEV (major): device number for device nodes
-	Devminor int64             // RDEV (minor): device number for device nodes
-	Nlink    int               // NLINK: the inode's name count; 0 is written as 1
+	Path      string            // PATH: absolute path of the node in the image
+	Mode      os.FileMode       // MODE: Go file-type + permission bits, mapped to the st_mode column
+	UID, GID  int               // UID, GID: owner ids
+	Xattrs    map[string]string // trailing KEY=VALUE xattr fields
+	Linkname  string            // PAYLOAD, for symlinks: the link target
+	Hardlink  string            // PAYLOAD, for hardlinks: absolute path of the earlier entry this name shares an inode with; when set every other field except Path is ignored
+	Content   []byte            // CONTENT, for regular files: inline file bytes; when non-nil the file is inlined and carries no Digest or Verity
+	Digest    digest.Digest     // content digest of the backing CAS object (the store's content-addressed key); required for a by-digest regular file but not emitted in the dump line
+	Verity    digest.Digest     // PAYLOAD and DIGEST, for by-digest regular files: the fs-verity digest, emitted both as the "<2>/<rest>" view redirect and as the value the kernel validates
+	Size      int64             // SIZE: file size (ignored for directories)
+	Devmajor  int64             // RDEV (major): device number for device nodes
+	Devminor  int64             // RDEV (minor): device number for device nodes
+	Nlink     int               // NLINK: the inode's name count; 0 is written as 1
+	Mtime     int64             // MTIME (seconds): modification time, whole seconds since the epoch
+	MtimeNsec int64             // MTIME (nanoseconds): sub-second part, in [0, 1e9)
 }
 
 // WriteImage streams a composefs dump for entries to a temp file beside out and
@@ -136,7 +139,7 @@ func WriteDump(w io.Writer, entries []Entry) error {
 //
 //	PATH SIZE MODE NLINK UID GID RDEV MTIME PAYLOAD CONTENT DIGEST [xattrs...]
 //
-// knarr does not track per-file mtime, so MTIME is fixed at zero (reproducible).
+// MTIME is emitted as "<Mtime>.<MtimeNsec>", the node's modification time.
 func writeDumpLine(w io.Writer, e *Entry) error {
 	if e.Path == "" || e.Path[0] != '/' {
 		return fmt.Errorf("path must be absolute, got %q", e.Path)
@@ -177,8 +180,8 @@ func writeDumpLine(w io.Writer, e *Entry) error {
 	if nlink < 1 {
 		nlink = 1
 	}
-	if _, err := fmt.Fprintf(w, "%s %d %o %d %d %d %d 0.000000000 ",
-		escapeDumpField(e.Path), size, unixMode(e.Mode), nlink, e.UID, e.GID, rdev); err != nil {
+	if _, err := fmt.Fprintf(w, "%s %d %o %d %d %d %d %d.%09d ",
+		escapeDumpField(e.Path), size, unixMode(e.Mode), nlink, e.UID, e.GID, rdev, e.Mtime, e.MtimeNsec); err != nil {
 		return err
 	}
 

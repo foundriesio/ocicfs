@@ -7,9 +7,10 @@
 #
 # Plays both sides of knarr's trust model on one machine using only the upstream
 # mkcomposefs and composefs-info tools:
-#   [publisher] builds a no-inline composefs image from a sample tree — objects
-#               stored by content sha256 with an fs-verity-keyed hardlink view,
-#               redirects keyed by fs-verity — and seals its fs-verity digest;
+#   [publisher] builds a composefs image from a sample tree — files over 64 bytes
+#               stored by content sha256 with an fs-verity-keyed hardlink view and
+#               redirects keyed by fs-verity, files of 64 bytes or fewer inlined
+#               into the EROFS as mkcomposefs does — and seals its fs-verity digest;
 #   [device]    rebuilds the image from the same dump + objects and verifies the
 #               measured digest matches the seal.
 #
@@ -45,15 +46,14 @@ mkcomposefs --use-epoch --skip-xattrs --min-version=1 --max-version=1 tree inlin
 composefs-info dump inlined.cfs
 
 echo
-echo "== [publisher] rewrite to a no-inline dump (+ build object store and fs-verity view) =="
+echo "== [publisher] externalize files over 64 bytes (+ build object store and fs-verity view) =="
 mkdir -p objects/sha256 objects/fsverity-sha256-12
 to_knarr() {
 	while IFS= read -r line; do
 		# shellcheck disable=SC2086 # dump fields are space-separated and unescaped here
 		set -- $line # PATH SIZE MODE NLINK UID GID RDEV MTIME PAYLOAD CONTENT DIGEST
 		# This demo maps the dump PATH straight to a source file, so it handles only
-		# plain names. Refuse an escaped PATH rather than silently leaving its file
-		# inlined, which would contradict the no-inline image this builds.
+		# plain names. Refuse an escaped PATH rather than mishandle it.
 		case $1 in
 		*\\*)
 			echo "storage-demo: dump PATH '$1' is escaped; this demo handles only plain names" >&2
@@ -61,7 +61,10 @@ to_knarr() {
 			;;
 		esac
 		f="tree$1"
-		if [ -f "$f" ] && [ ! -L "$f" ]; then
+		# knarr inlines files of <=64 bytes exactly as mkcomposefs already did, so
+		# those dump lines pass through untouched; only larger regular files become
+		# by-digest objects. A regular file's SIZE column ($2) is its byte length.
+		if [ -f "$f" ] && [ ! -L "$f" ] && [ "$2" -gt 64 ]; then
 			csum=$(sha256sum "$f" | cut -d' ' -f1)                    # content digest -> CAS name
 			install -D -m0644 "$f" "objects/sha256/${csum:0:2}/${csum:2}" # store the object
 			fsv=$(composefs-info measure-file "$f")                   # fs-verity digest -> PAYLOAD + DIGEST
