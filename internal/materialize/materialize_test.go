@@ -67,6 +67,62 @@ func TestMaterializeMatchesDirectoryAndMemorySources(t *testing.T) {
 	assertFileBytesEqual(t, octest.BindingPath(dirRoot, lay.Root, lay.Platform), octest.BindingPath(memRoot, lay.Root, lay.Platform))
 }
 
+// TestMaterializePersistsCanonicalFlag asserts the binding written by Materialize
+// records the construction's canonical flag: true for a standard-layout image
+// (explicit parents, /usr a directory) and false for a divergent one (implicit
+// parents, no /usr).
+func TestMaterializePersistsCanonicalFlag(t *testing.T) {
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+	// Over the inline threshold so the file is a real CAS object.
+	body := "a config payload larger than the sixty-four byte inline limit so it becomes an object\n"
+	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+
+	canonical, err := octest.BuildSingleLayerGzip(t.TempDir(), platform,
+		octest.File{Name: "usr", Dir: true},
+		octest.File{Name: "usr/bin", Dir: true},
+		octest.File{Name: "usr/bin/app", Mode: 0o755, Body: body},
+	)
+	if err != nil {
+		t.Fatalf("build canonical layout: %v", err)
+	}
+	divergent, err := octest.BuildSingleLayerGzip(t.TempDir(), platform,
+		octest.File{Name: "etc/config", Mode: 0o644, Body: body},
+	)
+	if err != nil {
+		t.Fatalf("build divergent layout: %v", err)
+	}
+
+	if got := materializeCanonical(t, canonical); !got {
+		t.Fatal("standard-layout binding recorded canonical = false")
+	}
+	if got := materializeCanonical(t, divergent); got {
+		t.Fatal("divergent binding recorded canonical = true")
+	}
+}
+
+// materializeCanonical materializes lay and returns the canonical flag recorded
+// in its binding.
+func materializeCanonical(t *testing.T, lay octest.Layout) bool {
+	t.Helper()
+	_, obj, img := newStores(t)
+	src, err := ocilayout.Open(lay.Dir)
+	if err != nil {
+		t.Fatalf("ocilayout.Open: %v", err)
+	}
+	_, err = Materialize(context.Background(), obj, img, src, lay.Root, lay.Platform)
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	b, err := img.Get(lay.Root, lay.Platform)
+	if err != nil {
+		t.Fatalf("imagestore.Get: %v", err)
+	}
+	return b.Canonical
+}
+
 type memorySource map[digest.Digest][]byte
 
 func (s memorySource) Open(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {

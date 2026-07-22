@@ -32,7 +32,10 @@ import (
 // and materialized+mounted by knarr, and the two resulting trees must agree on
 // every path, type, permission and setuid/setgid/sticky bit, ownership, size,
 // content, symlink target, device number, xattr, and hardlink grouping.
-// Excluded on purpose: mtimes (knarr fixes them at zero for reproducibility)
+// Excluded on purpose: mtimes (the canonical construction rewrites the root's
+// and /run's, so the trees legitimately differ there), the canonical tree
+// transforms themselves (the fixture stays transform-neutral — no /run
+// children, allowlisted xattrs only — since the rootfs unit tests pin them),
 // and the two merge cases the reference implementation itself gets wrong —
 // opaque-directory markers (it treats ".wh..wh..opq" as a file whiteout) and
 // whiting out one name of a hardlink group (it emits a dangling link) — which
@@ -62,7 +65,12 @@ func TestMountMatchesFlattenedImageE2E(t *testing.T) {
 		diffEnt{name: "etc/conf", typ: tar.TypeReg, mode: 0o644, body: "conf-v1", uid: 1000, gid: 2000},
 		diffEnt{
 			name: "etc/secret", typ: tar.TypeReg, mode: 0o600, body: "secret",
-			pax: map[string]string{"SCHILY.xattr.user.tag": "aye"},
+			// A well-formed VFS_CAP_REVISION_2 blob (effective, CAP_NET_BIND_SERVICE):
+			// the kernel validates security.capability on read, so an arbitrary
+			// string would EINVAL through the mount.
+			pax: map[string]string{
+				"SCHILY.xattr.security.capability": "\x01\x00\x00\x02\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+			},
 		},
 		diffEnt{name: "etc/rel", typ: tar.TypeSymlink, mode: 0o777, link: "conf"},
 		diffEnt{name: "share/", typ: tar.TypeDir, mode: 0o755},
@@ -70,8 +78,8 @@ func TestMountMatchesFlattenedImageE2E(t *testing.T) {
 		diffEnt{name: "share/doc/readme", typ: tar.TypeReg, mode: 0o644, body: "read me"},
 		diffEnt{name: "dev/", typ: tar.TypeDir, mode: 0o755},
 		diffEnt{name: "dev/null2", typ: tar.TypeChar, mode: 0o666, devmajor: 1, devminor: 3},
-		diffEnt{name: "run/", typ: tar.TypeDir, mode: 0o755},
-		diffEnt{name: "run/pipe", typ: tar.TypeFifo, mode: 0o644},
+		diffEnt{name: "srv/", typ: tar.TypeDir, mode: 0o755},
+		diffEnt{name: "srv/pipe", typ: tar.TypeFifo, mode: 0o644},
 		diffEnt{name: "junk/", typ: tar.TypeDir, mode: 0o755},
 		diffEnt{name: "junk/data", typ: tar.TypeReg, mode: 0o644, body: "junk"},
 		diffEnt{name: "old/", typ: tar.TypeDir, mode: 0o755},

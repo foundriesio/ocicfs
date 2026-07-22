@@ -69,6 +69,7 @@ func Materialize(ctx context.Context, store *objectstore.Store, img *imagestore.
 		Descriptor:     built.Descriptor,
 		FsverityDigest: built.FsverityDigest,
 		RootfsSize:     built.RootfsSize,
+		Canonical:      built.Canonical,
 	}); err != nil {
 		return Built{}, err
 	}

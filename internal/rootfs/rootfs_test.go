@@ -107,8 +107,12 @@ func TestRemoveOpaqueRemovesOnlyLowerDescendants(t *testing.T) {
 
 func TestEnsureParents(t *testing.T) {
 	tree := map[string]*node{"a/b/c": {mode: 0o644}}
-	if err := ensureParents(tree); err != nil {
+	synthesized, err := ensureParents(tree)
+	if err != nil {
 		t.Fatalf("ensureParents: %v", err)
+	}
+	if !synthesized {
+		t.Fatal("expected synthesized parents to be reported")
 	}
 	for _, p := range []string{"a", "a/b"} {
 		if n, ok := tree[p]; !ok || n.mode&os.ModeDir == 0 {
@@ -120,7 +124,7 @@ func TestEnsureParents(t *testing.T) {
 		"a":   {mode: 0o644},
 		"a/b": {mode: 0o644},
 	}
-	if err := ensureParents(tree); err == nil {
+	if _, err := ensureParents(tree); err == nil {
 		t.Fatal("expected non-directory parent error")
 	}
 }
@@ -161,7 +165,7 @@ func TestLinkHardlinkTargetChecks(t *testing.T) {
 
 func TestBuildEntriesRejectsEscapingName(t *testing.T) {
 	layer := tarBytes(t, tarEntry{name: "../../x", typ: tar.TypeDir, mode: 0o755})
-	_, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	_, _, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	if err == nil {
 		t.Fatal("expected escaping path error")
 	}
@@ -172,7 +176,7 @@ func TestBuildEntriesHardlinkToSymlink(t *testing.T) {
 		tarEntry{name: "target", typ: tar.TypeSymlink, mode: 0o777, link: "somewhere"},
 		tarEntry{name: "link", typ: tar.TypeLink, link: "target"},
 	)
-	entries, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	entries, _, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	if err != nil {
 		t.Fatalf("buildEntries: %v", err)
 	}
@@ -192,7 +196,7 @@ func TestBuildEntriesRejectsForwardHardlink(t *testing.T) {
 		tarEntry{name: "link", typ: tar.TypeLink, link: "target"},
 		tarEntry{name: "target", typ: tar.TypeSymlink, mode: 0o777, link: "somewhere"},
 	)
-	_, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	_, _, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	if err == nil {
 		t.Fatal("expected missing hardlink target error")
 	}
@@ -201,7 +205,7 @@ func TestBuildEntriesRejectsForwardHardlink(t *testing.T) {
 func TestBuildEntriesChecksDiffID(t *testing.T) {
 	layer := tarBytes(t, tarEntry{name: "dir", typ: tar.TypeDir, mode: 0o755})
 	wrong := digest.SHA256.FromString("wrong")
-	_, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{wrong})
+	_, _, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{wrong})
 	if err == nil {
 		t.Fatal("expected diff_id mismatch")
 	}
@@ -221,12 +225,12 @@ func TestBuildEntriesWithStore(t *testing.T) {
 	)
 	layer2 := tarBytes(t,
 		tarEntry{name: "etc/.wh.config", typ: tar.TypeReg, mode: 0o000},
-		tarEntry{name: "etc/config", typ: tar.TypeReg, mode: 0o600, body: large("v2"), pax: map[string]string{"SCHILY.xattr.user.test": "yes"}},
+		tarEntry{name: "etc/config", typ: tar.TypeReg, mode: 0o600, body: large("v2"), pax: map[string]string{"SCHILY.xattr.security.capability": "cap"}},
 		tarEntry{name: "app-copy", typ: tar.TypeLink, link: "usr/bin/app"},
 		tarEntry{name: "var/lib/.wh..wh..opq", typ: tar.TypeReg, mode: 0o000},
 		tarEntry{name: "var/lib/new", typ: tar.TypeReg, mode: 0o644, body: "new"},
 	)
-	entries, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
+	entries, _, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
 		digest.FromBytes(layer1),
 		digest.FromBytes(layer2),
 	})
@@ -245,7 +249,7 @@ func TestBuildEntriesWithStore(t *testing.T) {
 	if cfg.Verity == "" {
 		t.Fatal("/etc/config missing fs-verity digest")
 	}
-	if cfg.Mode.Perm() != 0o600 || cfg.Xattrs["user.test"] != "yes" {
+	if cfg.Mode.Perm() != 0o600 || cfg.Xattrs["security.capability"] != "cap" {
 		t.Fatalf("/etc/config metadata = %#v", cfg)
 	}
 	// "/app-copy" sorts before "/usr/bin/app", so it carries the shared inode's
@@ -280,7 +284,7 @@ func TestContentSizeMergedTree(t *testing.T) {
 		tarEntry{name: "app-copy", typ: tar.TypeLink, link: "usr/bin/app"},
 		tarEntry{name: "var/.wh.junk", typ: tar.TypeReg, mode: 0o000},
 	)
-	entries, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
+	entries, _, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
 		digest.FromBytes(layer1),
 		digest.FromBytes(layer2),
 	})
@@ -307,7 +311,7 @@ func TestBuildEntriesHardlinkSurvivesTargetWhiteout(t *testing.T) {
 	layer2 := tarBytes(t,
 		tarEntry{name: "bin/.wh.app", typ: tar.TypeReg, mode: 0o000},
 	)
-	entries, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
+	entries, _, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
 		digest.FromBytes(layer1),
 		digest.FromBytes(layer2),
 	})
@@ -340,7 +344,7 @@ func TestBuildEntriesHardlinkTargetReplaced(t *testing.T) {
 	layer2 := tarBytes(t,
 		tarEntry{name: "bin/app", typ: tar.TypeReg, mode: 0o755, body: large("v2")},
 	)
-	entries, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
+	entries, _, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
 		digest.FromBytes(layer1),
 		digest.FromBytes(layer2),
 	})
@@ -366,9 +370,9 @@ func TestBuildEntriesModifyWithoutWhiteout(t *testing.T) {
 		tarEntry{name: "etc/config", typ: tar.TypeReg, mode: 0o644, body: large("v1")},
 	)
 	layer2 := tarBytes(t,
-		tarEntry{name: "etc/config", typ: tar.TypeReg, mode: 0o600, body: large("v2"), pax: map[string]string{"SCHILY.xattr.user.test": "yes"}},
+		tarEntry{name: "etc/config", typ: tar.TypeReg, mode: 0o600, body: large("v2"), pax: map[string]string{"SCHILY.xattr.security.capability": "cap"}},
 	)
-	entries, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
+	entries, _, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
 		digest.FromBytes(layer1),
 		digest.FromBytes(layer2),
 	})
@@ -380,7 +384,7 @@ func TestBuildEntriesModifyWithoutWhiteout(t *testing.T) {
 	if cfg.Digest != digest.FromBytes([]byte(large("v2"))) {
 		t.Fatalf("/etc/config digest = %s, want v2 content", cfg.Digest)
 	}
-	if cfg.Mode.Perm() != 0o600 || cfg.Xattrs["user.test"] != "yes" {
+	if cfg.Mode.Perm() != 0o600 || cfg.Xattrs["security.capability"] != "cap" {
 		t.Fatalf("/etc/config not overridden by upper layer: %#v", cfg)
 	}
 }
@@ -398,7 +402,7 @@ func TestBuildEntriesReplaceDirWithFile(t *testing.T) {
 	layer2 := tarBytes(t,
 		tarEntry{name: "lib", typ: tar.TypeSymlink, mode: 0o777, link: "usr/lib"},
 	)
-	entries, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
+	entries, _, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
 		digest.FromBytes(layer1),
 		digest.FromBytes(layer2),
 	})
@@ -435,7 +439,7 @@ func TestBuildEntriesInlinesSmallFiles(t *testing.T) {
 		te = append(te, tarEntry{name: f.name, typ: tar.TypeReg, mode: 0o644, body: f.body})
 	}
 	layer := tarBytes(t, te...)
-	entries, err := buildEntries(context.Background(), store, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	entries, _, err := buildEntries(context.Background(), store, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	skipIfNoVerity(t, err)
 	if err != nil {
 		t.Fatalf("buildEntries: %v", err)
@@ -472,7 +476,7 @@ func TestBuildEntriesHardlinkToInlinedFile(t *testing.T) {
 		tarEntry{name: "cfg", typ: tar.TypeReg, mode: 0o644, body: "k=v\n"},
 		tarEntry{name: "cfg2", typ: tar.TypeLink, link: "cfg"},
 	)
-	entries, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	entries, _, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	if err != nil {
 		t.Fatalf("buildEntries: %v", err)
 	}
@@ -504,7 +508,7 @@ func TestBuildEntriesPreservesMtimes(t *testing.T) {
 		tarEntry{name: "sym", typ: tar.TypeSymlink, mode: 0o777, link: "etc/config", mtime: time.Unix(1500000000, 0)},
 		tarEntry{name: "fifo", typ: tar.TypeFifo, mode: 0o644, mtime: time.Unix(1400000000, 0)},
 	)
-	entries, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	entries, _, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	if err != nil {
 		t.Fatalf("buildEntries: %v", err)
 	}
@@ -537,12 +541,412 @@ func TestBuildEntriesPreservesMtimes(t *testing.T) {
 // since the composefs-dump parser reads the MTIME column as unsigned.
 func TestBuildEntriesClampsPreEpochMtime(t *testing.T) {
 	layer := tarBytes(t, tarEntry{name: "f", typ: tar.TypeReg, mode: 0o644, body: "x", mtime: time.Unix(-5, 0)})
-	entries, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	entries, _, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	if err != nil {
 		t.Fatalf("buildEntries: %v", err)
 	}
 	if e := entriesByPath(entries)["/f"]; e.Mtime != 0 || e.MtimeNsec != 0 {
 		t.Fatalf("pre-epoch mtime not clamped: %d.%09d", e.Mtime, e.MtimeNsec)
+	}
+}
+
+// TestTransformCanonicalStandardImage asserts a standard-layout image (every
+// parent present, /usr a directory, no odd /run) is reported canonical and that
+// the root directory adopts /usr's metadata: mode, uid, gid, mtime, and the
+// allowlisted xattr, with the non-allowlisted one dropped.
+func TestTransformCanonicalStandardImage(t *testing.T) {
+	usrMtime := time.Unix(1710000000, 42)
+	layer := tarBytes(t,
+		tarEntry{
+			name: "usr", typ: tar.TypeDir, mode: 0o750, uid: 5, gid: 6, mtime: usrMtime,
+			pax: map[string]string{"SCHILY.xattr.security.capability": "cap", "SCHILY.xattr.user.foo": "bar"},
+		},
+		tarEntry{name: "usr/lib", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "usr/lib/f", typ: tar.TypeReg, mode: 0o644, body: "hi"},
+	)
+	entries, canonical := buildInline(t, layer)
+	if !canonical {
+		t.Fatal("standard image reported non-canonical")
+	}
+	root := entriesByPath(entries)["/"]
+	if root.Mode != os.ModeDir|0o750 || root.UID != 5 || root.GID != 6 {
+		t.Fatalf("root metadata = %#v, want /usr's mode/uid/gid", root)
+	}
+	if root.Mtime != usrMtime.Unix() || root.MtimeNsec != int64(usrMtime.Nanosecond()) {
+		t.Fatalf("root mtime = %d.%09d, want /usr's %d.%09d", root.Mtime, root.MtimeNsec, usrMtime.Unix(), usrMtime.Nanosecond())
+	}
+	if root.Xattrs["security.capability"] != "cap" || len(root.Xattrs) != 1 {
+		t.Fatalf("root xattrs = %#v, want only security.capability", root.Xattrs)
+	}
+}
+
+// TestTransformMissingUsrUsesDefaultRoot asserts an image without /usr is
+// non-canonical and its root falls back to the canonical default metadata.
+func TestTransformMissingUsrUsesDefaultRoot(t *testing.T) {
+	layer := tarBytes(t,
+		tarEntry{name: "etc", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "etc/f", typ: tar.TypeReg, mode: 0o644, body: "hi"},
+	)
+	entries, canonical := buildInline(t, layer)
+	if canonical {
+		t.Fatal("missing /usr reported canonical")
+	}
+	root := entriesByPath(entries)["/"]
+	if root.Mode != os.ModeDir|0o755 || root.UID != 0 || root.GID != 0 || root.Mtime != 0 || root.MtimeNsec != 0 || root.Xattrs != nil {
+		t.Fatalf("root metadata = %#v, want canonical default", root)
+	}
+}
+
+// TestTransformUsrNotDirectoryDiverges asserts a /usr that is not a directory (a
+// symlink here) is treated like a missing /usr: default root, non-canonical.
+func TestTransformUsrNotDirectoryDiverges(t *testing.T) {
+	layer := tarBytes(t,
+		tarEntry{name: "usr", typ: tar.TypeSymlink, mode: 0o777, link: "share"},
+		tarEntry{name: "share", typ: tar.TypeDir, mode: 0o755},
+	)
+	entries, canonical := buildInline(t, layer)
+	if canonical {
+		t.Fatal("symlink /usr reported canonical")
+	}
+	byPath := entriesByPath(entries)
+	if byPath["/usr"].Linkname != "share" {
+		t.Fatalf("/usr = %#v, want the symlink left in place", byPath["/usr"])
+	}
+	if root := byPath["/"]; root.Mode != os.ModeDir|0o755 {
+		t.Fatalf("root mode = %v, want canonical default", root.Mode)
+	}
+}
+
+// TestTransformEmptiesRun asserts /run is emptied in place (node kept, children
+// removed) with its mtime taken from /usr, and the image stays canonical.
+func TestTransformEmptiesRun(t *testing.T) {
+	usrMtime := time.Unix(1710000000, 7)
+	layer := tarBytes(t,
+		tarEntry{name: "usr", typ: tar.TypeDir, mode: 0o755, mtime: usrMtime},
+		tarEntry{name: "run", typ: tar.TypeDir, mode: 0o755, mtime: time.Unix(1600000000, 0)},
+		tarEntry{name: "run/foo", typ: tar.TypeReg, mode: 0o644, body: "x"},
+		tarEntry{name: "run/sub", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "run/sub/bar", typ: tar.TypeReg, mode: 0o644, body: "y"},
+	)
+	entries, canonical := buildInline(t, layer)
+	if !canonical {
+		t.Fatal("populated /run (directory) reported non-canonical")
+	}
+	byPath := entriesByPath(entries)
+	run, ok := byPath["/run"]
+	if !ok || run.Mode&os.ModeDir == 0 {
+		t.Fatalf("/run node not kept: %#v", run)
+	}
+	if run.Mtime != usrMtime.Unix() || run.MtimeNsec != int64(usrMtime.Nanosecond()) {
+		t.Fatalf("/run mtime = %d.%09d, want /usr's %d.%09d", run.Mtime, run.MtimeNsec, usrMtime.Unix(), usrMtime.Nanosecond())
+	}
+	for _, p := range []string{"/run/foo", "/run/sub", "/run/sub/bar"} {
+		if _, ok := byPath[p]; ok {
+			t.Fatalf("%s survived /run canonicalization", p)
+		}
+	}
+}
+
+// TestTransformMissingUsrPopulatedRun exercises the fallback metadata source
+// end to end: /run is emptied using the default mtime 0, and the combined image
+// is non-canonical.
+func TestTransformMissingUsrPopulatedRun(t *testing.T) {
+	layer := tarBytes(t,
+		tarEntry{name: "run", typ: tar.TypeDir, mode: 0o755, mtime: time.Unix(1600000000, 0)},
+		tarEntry{name: "run/foo", typ: tar.TypeReg, mode: 0o644, body: "x"},
+	)
+	entries, canonical := buildInline(t, layer)
+	if canonical {
+		t.Fatal("missing /usr with populated /run reported canonical")
+	}
+	byPath := entriesByPath(entries)
+	if run := byPath["/run"]; run.Mode&os.ModeDir == 0 || run.Mtime != 0 || run.MtimeNsec != 0 {
+		t.Fatalf("/run = %#v, want kept with default mtime 0", run)
+	}
+	if _, ok := byPath["/run/foo"]; ok {
+		t.Fatal("/run/foo survived canonicalization")
+	}
+}
+
+// TestTransformNonDirectoryRunDiverges asserts a /run that is not a directory is
+// left untouched and marks the image non-canonical.
+func TestTransformNonDirectoryRunDiverges(t *testing.T) {
+	layer := tarBytes(t,
+		tarEntry{name: "usr", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "run", typ: tar.TypeReg, mode: 0o644, body: "not a dir"},
+	)
+	entries, canonical := buildInline(t, layer)
+	if canonical {
+		t.Fatal("non-directory /run reported canonical")
+	}
+	if run := entriesByPath(entries)["/run"]; run.Mode&os.ModeDir != 0 || string(run.Content) != "not a dir" {
+		t.Fatalf("/run = %#v, want the file left in place", run)
+	}
+}
+
+// TestTransformSynthesizedParentDiverges asserts that an image relying on an
+// implicit parent directory (which the builder synthesizes) is non-canonical.
+func TestTransformSynthesizedParentDiverges(t *testing.T) {
+	layer := tarBytes(t,
+		tarEntry{name: "usr", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "a/b/c", typ: tar.TypeReg, mode: 0o644, body: "deep"},
+	)
+	entries, canonical := buildInline(t, layer)
+	if canonical {
+		t.Fatal("implicit-parent image reported canonical")
+	}
+	byPath := entriesByPath(entries)
+	for _, p := range []string{"/a", "/a/b"} {
+		if n, ok := byPath[p]; !ok || n.Mode&os.ModeDir == 0 {
+			t.Fatalf("synthesized parent %s missing or not a directory: %#v", p, n)
+		}
+	}
+}
+
+// TestTransformOpaqueSameLayerBeforeMarkerDiverges asserts the divergence case:
+// a same-layer entry written under a directory *before* that layer's opaque
+// marker is kept by knarr (upstream clears it), so the image is non-canonical.
+func TestTransformOpaqueSameLayerBeforeMarkerDiverges(t *testing.T) {
+	layer1 := tarBytes(t,
+		tarEntry{name: "usr", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "d", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "d/lower", typ: tar.TypeReg, mode: 0o644, body: "lower"},
+	)
+	layer2 := tarBytes(t,
+		tarEntry{name: "d/before", typ: tar.TypeReg, mode: 0o644, body: "before"},
+		tarEntry{name: "d/.wh..wh..opq", typ: tar.TypeReg, mode: 0o000},
+	)
+	entries, canonical := buildInline(t, layer1, layer2)
+	if canonical {
+		t.Fatal("opaque-with-same-layer-before reported canonical")
+	}
+	byPath := entriesByPath(entries)
+	if _, ok := byPath["/d/before"]; !ok {
+		t.Fatal("/d/before (same layer as the marker) was dropped")
+	}
+	if _, ok := byPath["/d/lower"]; ok {
+		t.Fatal("/d/lower (lower layer) survived the opaque marker")
+	}
+}
+
+// TestTransformOpaqueSameLayerAfterMarkerStaysCanonical is the control: when the
+// opaque marker precedes its layer's own entries — the usual tar ordering —
+// knarr and upstream agree, so the image stays canonical.
+func TestTransformOpaqueSameLayerAfterMarkerStaysCanonical(t *testing.T) {
+	layer1 := tarBytes(t,
+		tarEntry{name: "usr", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "d", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "d/lower", typ: tar.TypeReg, mode: 0o644, body: "lower"},
+	)
+	layer2 := tarBytes(t,
+		tarEntry{name: "d/.wh..wh..opq", typ: tar.TypeReg, mode: 0o000},
+		tarEntry{name: "d/after", typ: tar.TypeReg, mode: 0o644, body: "after"},
+	)
+	entries, canonical := buildInline(t, layer1, layer2)
+	if !canonical {
+		t.Fatal("opaque-then-same-layer-entries reported non-canonical")
+	}
+	byPath := entriesByPath(entries)
+	if _, ok := byPath["/d/after"]; !ok {
+		t.Fatal("/d/after was dropped")
+	}
+	if _, ok := byPath["/d/lower"]; ok {
+		t.Fatal("/d/lower survived the opaque marker")
+	}
+}
+
+// TestTransformXattrAllowlist asserts a non-root node keeps only
+// security.capability and drops every other xattr.
+func TestTransformXattrAllowlist(t *testing.T) {
+	layer := tarBytes(t,
+		tarEntry{name: "usr", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{
+			name: "f", typ: tar.TypeReg, mode: 0o644, body: "hi",
+			pax: map[string]string{
+				"SCHILY.xattr.security.capability": "cap",
+				"SCHILY.xattr.security.selinux":    "label",
+				"SCHILY.xattr.user.foo":            "bar",
+			},
+		},
+	)
+	entries, _ := buildInline(t, layer)
+	f := entriesByPath(entries)["/f"]
+	if len(f.Xattrs) != 1 || f.Xattrs["security.capability"] != "cap" {
+		t.Fatalf("/f xattrs = %#v, want only security.capability", f.Xattrs)
+	}
+}
+
+// TestTransformFiltersWhitedOutHardlinkPayloadXattr pins that a hardlink whose
+// payload's own name was whited out still has its xattrs filtered: only the
+// wrapper remains in the tree, but its payload — reached through the link — must
+// drop disallowed xattrs. The image is otherwise canonical.
+func TestTransformFiltersWhitedOutHardlinkPayloadXattr(t *testing.T) {
+	layer1 := tarBytes(t,
+		tarEntry{name: "usr", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "bin", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{
+			name: "bin/f", typ: tar.TypeReg, mode: 0o644, body: "data",
+			pax: map[string]string{"SCHILY.xattr.security.capability": "cap", "SCHILY.xattr.user.foo": "bar"},
+		},
+		tarEntry{name: "bin/g", typ: tar.TypeLink, link: "bin/f"},
+	)
+	layer2 := tarBytes(t, tarEntry{name: "bin/.wh.f", typ: tar.TypeReg, mode: 0o000})
+	entries, canonical := buildInline(t, layer1, layer2)
+	if !canonical {
+		t.Fatal("hardlink+whiteout image reported non-canonical")
+	}
+	byPath := entriesByPath(entries)
+	if _, ok := byPath["/bin/f"]; ok {
+		t.Fatal("/bin/f survived its whiteout")
+	}
+	g := byPath["/bin/g"]
+	if string(g.Content) != "data" {
+		t.Fatalf("/bin/g = %#v, want the surviving payload", g)
+	}
+	if len(g.Xattrs) != 1 || g.Xattrs["security.capability"] != "cap" {
+		t.Fatalf("/bin/g xattrs = %#v, want only security.capability", g.Xattrs)
+	}
+}
+
+// TestTransformFiltersRunOrphanedHardlinkPayloadXattr is the /run variant: the
+// payload lives under /run and is dropped from the tree when /run is emptied,
+// yet a hardlink outside /run keeps it and its xattrs must still be filtered.
+func TestTransformFiltersRunOrphanedHardlinkPayloadXattr(t *testing.T) {
+	layer := tarBytes(t,
+		tarEntry{name: "usr", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "run", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{
+			name: "run/x", typ: tar.TypeReg, mode: 0o644, body: "data",
+			pax: map[string]string{"SCHILY.xattr.security.capability": "cap", "SCHILY.xattr.user.foo": "bar"},
+		},
+		tarEntry{name: "keep", typ: tar.TypeLink, link: "run/x"},
+	)
+	entries, canonical := buildInline(t, layer)
+	if !canonical {
+		t.Fatal("hardlink-into-run image reported non-canonical")
+	}
+	byPath := entriesByPath(entries)
+	if _, ok := byPath["/run/x"]; ok {
+		t.Fatal("/run/x survived /run canonicalization")
+	}
+	keep := byPath["/keep"]
+	if string(keep.Content) != "data" {
+		t.Fatalf("/keep = %#v, want the surviving payload", keep)
+	}
+	if len(keep.Xattrs) != 1 || keep.Xattrs["security.capability"] != "cap" {
+		t.Fatalf("/keep xattrs = %#v, want only security.capability", keep.Xattrs)
+	}
+}
+
+// TestTransformStreamOrderParentDiverges asserts a layer that names a child
+// before its parent is non-canonical even though the parent is present by the
+// end: upstream errors at insert time, so the reordering diverges.
+func TestTransformStreamOrderParentDiverges(t *testing.T) {
+	layer := tarBytes(t,
+		tarEntry{name: "usr", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "a/b", typ: tar.TypeReg, mode: 0o644, body: "x"},
+		tarEntry{name: "a", typ: tar.TypeDir, mode: 0o755},
+	)
+	entries, canonical := buildInline(t, layer)
+	if canonical {
+		t.Fatal("child-before-parent ordering reported canonical")
+	}
+	byPath := entriesByPath(entries)
+	if n, ok := byPath["/a"]; !ok || n.Mode&os.ModeDir == 0 {
+		t.Fatalf("/a = %#v, want a directory", n)
+	}
+	if _, ok := byPath["/a/b"]; !ok {
+		t.Fatal("/a/b missing")
+	}
+}
+
+// TestTransformStreamOrderParentFirstCanonical is the control: the same entries
+// in parent-first order have every parent present at insert time, so the image
+// stays canonical.
+func TestTransformStreamOrderParentFirstCanonical(t *testing.T) {
+	layer := tarBytes(t,
+		tarEntry{name: "usr", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "a", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "a/b", typ: tar.TypeReg, mode: 0o644, body: "x"},
+	)
+	_, canonical := buildInline(t, layer)
+	if !canonical {
+		t.Fatal("parent-first ordering reported non-canonical")
+	}
+}
+
+// TestTransformOpaqueMarkerAbsentParentDiverges asserts an opaque marker whose
+// directory does not exist at marker time is a divergence: upstream resolves the
+// parent chain before clearing and errors when it is missing.
+func TestTransformOpaqueMarkerAbsentParentDiverges(t *testing.T) {
+	layer := tarBytes(t,
+		tarEntry{name: "usr", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "ghost/.wh..wh..opq", typ: tar.TypeReg, mode: 0o000},
+	)
+	_, canonical := buildInline(t, layer)
+	if canonical {
+		t.Fatal("opaque marker under an absent directory reported canonical")
+	}
+}
+
+// TestTransformDumpGoldenRootAndRun pins the observable dump for a canonical
+// fixture: exactly one "/" row carrying /usr's mtime and only the allowlisted
+// xattr, and a "/run" row that is present, empty, and carries the source mtime.
+func TestTransformDumpGoldenRootAndRun(t *testing.T) {
+	usrMtime := time.Unix(1710000000, 42)
+	const wantMtime = "1710000000.000000042"
+	layer := tarBytes(t,
+		tarEntry{
+			name: "usr", typ: tar.TypeDir, mode: 0o755, mtime: usrMtime,
+			pax: map[string]string{"SCHILY.xattr.security.capability": "cap", "SCHILY.xattr.user.foo": "bar"},
+		},
+		tarEntry{name: "run", typ: tar.TypeDir, mode: 0o755, mtime: time.Unix(1600000000, 0)},
+		tarEntry{name: "run/child", typ: tar.TypeReg, mode: 0o644, body: "x"},
+	)
+	entries, canonical := buildInline(t, layer)
+	if !canonical {
+		t.Fatal("golden fixture reported non-canonical")
+	}
+	var dump bytes.Buffer
+	if err := composefs.WriteDump(&dump, entries); err != nil {
+		t.Fatalf("WriteDump: %v", err)
+	}
+
+	var rootLine, runLine string
+	rootRows := 0
+	for _, line := range strings.Split(strings.TrimRight(dump.String(), "\n"), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		switch {
+		case fields[0] == "/":
+			rootRows++
+			rootLine = line
+		case fields[0] == "/run":
+			runLine = line
+		case strings.HasPrefix(fields[0], "/run/"):
+			t.Fatalf("/run has a surviving child row: %q", line)
+		}
+	}
+	if rootRows != 1 {
+		t.Fatalf("root rows = %d, want exactly 1\n%s", rootRows, dump.String())
+	}
+
+	// PATH SIZE MODE NLINK UID GID RDEV MTIME PAYLOAD CONTENT DIGEST [xattrs...]
+	rootFields := strings.Fields(rootLine)
+	if rootFields[2] != "40755" || rootFields[7] != wantMtime {
+		t.Fatalf("root row = %q, want dir mode 40755 and /usr mtime %s", rootLine, wantMtime)
+	}
+	if !strings.Contains(rootLine, "security.capability=cap") || strings.Contains(rootLine, "user.foo") {
+		t.Fatalf("root row xattrs = %q, want only security.capability", rootLine)
+	}
+	if runLine == "" {
+		t.Fatalf("no /run row emitted\n%s", dump.String())
+	}
+	runFields := strings.Fields(runLine)
+	if runFields[2] != "40755" || runFields[7] != wantMtime {
+		t.Fatalf("/run row = %q, want dir mode 40755 and source mtime %s", runLine, wantMtime)
 	}
 }
 
@@ -599,7 +1003,7 @@ func TestBuildEntriesOpensConsumesClosesLayerBeforeNext(t *testing.T) {
 		}, nil
 	}
 
-	if _, err := buildEntries(context.Background(), nil, openLayer, diffIDs); err != nil {
+	if _, _, err := buildEntries(context.Background(), nil, openLayer, diffIDs); err != nil {
 		t.Fatalf("buildEntries: %v", err)
 	}
 	if layerOpen {
@@ -668,6 +1072,21 @@ func assertObjectPresent(t *testing.T, store *objectstore.Store, d digest.Digest
 	}
 }
 
+// buildInline merges layers whose regular files all fit the inline threshold, so
+// no CAS store is needed, and returns the entries and the canonical flag.
+func buildInline(t *testing.T, layers ...[]byte) ([]composefs.Entry, bool) {
+	t.Helper()
+	diffIDs := make([]digest.Digest, len(layers))
+	for i, l := range layers {
+		diffIDs[i] = digest.FromBytes(l)
+	}
+	entries, canonical, err := buildEntries(context.Background(), nil, openTestLayers(t, layers...), diffIDs)
+	if err != nil {
+		t.Fatalf("buildEntries: %v", err)
+	}
+	return entries, canonical
+}
+
 func entriesByPath(entries []composefs.Entry) map[string]composefs.Entry {
 	out := make(map[string]composefs.Entry, len(entries))
 	for _, e := range entries {
@@ -713,6 +1132,8 @@ type tarEntry struct {
 	name  string
 	typ   byte
 	mode  int64
+	uid   int
+	gid   int
 	body  string
 	link  string
 	pax   map[string]string
@@ -728,6 +1149,8 @@ func tarBytes(t *testing.T, entries ...tarEntry) []byte {
 			Name:       e.name,
 			Typeflag:   e.typ,
 			Mode:       e.mode,
+			Uid:        e.uid,
+			Gid:        e.gid,
 			Linkname:   e.link,
 			Size:       int64(len(e.body)),
 			PAXRecords: e.pax,
@@ -753,4 +1176,21 @@ func tarBytes(t *testing.T, entries ...tarEntry) []byte {
 		t.Fatalf("Close tar: %v", err)
 	}
 	return buf.Bytes()
+}
+
+// TestTransformNonDirectoryParentDiverges asserts a name inserted while its
+// parent exists as a regular file is a divergence even when a later directory
+// entry replaces that file: upstream's parent walk rejects a non-directory
+// component at insert time.
+func TestTransformNonDirectoryParentDiverges(t *testing.T) {
+	layer := tarBytes(t,
+		tarEntry{name: "usr", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "a", typ: tar.TypeReg, mode: 0o644, body: "f"},
+		tarEntry{name: "a/b", typ: tar.TypeReg, mode: 0o644, body: "x"},
+		tarEntry{name: "a", typ: tar.TypeDir, mode: 0o755},
+	)
+	_, canonical := buildInline(t, layer)
+	if canonical {
+		t.Fatal("non-directory parent at insert time reported canonical")
+	}
 }

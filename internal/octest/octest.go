@@ -38,13 +38,15 @@ type Layout struct {
 	Platform   ocispec.Platform
 }
 
-// File is a regular file placed in a layer, or, when Link is set, a hardlink
-// to the earlier entry named by Link (Mode and Body are ignored).
+// File is a regular file placed in a layer, or, when Dir is set, a directory
+// entry (Body and Link are ignored), or, when Link is set, a hardlink to the
+// earlier entry named by Link (Mode and Body are ignored). Dir wins over Link.
 type File struct {
 	Name string
 	Mode int64
 	Body string
 	Link string
+	Dir  bool
 }
 
 // LayerSpec describes one layer of a built image: its files and the OCI layer
@@ -157,8 +159,12 @@ func BuildImage(dir string, images ...ImageSpec) (Layout, error) {
 				DiffIDs:  diffIDs,
 				Platform: img.Platform,
 			}
-			if f := img.Layers[0].Files; len(f) > 0 {
-				out.FileDigest = digest.SHA256.FromBytes([]byte(f[0].Body))
+			for _, f := range img.Layers[0].Files {
+				if f.Dir || f.Link != "" {
+					continue
+				}
+				out.FileDigest = digest.SHA256.FromBytes([]byte(f.Body))
+				break
 			}
 		}
 	}
@@ -194,8 +200,9 @@ func BuildImage(dir string, images ...ImageSpec) (Layout, error) {
 // layer holding files, a config for platform whose diff_id matches the layer, a
 // manifest, and index.json. It returns the descriptors a pull test asserts against,
 // with Ref pinning the manifest digest and FileDigest set to the content digest of
-// files[0] (a per-file object a successful pull materializes into the CAS when the
-// file exceeds the inline threshold; smaller files are inlined and stored no object).
+// the first regular file (a per-file object a successful pull materializes into the
+// CAS when the file exceeds the inline threshold; smaller files are inlined and
+// store no object; empty when the layer holds no regular file).
 func BuildSingleLayerGzip(dir string, platform ocispec.Platform, files ...File) (Layout, error) {
 	if len(files) == 0 {
 		return Layout{}, fmt.Errorf("octest: need at least one file")
@@ -233,6 +240,16 @@ func tarBytes(files []File) ([]byte, error) {
 		return nil, fmt.Errorf("octest: tar root header: %w", err)
 	}
 	for _, f := range files {
+		if f.Dir {
+			mode := f.Mode
+			if mode == 0 {
+				mode = 0o755
+			}
+			if err := tw.WriteHeader(&tar.Header{Name: f.Name, Typeflag: tar.TypeDir, Mode: mode}); err != nil {
+				return nil, fmt.Errorf("octest: tar header %s: %w", f.Name, err)
+			}
+			continue
+		}
 		if f.Link != "" {
 			hdr := &tar.Header{Name: f.Name, Typeflag: tar.TypeLink, Linkname: f.Link}
 			if err := tw.WriteHeader(hdr); err != nil {
