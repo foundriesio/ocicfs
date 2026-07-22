@@ -22,17 +22,22 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// InlineContentMax is the largest regular-file size, in bytes, stored inline in
+// the CONTENT column instead of by digest in the CAS.
+const InlineContentMax = 64
+
 // Entry is one node of the composefs image — one line of the composefs-dump(5)
 // stream WriteDump emits, whose fixed fields are
 //
 //	PATH SIZE MODE NLINK UID GID RDEV MTIME PAYLOAD CONTENT DIGEST [xattrs...]
 //
 // The fields below map onto those columns (see the per-field comments). WriteDump
-// fixes the columns Entry does not model: MTIME is always 0 (reproducible builds)
-// and CONTENT is always "-". knarr never inlines file content into the image:
-// every regular file is stored by digest, so its bytes live in a separate
-// fs-verity-sealed CAS object rather than in the EROFS, which is what keeps
-// per-file integrity and content dedup. An entry with Hardlink set is another
+// fixes the MTIME column at 0 (reproducible builds). A regular file is emitted one
+// of two ways. With Content set, its bytes are inlined into the EROFS (the CONTENT
+// column) and it carries no PAYLOAD or DIGEST. Otherwise it is stored by digest:
+// its bytes live in a separate fs-verity-sealed CAS object that PAYLOAD redirects
+// into and DIGEST validates, which is what keeps per-file integrity and content
+// dedup. An entry with Hardlink set is another
 // name for an earlier entry: it carries only Path and Hardlink, and mkcomposefs
 // gives both names one shared inode whose metadata and content come from the
 // target entry. mkcomposefs recomputes directory link counts but takes a leaf's
@@ -50,8 +55,9 @@ type Entry struct {
 	Xattrs   map[string]string // trailing KEY=VALUE xattr fields
 	Linkname string            // PAYLOAD, for symlinks: the link target
 	Hardlink string            // PAYLOAD, for hardlinks: absolute path of the earlier entry this name shares an inode with; when set every other field except Path is ignored
+	Content  []byte            // CONTENT, for regular files: inline file bytes; when non-nil the file is inlined and carries no Digest or Verity
 	Digest   digest.Digest     // PAYLOAD, for regular files: content digest of the backing CAS object, emitted as the "<2>/<rest>" redirect
-	Verity   digest.Digest     // DIGEST: fs-verity digest the kernel validates the backing object against; required for regular files
+	Verity   digest.Digest     // DIGEST: fs-verity digest the kernel validates the backing object against; required for by-digest regular files
 	Size     int64             // SIZE: file size (ignored for directories)
 	Devmajor int64             // RDEV (major): device number for device nodes
 	Devminor int64             // RDEV (minor): device number for device nodes
@@ -153,6 +159,14 @@ func writeDumpLine(w io.Writer, e *Entry) error {
 	if e.Mode&os.ModeDir != 0 {
 		size = 0
 	}
+	if e.Content != nil && e.Mode&os.ModeType != 0 {
+		return fmt.Errorf("entry %q has inline content but is not a regular file", e.Path)
+	}
+	if e.Mode&os.ModeType == 0 && e.Content != nil {
+		// An inlined regular file's size is exactly its inline byte count; the
+		// dump parser rejects a CONTENT length that disagrees with SIZE.
+		size = int64(len(e.Content))
+	}
 	rdev := uint64(0)
 	if e.Mode&os.ModeDevice != 0 {
 		rdev = unix.Mkdev(uint32(e.Devmajor), uint32(e.Devminor)) // #nosec G115 -- device major/minor fit in uint32
@@ -175,11 +189,28 @@ func writeDumpLine(w io.Writer, e *Entry) error {
 		if _, err := fmt.Fprintf(w, "%s - -", escapeOptionalField(e.Linkname)); err != nil {
 			return err
 		}
+	case e.Mode&os.ModeType == 0 && e.Content != nil:
+		// Inlined regular file: PAYLOAD = "-", CONTENT = the escaped inline bytes,
+		// DIGEST = "-". The bytes live in the EROFS itself, so there is no backing
+		// CAS object and no fs-verity digest to carry.
+		if e.Digest != "" || e.Verity != "" {
+			return fmt.Errorf("regular file %q has both inline content and a digest", e.Path)
+		}
+		if len(e.Content) > InlineContentMax {
+			return fmt.Errorf("regular file %q inline content is %d bytes, over the %d-byte limit", e.Path, len(e.Content), InlineContentMax)
+		}
+		content := "-"
+		if len(e.Content) > 0 {
+			content = escapeOptionalField(string(e.Content))
+		}
+		if _, err := fmt.Fprintf(w, "- %s -", content); err != nil {
+			return err
+		}
 	case e.Mode&os.ModeType == 0:
-		// Regular file: PAYLOAD = "<2>/<rest>" of the content digest (the redirect
-		// into the CAS object store), CONTENT = "-", DIGEST = the fs-verity digest
-		// the kernel validates the backing object against. Both are required: a
-		// content object with no fs-verity digest is rejected, since an image must
+		// By-digest regular file: PAYLOAD = "<2>/<rest>" of the content digest (the
+		// redirect into the CAS object store), CONTENT = "-", DIGEST = the fs-verity
+		// digest the kernel validates the backing object against. Both are required:
+		// a content object with no fs-verity digest is rejected, since an image must
 		// not carry a backing file the kernel will not enforce.
 		if e.Digest == "" {
 			return errors.New("regular file missing Digest")

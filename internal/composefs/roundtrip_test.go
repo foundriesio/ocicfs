@@ -32,7 +32,7 @@ func TestWriteImageMatchesUpstream(t *testing.T) {
 	// A tree with directories, nested files, and a symlink. The regular files are
 	// larger than the inline threshold (64 bytes) so mkcomposefs stores them by
 	// digest (payload + fs-verity digest) rather than inlining their content, which
-	// Entry does not model.
+	// parseDump does not handle.
 	src := filepath.Join(t.TempDir(), "src")
 	mustMkdirAll(t, filepath.Join(src, "dir"))
 	mustWriteFile(t, filepath.Join(src, "dir", "a.txt"), bytes.Repeat([]byte("a"), 200))
@@ -125,11 +125,95 @@ func TestWriteImageNoInlineMatchesUpstream(t *testing.T) {
 	}
 }
 
+// TestWriteImageInlineContentRoundTrip proves an inlined regular file survives a
+// build-and-dump cycle: WriteImage runs mkcomposefs on a dump carrying inline
+// CONTENT, and composefs-info dumps the resulting image back with the same bytes in
+// the CONTENT column (payload and digest empty). The content mixes bytes that must
+// be escaped — space, newline, tab, backslash — so the escape round-trip is
+// exercised too. Needs mkcomposefs and composefs-info on PATH.
+func TestWriteImageInlineContentRoundTrip(t *testing.T) {
+	lookPathOrSkip(t, "mkcomposefs") // WriteImage invokes it internally
+	cfsInfo := lookPathOrSkip(t, "composefs-info")
+
+	const payload = "k=v x\n\t\\end"
+	out := filepath.Join(t.TempDir(), "inline.cfs")
+	if err := WriteImage(context.Background(), out, []Entry{
+		{Path: "/cfg", Mode: 0o644, Content: []byte(payload)},
+	}); err != nil {
+		t.Fatalf("WriteImage: %v", err)
+	}
+
+	if got := inlineContentOf(t, runCmd(t, cfsInfo, "dump", out), "/cfg"); got != payload {
+		t.Fatalf("inline content did not survive round-trip: got %q, want %q", got, payload)
+	}
+}
+
+// inlineContentOf returns the decoded inline bytes of path from a composefs-info
+// dump, asserting the line carries inline content (payload and digest are "-").
+func inlineContentOf(t *testing.T, dump, path string) string {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimRight(dump, "\n"), "\n") {
+		f := strings.Split(line, " ")
+		if len(f) < 11 || f[0] != path {
+			continue
+		}
+		if f[8] != "-" || f[10] != "-" {
+			t.Fatalf("%s is not inline (payload=%q digest=%q)", path, f[8], f[10])
+		}
+		if f[9] == "-" {
+			t.Fatalf("%s carries no inline content", path)
+		}
+		return unescapeField(t, f[9])
+	}
+	t.Fatalf("%s not found in dump:\n%s", path, dump)
+	return ""
+}
+
+// unescapeField decodes a composefs-dump field — the inverse of the writer's
+// escaping for the sequences the dump emits (\\, \n, \r, \t, \xHH).
+func unescapeField(t *testing.T, s string) string {
+	t.Helper()
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\\' {
+			b.WriteByte(s[i])
+			continue
+		}
+		i++
+		if i >= len(s) {
+			t.Fatalf("dangling escape in %q", s)
+		}
+		switch s[i] {
+		case '\\':
+			b.WriteByte('\\')
+		case 'n':
+			b.WriteByte('\n')
+		case 'r':
+			b.WriteByte('\r')
+		case 't':
+			b.WriteByte('\t')
+		case 'x':
+			if i+2 >= len(s) {
+				t.Fatalf("truncated hex escape in %q", s)
+			}
+			v, err := strconv.ParseUint(s[i+1:i+3], 16, 8)
+			if err != nil {
+				t.Fatalf("bad hex escape in %q: %v", s, err)
+			}
+			b.WriteByte(byte(v))
+			i += 2
+		default:
+			t.Fatalf("unknown escape \\%c in %q", s[i], s)
+		}
+	}
+	return b.String()
+}
+
 // parseDump converts a composefs-info dump back into the Entry inventory that
 // produced it — the inverse of WriteDump for the node types this test generates
 // (directories, by-digest regular files, symlinks). It is deliberately strict:
 // inline content, hardlinks, or xattrs (none of which the fixture produces, and
-// which Entry does not model) fail the test rather than silently round-tripping
+// which it does not parse) fail the test rather than silently round-tripping
 // something other than what was dumped.
 func parseDump(t *testing.T, dump string) []Entry {
 	t.Helper()

@@ -6,6 +6,7 @@ package composefs
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -112,6 +113,132 @@ func TestWriteDumpRejectsRelativeHardlinkTarget(t *testing.T) {
 	err := WriteDump(&bytes.Buffer{}, []Entry{{Path: "/link", Hardlink: "target"}})
 	if err == nil {
 		t.Fatal("expected error for non-absolute hardlink target")
+	}
+}
+
+// TestWriteDumpInlineContent covers a small regular file whose bytes are inlined
+// into the CONTENT column, with no PAYLOAD or DIGEST.
+func TestWriteDumpInlineContent(t *testing.T) {
+	var got bytes.Buffer
+	if err := WriteDump(&got, []Entry{
+		{Path: "/f", Mode: 0o644, Content: []byte("hi")},
+	}); err != nil {
+		t.Fatalf("WriteDump: %v", err)
+	}
+	want := "/ 0 40755 1 0 0 0 0.000000000 - - -\n" +
+		"/f 2 100644 1 0 0 0 0.000000000 - hi -\n"
+	if got.String() != want {
+		t.Errorf("WriteDump mismatch:\n got:\n%s\nwant:\n%s", got.String(), want)
+	}
+}
+
+// TestWriteDumpInlineContentEscaping checks the CONTENT column applies the dump
+// escape rules: space, newline, carriage return, backslash, a non-ASCII byte,
+// DEL, and NUL are escaped, while a literal '=' and '-' inside the value are not
+// (only a lone '-' field is).
+func TestWriteDumpInlineContentEscaping(t *testing.T) {
+	var got bytes.Buffer
+	if err := WriteDump(&got, []Entry{
+		{Path: "/f", Mode: 0o644, Content: []byte("a=b c\n\r\\-\x00\xff\x7f")},
+	}); err != nil {
+		t.Fatalf("WriteDump: %v", err)
+	}
+	wantLine := "/f 12 100644 1 0 0 0 0.000000000 - " + `a=b\x20c\n\r\\-\x00\xff\x7f` + " -\n"
+	if out := got.String(); !strings.Contains(out, wantLine) {
+		t.Errorf("inline content escaping mismatch:\n got:\n%s\nwant line:\n%s", out, wantLine)
+	}
+}
+
+// TestWriteDumpInlineContentNonRegular checks that inline content on a
+// non-regular node type is rejected rather than silently dropped. (A hardlink
+// entry is exempt by contract: every field except Path and Hardlink is ignored.)
+func TestWriteDumpInlineContentNonRegular(t *testing.T) {
+	for _, e := range []Entry{
+		{Path: "/d", Mode: os.ModeDir | 0o755, Content: []byte("x")},
+		{Path: "/l", Mode: os.ModeSymlink | 0o777, Linkname: "t", Content: []byte("x")},
+	} {
+		if err := WriteDump(io.Discard, []Entry{e}); err == nil {
+			t.Errorf("entry %q: inline content on a non-regular entry should error", e.Path)
+		}
+	}
+}
+
+// TestWriteDumpInlineContentDash checks that inline content that is a single '-'
+// byte is escaped, so it is not read back as the "no content" sentinel.
+func TestWriteDumpInlineContentDash(t *testing.T) {
+	var got bytes.Buffer
+	if err := WriteDump(&got, []Entry{
+		{Path: "/d", Mode: 0o644, Content: []byte("-")},
+	}); err != nil {
+		t.Fatalf("WriteDump: %v", err)
+	}
+	if out := got.String(); !strings.Contains(out, "/d 1 100644 1 0 0 0 0.000000000 - \\x2d -\n") {
+		t.Errorf("lone '-' inline content should be escaped:\n%s", out)
+	}
+}
+
+// TestWriteDumpInlineContentZeroLength checks that a zero-length inline file emits
+// the same "- - -" row as a metadata-only empty file (no content, payload, digest).
+func TestWriteDumpInlineContentZeroLength(t *testing.T) {
+	var got bytes.Buffer
+	if err := WriteDump(&got, []Entry{
+		{Path: "/empty", Mode: 0o644, Content: []byte{}},
+	}); err != nil {
+		t.Fatalf("WriteDump: %v", err)
+	}
+	want := "/ 0 40755 1 0 0 0 0.000000000 - - -\n" +
+		"/empty 0 100644 1 0 0 0 0.000000000 - - -\n"
+	if got.String() != want {
+		t.Errorf("WriteDump mismatch:\n got:\n%s\nwant:\n%s", got.String(), want)
+	}
+}
+
+// TestWriteDumpInlineContentBoundary checks that content exactly at the inline
+// limit is accepted and emitted inline.
+func TestWriteDumpInlineContentBoundary(t *testing.T) {
+	var got bytes.Buffer
+	content := bytes.Repeat([]byte("x"), InlineContentMax)
+	if err := WriteDump(&got, []Entry{
+		{Path: "/f", Mode: 0o644, Content: content},
+	}); err != nil {
+		t.Fatalf("WriteDump: %v", err)
+	}
+	wantLine := "/f 64 100644 1 0 0 0 0.000000000 - " + string(content) + " -\n"
+	if out := got.String(); !strings.Contains(out, wantLine) {
+		t.Errorf("boundary inline content mismatch:\n got:\n%s\nwant line:\n%s", out, wantLine)
+	}
+}
+
+// TestWriteDumpRejectsOversizedInlineContent asserts content over the inline limit
+// is a writer error rather than being inlined past the format's cap.
+func TestWriteDumpRejectsOversizedInlineContent(t *testing.T) {
+	err := WriteDump(&bytes.Buffer{}, []Entry{
+		{Path: "/f", Mode: 0o644, Content: bytes.Repeat([]byte("x"), InlineContentMax+1)},
+	})
+	if err == nil {
+		t.Fatal("expected error for inline content over the limit")
+	}
+}
+
+// TestWriteDumpRejectsInlineContentWithDigest asserts a regular file cannot carry
+// both inline content and a by-digest reference.
+func TestWriteDumpRejectsInlineContentWithDigest(t *testing.T) {
+	err := WriteDump(&bytes.Buffer{}, []Entry{
+		{Path: "/f", Mode: 0o644, Content: []byte("x"), Digest: d('1'), Verity: d('a')},
+	})
+	if err == nil {
+		t.Fatal("expected error for a regular file with both inline content and a digest")
+	}
+}
+
+// TestWriteDumpRejectsRegularFileWithNeither asserts a regular file with neither
+// inline content nor a digest is rejected.
+func TestWriteDumpRejectsRegularFileWithNeither(t *testing.T) {
+	err := WriteDump(&bytes.Buffer{}, []Entry{
+		{Path: "/f", Mode: 0o644},
+	})
+	if err == nil {
+		t.Fatal("expected error for a regular file with neither content nor a digest")
 	}
 }
 
