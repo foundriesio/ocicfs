@@ -138,6 +138,12 @@ disagrees, and fails closed without recording the image. The e2e suite runs
 the same tamper check automatically in both directions — against a fresh pull
 and against a restart over an already-stored image.
 
+`scripts/seal-crosscheck.sh <image-uri>` verifies the sealed digest for any
+image (current platform of an index) against two independent implementations:
+`cfsctl oci compute-id` must reproduce it bit-for-bit, and a third build from
+an `umoci` flatten through `mkcomposefs` must agree at least on the full tree
+(bit-for-bit when the image carries no hardlinks — see the script header).
+
 ## Authority boundary
 
 Sealing establishes **publisher-side consistency**: it proves the recorded

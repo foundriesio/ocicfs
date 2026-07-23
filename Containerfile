@@ -168,6 +168,19 @@ RUN arch="$(dpkg --print-architecture)" \
  && zot --version
 COPY .devcontainer/zot-config.json /etc/zot/config.json
 
+# umoci: a pinned OCI image unpacker, the independent flattener the
+# seal-crosscheck script uses for its third comparison leg. Built from the
+# pinned tag's vendored sources (release binaries are amd64-only and
+# `go install` rejects its replace directives); the build asserts the
+# checkout landed on the pinned commit.
+ARG UMOCI_VERSION=v0.4.7
+ARG UMOCI_COMMIT=17f38511d61846e2fb8ec01a1532f3ef5525e71d
+RUN git clone --depth 1 --branch "${UMOCI_VERSION}" https://github.com/opencontainers/umoci /tmp/umoci \
+ && test "$(git -C /tmp/umoci rev-parse HEAD)" = "${UMOCI_COMMIT}" \
+ && (cd /tmp/umoci && go build -mod=vendor -o /usr/bin/umoci ./cmd/umoci) \
+ && rm -rf /tmp/umoci \
+ && umoci --version
+
 # Share the toolchain caches with bind-mounted workspaces.
 ENV GOMODCACHE=/go/pkg/mod
 ENV GOCACHE=/root/.cache/go-build
