@@ -43,6 +43,12 @@ type Image struct {
 	Canonical      bool
 }
 
+// ObjectSink records a regular file's content and returns its content digest
+// and fs-verity digest formatted as "sha256:<hex>".
+type ObjectSink interface {
+	WriteObject(ctx context.Context, r io.Reader) (digest.Digest, string, error)
+}
+
 // Assemble merges decompressed layer tar streams, writes regular files larger
 // than the inline threshold to CAS (smaller ones ride inline in the image),
 // generates a composefs image, stores it in CAS, and returns its descriptor
@@ -56,7 +62,7 @@ func Assemble(ctx context.Context, store *objectstore.Store, openLayer func(int)
 	if store == nil {
 		return Image{}, errors.New("rootfs: nil CAS store")
 	}
-	entries, canonical, err := buildEntries(ctx, store, openLayer, diffIDs)
+	entries, canonical, err := BuildEntries(ctx, store, openLayer, diffIDs)
 	if err != nil {
 		return Image{}, err
 	}
@@ -161,11 +167,11 @@ type node struct {
 	link      *node
 }
 
-// buildEntries applies every layer in order into one tree, synthesises any
+// BuildEntries applies every layer in order into one tree, synthesises any
 // missing parent directories, applies the canonical tree transforms, and
 // returns the merged composefs inventory. The bool reports whether the tree was
 // built without any divergence from the upstream-reproducible construction.
-func buildEntries(ctx context.Context, store *objectstore.Store, openLayer func(int) (io.ReadCloser, error), diffIDs []digest.Digest) ([]composefs.Entry, bool, error) {
+func BuildEntries(ctx context.Context, sink ObjectSink, openLayer func(int) (io.ReadCloser, error), diffIDs []digest.Digest) ([]composefs.Entry, bool, error) {
 	if openLayer == nil {
 		return nil, false, errors.New("rootfs: nil layer opener")
 	}
@@ -180,7 +186,7 @@ func buildEntries(ctx context.Context, store *objectstore.Store, openLayer func(
 			return nil, false, fmt.Errorf("rootfs: layer[%d] is nil", i)
 		}
 
-		layerDiverged, applyErr := applyLayer(ctx, store, tree, layer, id, i)
+		layerDiverged, applyErr := applyLayer(ctx, sink, tree, layer, id, i)
 		closeErr := layer.Close()
 		if closeErr != nil {
 			closeErr = fmt.Errorf("rootfs: layer %d: close: %w", i, closeErr)
@@ -209,7 +215,7 @@ func buildEntries(ctx context.Context, store *objectstore.Store, openLayer func(
 // construction: an entry (or marker) reached a name whose immediate parent was
 // absent at that moment — upstream errors there while knarr synthesises the
 // parent later — or an opaque marker cleared same-layer content.
-func applyLayer(ctx context.Context, store *objectstore.Store, tree map[string]*node, layer io.Reader, diffID digest.Digest, idx int) (bool, error) {
+func applyLayer(ctx context.Context, sink ObjectSink, tree map[string]*node, layer io.Reader, diffID digest.Digest, idx int) (bool, error) {
 	h := sha256.New()
 	teed := io.TeeReader(&ctxReader{ctx: ctx, r: layer}, h)
 	tr := tar.NewReader(teed)
@@ -262,7 +268,7 @@ func applyLayer(ctx context.Context, store *objectstore.Store, tree map[string]*
 			continue
 		}
 
-		if err := applyHeader(ctx, store, tree, tr, hdr, name, idx); err != nil {
+		if err := applyHeader(ctx, sink, tree, tr, hdr, name, idx); err != nil {
 			return false, fmt.Errorf("rootfs: layer %d: %w", idx, err)
 		}
 	}
@@ -277,12 +283,12 @@ func applyLayer(ctx context.Context, store *objectstore.Store, tree map[string]*
 
 // applyHeader merges a single tar entry into tree: a regular file of at most
 // composefs.InlineContentMax bytes has its bytes read inline, a larger one
-// streams from tr into CAS (recording its content and fs-verity digests), a
-// hardlink becomes another name of its target's inode, and the remaining types
-// become metadata-only nodes. Every node type carries the tar entry's
-// modification time. Whiteout and opaque markers are handled by the caller
-// before this is reached.
-func applyHeader(ctx context.Context, store *objectstore.Store, tree map[string]*node, tr *tar.Reader, hdr *tar.Header, name string, idx int) error {
+// streams from tr into the object sink (recording its content and fs-verity
+// digests), a hardlink becomes another name of its target's inode, and the
+// remaining types become metadata-only nodes. Every node type carries the tar
+// entry's modification time. Whiteout and opaque markers are handled by the
+// caller before this is reached.
+func applyHeader(ctx context.Context, sink ObjectSink, tree map[string]*node, tr *tar.Reader, hdr *tar.Header, name string, idx int) error {
 	// A non-directory entry replaces whatever occupied name. If that was a
 	// directory, its children lose their parent, so drop the whole subtree
 	// before inserting the replacement (last-writer-wins, matching overlay
@@ -317,10 +323,10 @@ func applyHeader(ctx context.Context, store *objectstore.Store, tree map[string]
 			}
 			return nil
 		}
-		if store == nil {
-			return errors.New("regular file requires CAS store")
+		if sink == nil {
+			return errors.New("regular file requires object sink")
 		}
-		d, fsv, err := store.WriteObject(ctx, tr)
+		d, fsv, err := sink.WriteObject(ctx, tr)
 		if err != nil {
 			return fmt.Errorf("write object for %s: %w", name, err)
 		}

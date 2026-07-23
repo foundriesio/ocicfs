@@ -165,7 +165,7 @@ func TestLinkHardlinkTargetChecks(t *testing.T) {
 
 func TestBuildEntriesRejectsEscapingName(t *testing.T) {
 	layer := tarBytes(t, tarEntry{name: "../../x", typ: tar.TypeDir, mode: 0o755})
-	_, _, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	_, _, err := BuildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	if err == nil {
 		t.Fatal("expected escaping path error")
 	}
@@ -176,7 +176,7 @@ func TestBuildEntriesHardlinkToSymlink(t *testing.T) {
 		tarEntry{name: "target", typ: tar.TypeSymlink, mode: 0o777, link: "somewhere"},
 		tarEntry{name: "link", typ: tar.TypeLink, link: "target"},
 	)
-	entries, _, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	entries, _, err := BuildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	if err != nil {
 		t.Fatalf("buildEntries: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestBuildEntriesRejectsForwardHardlink(t *testing.T) {
 		tarEntry{name: "link", typ: tar.TypeLink, link: "target"},
 		tarEntry{name: "target", typ: tar.TypeSymlink, mode: 0o777, link: "somewhere"},
 	)
-	_, _, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	_, _, err := BuildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	if err == nil {
 		t.Fatal("expected missing hardlink target error")
 	}
@@ -205,7 +205,7 @@ func TestBuildEntriesRejectsForwardHardlink(t *testing.T) {
 func TestBuildEntriesChecksDiffID(t *testing.T) {
 	layer := tarBytes(t, tarEntry{name: "dir", typ: tar.TypeDir, mode: 0o755})
 	wrong := digest.SHA256.FromString("wrong")
-	_, _, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{wrong})
+	_, _, err := BuildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{wrong})
 	if err == nil {
 		t.Fatal("expected diff_id mismatch")
 	}
@@ -230,7 +230,7 @@ func TestBuildEntriesWithStore(t *testing.T) {
 		tarEntry{name: "var/lib/.wh..wh..opq", typ: tar.TypeReg, mode: 0o000},
 		tarEntry{name: "var/lib/new", typ: tar.TypeReg, mode: 0o644, body: "new"},
 	)
-	entries, _, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
+	entries, _, err := BuildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
 		digest.FromBytes(layer1),
 		digest.FromBytes(layer2),
 	})
@@ -284,7 +284,7 @@ func TestContentSizeMergedTree(t *testing.T) {
 		tarEntry{name: "app-copy", typ: tar.TypeLink, link: "usr/bin/app"},
 		tarEntry{name: "var/.wh.junk", typ: tar.TypeReg, mode: 0o000},
 	)
-	entries, _, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
+	entries, _, err := BuildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
 		digest.FromBytes(layer1),
 		digest.FromBytes(layer2),
 	})
@@ -311,7 +311,7 @@ func TestBuildEntriesHardlinkSurvivesTargetWhiteout(t *testing.T) {
 	layer2 := tarBytes(t,
 		tarEntry{name: "bin/.wh.app", typ: tar.TypeReg, mode: 0o000},
 	)
-	entries, _, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
+	entries, _, err := BuildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
 		digest.FromBytes(layer1),
 		digest.FromBytes(layer2),
 	})
@@ -344,7 +344,7 @@ func TestBuildEntriesHardlinkTargetReplaced(t *testing.T) {
 	layer2 := tarBytes(t,
 		tarEntry{name: "bin/app", typ: tar.TypeReg, mode: 0o755, body: large("v2")},
 	)
-	entries, _, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
+	entries, _, err := BuildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
 		digest.FromBytes(layer1),
 		digest.FromBytes(layer2),
 	})
@@ -372,7 +372,7 @@ func TestBuildEntriesModifyWithoutWhiteout(t *testing.T) {
 	layer2 := tarBytes(t,
 		tarEntry{name: "etc/config", typ: tar.TypeReg, mode: 0o600, body: large("v2"), pax: map[string]string{"SCHILY.xattr.security.capability": "cap"}},
 	)
-	entries, _, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
+	entries, _, err := BuildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
 		digest.FromBytes(layer1),
 		digest.FromBytes(layer2),
 	})
@@ -402,7 +402,7 @@ func TestBuildEntriesReplaceDirWithFile(t *testing.T) {
 	layer2 := tarBytes(t,
 		tarEntry{name: "lib", typ: tar.TypeSymlink, mode: 0o777, link: "usr/lib"},
 	)
-	entries, _, err := buildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
+	entries, _, err := BuildEntries(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
 		digest.FromBytes(layer1),
 		digest.FromBytes(layer2),
 	})
@@ -439,7 +439,7 @@ func TestBuildEntriesInlinesSmallFiles(t *testing.T) {
 		te = append(te, tarEntry{name: f.name, typ: tar.TypeReg, mode: 0o644, body: f.body})
 	}
 	layer := tarBytes(t, te...)
-	entries, _, err := buildEntries(context.Background(), store, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	entries, _, err := BuildEntries(context.Background(), store, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	skipIfNoVerity(t, err)
 	if err != nil {
 		t.Fatalf("buildEntries: %v", err)
@@ -476,7 +476,7 @@ func TestBuildEntriesHardlinkToInlinedFile(t *testing.T) {
 		tarEntry{name: "cfg", typ: tar.TypeReg, mode: 0o644, body: "k=v\n"},
 		tarEntry{name: "cfg2", typ: tar.TypeLink, link: "cfg"},
 	)
-	entries, _, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	entries, _, err := BuildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	if err != nil {
 		t.Fatalf("buildEntries: %v", err)
 	}
@@ -508,7 +508,7 @@ func TestBuildEntriesPreservesMtimes(t *testing.T) {
 		tarEntry{name: "sym", typ: tar.TypeSymlink, mode: 0o777, link: "etc/config", mtime: time.Unix(1500000000, 0)},
 		tarEntry{name: "fifo", typ: tar.TypeFifo, mode: 0o644, mtime: time.Unix(1400000000, 0)},
 	)
-	entries, _, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	entries, _, err := BuildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	if err != nil {
 		t.Fatalf("buildEntries: %v", err)
 	}
@@ -541,7 +541,7 @@ func TestBuildEntriesPreservesMtimes(t *testing.T) {
 // since the composefs-dump parser reads the MTIME column as unsigned.
 func TestBuildEntriesClampsPreEpochMtime(t *testing.T) {
 	layer := tarBytes(t, tarEntry{name: "f", typ: tar.TypeReg, mode: 0o644, body: "x", mtime: time.Unix(-5, 0)})
-	entries, _, err := buildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
+	entries, _, err := BuildEntries(context.Background(), nil, openTestLayers(t, layer), []digest.Digest{digest.FromBytes(layer)})
 	if err != nil {
 		t.Fatalf("buildEntries: %v", err)
 	}
@@ -1003,7 +1003,7 @@ func TestBuildEntriesOpensConsumesClosesLayerBeforeNext(t *testing.T) {
 		}, nil
 	}
 
-	if _, _, err := buildEntries(context.Background(), nil, openLayer, diffIDs); err != nil {
+	if _, _, err := BuildEntries(context.Background(), nil, openLayer, diffIDs); err != nil {
 		t.Fatalf("buildEntries: %v", err)
 	}
 	if layerOpen {
@@ -1080,7 +1080,7 @@ func buildInline(t *testing.T, layers ...[]byte) ([]composefs.Entry, bool) {
 	for i, l := range layers {
 		diffIDs[i] = digest.FromBytes(l)
 	}
-	entries, canonical, err := buildEntries(context.Background(), nil, openTestLayers(t, layers...), diffIDs)
+	entries, canonical, err := BuildEntries(context.Background(), nil, openTestLayers(t, layers...), diffIDs)
 	if err != nil {
 		t.Fatalf("buildEntries: %v", err)
 	}
