@@ -8,8 +8,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -148,7 +151,7 @@ func TestSealBareManifestDryRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("name.NewRepository: %v", err)
 	}
-	result, err := seal(context.Background(), src, repo, layout.Root, nil, true)
+	result, err := seal(context.Background(), src, repo, layout.Root, nil, nil, true)
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
@@ -275,13 +278,148 @@ func TestSealGoldenDigest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("name.NewRepository: %v", err)
 	}
-	result, err := seal(context.Background(), src, repo, layout.Root, nil, true)
+	result, err := seal(context.Background(), src, repo, layout.Root, nil, nil, true)
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
 	const want = "sha256:9238176e13729b9215caf137866624e2f0d053c6e440e5446c824799d1d00123"
 	if result.Platforms[0].MergedFsverity != want {
 		t.Fatalf("merged fs-verity = %s, want %s", result.Platforms[0].MergedFsverity, want)
+	}
+}
+
+func TestSealIndexPreservesUnknownFieldsAndAttestation(t *testing.T) {
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skipf("mkcomposefs unavailable: %v", err)
+	}
+	registry := octest.NewRegistry()
+	t.Cleanup(registry.Close)
+	oldTransport := remote.DefaultTransport
+	remote.DefaultTransport = registry.Transport()
+	t.Cleanup(func() {
+		remote.DefaultTransport = oldTransport
+	})
+
+	amdPlatform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	armPlatform := ocispec.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"}
+	amdFixture := buildIndexImage(t, amdPlatform, "amd64")
+	armFixture := buildIndexImage(t, armPlatform, "arm64")
+	amdImage := layoutImage(t, amdFixture)
+	armImage := layoutImage(t, armFixture)
+	pushImage(t, registry, "registry.example.com/team/multi:amd64", amdImage)
+	pushImage(t, registry, "registry.example.com/team/multi:arm64", armImage)
+
+	amdDesc := imageDescriptor(t, amdImage, amdPlatform)
+	armDesc := imageDescriptor(t, armImage, armPlatform)
+	repo, err := name.NewRepository("registry.example.com/team/multi")
+	if err != nil {
+		t.Fatalf("name.NewRepository: %v", err)
+	}
+	// The shape Docker Hub publishes: an attestation manifest carries a regular
+	// image config and is distinguishable from an image only by its layer types.
+	attestationDesc := pushDocument(t, repo, map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     ocispec.MediaTypeImageManifest,
+		"config": map[string]any{
+			"mediaType": ocispec.MediaTypeImageConfig,
+			"digest":    "sha256:" + strings.Repeat("c", 64),
+			"size":      json.Number("233"),
+		},
+		"layers": []any{map[string]any{
+			"mediaType": "application/vnd.in-toto+json",
+			"digest":    "sha256:" + strings.Repeat("d", 64),
+			"size":      json.Number("1024"),
+		}},
+		"annotations": map[string]any{
+			"vnd.docker.reference.type": "attestation-manifest",
+		},
+	}, ocispec.MediaTypeImageManifest)
+	indexDoc := map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     ocispec.MediaTypeImageIndex,
+		"annotations":   map[string]any{"vendor.index": "kept"},
+		"x-vendor-index": map[string]any{
+			"number": json.Number("9007199254740993"),
+		},
+		"manifests": []any{
+			descriptorDocument(amdDesc, map[string]any{"x-vendor-descriptor": "amd"}),
+			descriptorDocument(armDesc, map[string]any{"x-vendor-descriptor": "arm"}),
+			map[string]any{
+				"mediaType": ocispec.MediaTypeImageManifest,
+				"digest":    attestationDesc.Digest.String(),
+				"size":      json.Number(fmt.Sprint(attestationDesc.Size)),
+				"platform":  map[string]any{"os": "unknown", "architecture": "unknown"},
+				"annotations": map[string]any{
+					"vnd.docker.reference.type": "attestation-manifest",
+					"vendor.attestation":        "kept",
+				},
+				"x-attestation": map[string]any{"kept": true},
+			},
+		},
+	}
+	rawIndex, err := json.Marshal(indexDoc)
+	if err != nil {
+		t.Fatalf("marshal index: %v", err)
+	}
+	root := digest.FromBytes(rawIndex)
+	if err := putManifest(context.Background(), repo.Digest(root.String()), rawIndex, ocispec.MediaTypeImageIndex); err != nil {
+		t.Fatalf("push index: %v", err)
+	}
+
+	// One platform per call: seal amd64, then arm64 on the digest the first
+	// call produced. Each intermediate index is a valid, partially sealed
+	// state.
+	first, err := Seal(context.Background(), "registry.example.com/team/multi@"+root.String(), Options{Platform: "linux/amd64"})
+	if err != nil {
+		t.Fatalf("Seal amd64: %v", err)
+	}
+	if len(first.Platforms) != 1 || first.Platforms[0].Platform.Architecture != "amd64" {
+		t.Fatalf("first result platforms = %#v, want one amd64 entry", first.Platforms)
+	}
+	originalDescriptors := indexDoc["manifests"].([]any)
+	firstRaw := fetchRawManifest(t, registry, "registry.example.com/team/multi@"+first.Sealed.String())
+	firstDoc, err := decodeDocument(firstRaw)
+	if err != nil {
+		t.Fatalf("decode first sealed index: %v", err)
+	}
+	firstDescriptors := firstDoc["manifests"].([]any)
+	if firstDescriptors[0].(map[string]any)["digest"] == originalDescriptors[0].(map[string]any)["digest"] {
+		t.Fatal("amd64 descriptor was not rewritten")
+	}
+	if !documentsEqual(t, firstDescriptors[1], originalDescriptors[1]) {
+		t.Fatal("unsealed arm64 descriptor changed in the amd64 call")
+	}
+	if !documentsEqual(t, firstDescriptors[2], originalDescriptors[2]) {
+		t.Fatal("attestation descriptor changed in the amd64 call")
+	}
+
+	result, err := Seal(context.Background(), "registry.example.com/team/multi@"+first.Sealed.String(), Options{Platform: "linux/arm64/v8"})
+	if err != nil {
+		t.Fatalf("Seal arm64: %v", err)
+	}
+	sealedRaw := fetchRawManifest(t, registry, "registry.example.com/team/multi@"+result.Sealed.String())
+	sealedDoc, err := decodeDocument(sealedRaw)
+	if err != nil {
+		t.Fatalf("decode sealed index: %v", err)
+	}
+	if sealedDoc["annotations"].(map[string]any)["vendor.index"] != "kept" {
+		t.Fatal("index annotation was not preserved")
+	}
+	if got := sealedDoc["x-vendor-index"].(map[string]any)["number"].(json.Number).String(); got != "9007199254740993" {
+		t.Fatalf("vendor number = %s", got)
+	}
+	sealedDescriptors := sealedDoc["manifests"].([]any)
+	for i := 0; i < 2; i++ {
+		got := sealedDescriptors[i].(map[string]any)
+		if got["digest"] == originalDescriptors[i].(map[string]any)["digest"] {
+			t.Fatalf("platform descriptor %d digest was not rewritten", i)
+		}
+		if got["x-vendor-descriptor"] != originalDescriptors[i].(map[string]any)["x-vendor-descriptor"] {
+			t.Fatalf("platform descriptor %d vendor field changed", i)
+		}
+	}
+	if !documentsEqual(t, sealedDescriptors[2], originalDescriptors[2]) {
+		t.Fatal("attestation descriptor changed")
 	}
 }
 
@@ -300,34 +438,113 @@ func TestSealDeclinesNonCanonical(t *testing.T) {
 		t.Fatalf("name.NewRepository: %v", err)
 	}
 	for _, dryRun := range []bool{false, true} {
-		_, err := seal(context.Background(), src, repo, layout.Root, nil, dryRun)
+		_, err := seal(context.Background(), src, repo, layout.Root, nil, nil, dryRun)
 		if !errors.Is(err, ErrNotCanonical) {
 			t.Fatalf("dryRun=%v: err = %v, want ErrNotCanonical", dryRun, err)
 		}
 	}
 }
 
-func TestSealIndexDeclines(t *testing.T) {
+func TestSealMixedIndexDeclinesAndPushesNothing(t *testing.T) {
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skipf("mkcomposefs unavailable: %v", err)
+	}
 	registry := octest.NewRegistry()
 	t.Cleanup(registry.Close)
+	counter := &putCounter{inner: registry.Transport()}
 	oldTransport := remote.DefaultTransport
-	remote.DefaultTransport = registry.Transport()
+	remote.DefaultTransport = counter
 	t.Cleanup(func() {
 		remote.DefaultTransport = oldTransport
 	})
 
-	repo, err := name.NewRepository("registry.example.com/team/index")
+	amdPlatform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	armPlatform := ocispec.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"}
+	amdFixture := buildIndexImage(t, amdPlatform, "amd64")
+	armFixture := nonCanonicalLayout(t, armPlatform)
+	amdImage := layoutImage(t, amdFixture)
+	armImage := layoutImage(t, armFixture)
+	pushImage(t, registry, "registry.example.com/team/mixed:amd64", amdImage)
+	pushImage(t, registry, "registry.example.com/team/mixed:arm64", armImage)
+
+	repo, err := name.NewRepository("registry.example.com/team/mixed")
 	if err != nil {
 		t.Fatalf("name.NewRepository: %v", err)
 	}
-	index := pushDocument(t, repo, map[string]any{
+	amdDesc := imageDescriptor(t, amdImage, amdPlatform)
+	armDesc := imageDescriptor(t, armImage, armPlatform)
+	indexDoc := map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     ocispec.MediaTypeImageIndex,
+		"manifests": []any{
+			descriptorDocument(amdDesc, nil),
+			descriptorDocument(armDesc, nil),
+		},
+	}
+	root := pushDocument(t, repo, indexDoc, ocispec.MediaTypeImageIndex)
+
+	// The non-canonical platform declines without writing anything; the
+	// canonical sibling seals fine in its own call — a decline is per
+	// platform, not per index.
+	counter.puts.Store(0)
+	_, err = Seal(context.Background(), "registry.example.com/team/mixed@"+root.Digest.String(), Options{Platform: "linux/arm64/v8", Tag: "sealed"})
+	if !errors.Is(err, ErrNotCanonical) {
+		t.Fatalf("Seal err = %v, want ErrNotCanonical", err)
+	}
+	if got := counter.puts.Load(); got != 0 {
+		t.Fatalf("declined seal issued %d PUT requests, want 0", got)
+	}
+	tag, err := name.NewTag("registry.example.com/team/mixed:sealed")
+	if err != nil {
+		t.Fatalf("name.NewTag: %v", err)
+	}
+	if _, err := remote.Get(tag, remote.WithTransport(registry.Transport())); err == nil {
+		t.Fatal("declined seal tagged the image")
+	}
+
+	sealed, err := Seal(context.Background(), "registry.example.com/team/mixed@"+root.Digest.String(), Options{Platform: "linux/amd64"})
+	if err != nil {
+		t.Fatalf("Seal canonical sibling: %v", err)
+	}
+	if sealed.Sealed == root.Digest {
+		t.Fatal("sealing the canonical platform did not change the index")
+	}
+}
+
+func TestSealNestedIndexDeclines(t *testing.T) {
+	registry := octest.NewRegistry()
+	t.Cleanup(registry.Close)
+	counter := &putCounter{inner: registry.Transport()}
+	oldTransport := remote.DefaultTransport
+	remote.DefaultTransport = counter
+	t.Cleanup(func() {
+		remote.DefaultTransport = oldTransport
+	})
+
+	repo, err := name.NewRepository("registry.example.com/team/nested")
+	if err != nil {
+		t.Fatalf("name.NewRepository: %v", err)
+	}
+	inner := pushDocument(t, repo, map[string]any{
 		"schemaVersion": 2,
 		"mediaType":     ocispec.MediaTypeImageIndex,
 		"manifests":     []any{},
 	}, ocispec.MediaTypeImageIndex)
-	_, err = Seal(context.Background(), "registry.example.com/team/index@"+index.Digest.String(), Options{})
-	if err == nil || !strings.Contains(err.Error(), "names an image index") {
-		t.Fatalf("Seal err = %v, want an index decline", err)
+	innerDesc := rawDescriptor(inner)
+	innerDesc["platform"] = map[string]any{"os": "linux", "architecture": "amd64"}
+	outer := pushDocument(t, repo, map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     ocispec.MediaTypeImageIndex,
+		"manifests":     []any{innerDesc},
+	}, ocispec.MediaTypeImageIndex)
+
+	counter.puts.Store(0)
+	_, err = Seal(context.Background(), "registry.example.com/team/nested@"+outer.Digest.String(), Options{Platform: "linux/amd64"})
+	if err == nil || !strings.Contains(err.Error(), "nested index") {
+		t.Fatalf("Seal err = %v, want nested index rejection", err)
+	}
+	if got := counter.puts.Load(); got != 0 {
+		t.Fatalf("nested-index seal issued %d PUT requests, want 0", got)
 	}
 }
 
@@ -397,6 +614,146 @@ func TestSealDirectAttestationDeclines(t *testing.T) {
 	}
 }
 
+func TestSealTouchesOnlySelectedChild(t *testing.T) {
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skipf("mkcomposefs unavailable: %v", err)
+	}
+	registry := octest.NewRegistry()
+	t.Cleanup(registry.Close)
+	oldTransport := remote.DefaultTransport
+	remote.DefaultTransport = registry.Transport()
+	t.Cleanup(func() {
+		remote.DefaultTransport = oldTransport
+	})
+
+	amdPlatform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	amdFixture := buildIndexImage(t, amdPlatform, "amd64")
+	amdImage := layoutImage(t, amdFixture)
+	pushImage(t, registry, "registry.example.com/team/liar:amd64", amdImage)
+
+	repo, err := name.NewRepository("registry.example.com/team/liar")
+	if err != nil {
+		t.Fatalf("name.NewRepository: %v", err)
+	}
+	amdDesc := imageDescriptor(t, amdImage, amdPlatform)
+	// A real sibling manifest that sealing amd64 must never fetch: the seal
+	// touches exactly the selected child, so the sibling's manifest endpoint
+	// must see zero requests.
+	sibling := pushDocument(t, repo, map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     ocispec.MediaTypeImageManifest,
+		"config": map[string]any{
+			"mediaType": ocispec.MediaTypeImageConfig,
+			"digest":    "sha256:" + strings.Repeat("c", 64),
+			"size":      json.Number("233"),
+		},
+		"layers": []any{},
+	}, ocispec.MediaTypeImageManifest)
+	siblingDesc := rawDescriptor(sibling)
+	siblingDesc["platform"] = map[string]any{"os": "linux", "architecture": "arm64"}
+	indexDoc := map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     ocispec.MediaTypeImageIndex,
+		"manifests": []any{
+			descriptorDocument(amdDesc, nil),
+			siblingDesc,
+		},
+	}
+	root := pushDocument(t, repo, indexDoc, ocispec.MediaTypeImageIndex)
+
+	fetches := &pathCounter{inner: registry.Transport(), path: "/manifests/" + sibling.Digest.String()}
+	remote.DefaultTransport = fetches
+
+	sealed, err := Seal(context.Background(), "registry.example.com/team/liar@"+root.Digest.String(), Options{Platform: "linux/amd64"})
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if got := fetches.hits.Load(); got != 0 {
+		t.Fatalf("sealing amd64 touched the arm64 sibling %d times, want 0", got)
+	}
+	sealedDoc, err := decodeDocument(fetchRawManifest(t, registry, "registry.example.com/team/liar@"+sealed.Sealed.String()))
+	if err != nil {
+		t.Fatalf("decode sealed index: %v", err)
+	}
+	if !documentsEqual(t, sealedDoc["manifests"].([]any)[1], siblingDesc) {
+		t.Fatal("untouched sibling descriptor changed")
+	}
+}
+
+// pathCounter tallies requests whose URL path ends with the given suffix, so a
+// test can assert an endpoint was never touched.
+type pathCounter struct {
+	inner http.RoundTripper
+	path  string
+	hits  atomic.Int64
+}
+
+func (c *pathCounter) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(req.URL.Path, c.path) {
+		c.hits.Add(1)
+	}
+	return c.inner.RoundTrip(req)
+}
+
+func TestSealPlatformSelectionErrors(t *testing.T) {
+	registry := octest.NewRegistry()
+	t.Cleanup(registry.Close)
+	oldTransport := remote.DefaultTransport
+	remote.DefaultTransport = registry.Transport()
+	t.Cleanup(func() {
+		remote.DefaultTransport = oldTransport
+	})
+
+	repo, err := name.NewRepository("registry.example.com/team/select")
+	if err != nil {
+		t.Fatalf("name.NewRepository: %v", err)
+	}
+	manifest := pushDocument(t, repo, map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     ocispec.MediaTypeImageManifest,
+		"config": map[string]any{
+			"mediaType": ocispec.MediaTypeImageConfig,
+			"digest":    "sha256:" + strings.Repeat("c", 64),
+			"size":      json.Number("233"),
+		},
+		"layers": []any{},
+	}, ocispec.MediaTypeImageManifest)
+	// Selection errors fire before the chosen child is fetched; the children
+	// just have to exist for the index push to be accepted.
+	child := func(arch string) map[string]any {
+		desc := rawDescriptor(manifest)
+		desc["platform"] = map[string]any{"os": "linux", "architecture": arch}
+		return desc
+	}
+	index := pushDocument(t, repo, map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     ocispec.MediaTypeImageIndex,
+		"manifests":     []any{child("amd64"), child("arm64"), child("arm64")},
+	}, ocispec.MediaTypeImageIndex)
+
+	tests := []struct {
+		name     string
+		target   ocispec.Descriptor
+		platform string
+		want     string
+	}{
+		{"index without platform", index, "", "select one platform"},
+		{"platform not in index", index, "linux/riscv64", "no manifest for platform"},
+		{"ambiguous platform", index, "linux/arm64", "matches more than one"},
+		{"manifest with platform", manifest, "linux/amd64", "applies only to an index"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Seal(context.Background(),
+				"registry.example.com/team/select@"+tt.target.Digest.String(),
+				Options{Platform: tt.platform})
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Seal err = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
 // nonCanonicalLayout builds a single-layer image whose tree omits /usr, so the
 // canonical construction substitutes default root metadata — a divergence that
 // makes the image ineligible for sealing.
@@ -426,6 +783,30 @@ func pushDocument(t *testing.T, repo name.Repository, doc map[string]any, mediaT
 	return ocispec.Descriptor{MediaType: mediaType, Digest: d, Size: int64(len(raw))}
 }
 
+// rawDescriptor renders desc as the minimal JSON descriptor map an index entry
+// carries.
+func rawDescriptor(desc ocispec.Descriptor) map[string]any {
+	return map[string]any{
+		"mediaType": desc.MediaType,
+		"digest":    desc.Digest.String(),
+		"size":      json.Number(fmt.Sprint(desc.Size)),
+	}
+}
+
+// putCounter tallies the PUT requests reaching the wrapped transport, so a test
+// can assert a declined seal writes nothing.
+type putCounter struct {
+	inner http.RoundTripper
+	puts  atomic.Int64
+}
+
+func (c *putCounter) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodPut {
+		c.puts.Add(1)
+	}
+	return c.inner.RoundTrip(req)
+}
+
 func layoutImage(t *testing.T, fixture octest.Layout) ggcrv1.Image {
 	t.Helper()
 	path, err := ggcrlayout.FromPath(fixture.Dir)
@@ -441,6 +822,98 @@ func layoutImage(t *testing.T, fixture octest.Layout) ggcrv1.Image {
 		t.Fatalf("layout.Image: %v", err)
 	}
 	return image
+}
+
+func buildIndexImage(t *testing.T, platform ocispec.Platform, body string) octest.Layout {
+	t.Helper()
+	fixture, err := octest.BuildSingleLayerGzip(t.TempDir(), platform,
+		octest.File{Name: "usr", Dir: true},
+		octest.File{Name: "etc", Dir: true},
+		octest.File{Name: "empty", Mode: 0o644},
+		octest.File{Name: "etc/platform", Mode: 0o644, Body: body},
+	)
+	if err != nil {
+		t.Fatalf("BuildSingleLayerGzip: %v", err)
+	}
+	return fixture
+}
+
+func pushImage(t *testing.T, registry *octest.Registry, ref string, image ggcrv1.Image) {
+	t.Helper()
+	tag, err := name.NewTag(ref)
+	if err != nil {
+		t.Fatalf("name.NewTag: %v", err)
+	}
+	if err := remote.Write(tag, image, remote.WithTransport(registry.Transport())); err != nil {
+		t.Fatalf("remote.Write: %v", err)
+	}
+}
+
+func imageDescriptor(t *testing.T, image ggcrv1.Image, platform ocispec.Platform) ocispec.Descriptor {
+	t.Helper()
+	hash, err := image.Digest()
+	if err != nil {
+		t.Fatalf("image.Digest: %v", err)
+	}
+	raw, err := image.RawManifest()
+	if err != nil {
+		t.Fatalf("image.RawManifest: %v", err)
+	}
+	mediaType, err := image.MediaType()
+	if err != nil {
+		t.Fatalf("image.MediaType: %v", err)
+	}
+	return ocispec.Descriptor{
+		MediaType: string(mediaType),
+		Digest:    digest.Digest(hash.String()),
+		Size:      int64(len(raw)),
+		Platform:  &platform,
+	}
+}
+
+func descriptorDocument(desc ocispec.Descriptor, extra map[string]any) map[string]any {
+	doc := map[string]any{
+		"mediaType": desc.MediaType,
+		"digest":    desc.Digest.String(),
+		"size":      json.Number(fmt.Sprint(desc.Size)),
+		"platform": map[string]any{
+			"os":           desc.Platform.OS,
+			"architecture": desc.Platform.Architecture,
+		},
+	}
+	if desc.Platform.Variant != "" {
+		doc["platform"].(map[string]any)["variant"] = desc.Platform.Variant
+	}
+	for key, value := range extra {
+		doc[key] = value
+	}
+	return doc
+}
+
+func fetchRawManifest(t *testing.T, registry *octest.Registry, ref string) []byte {
+	t.Helper()
+	digestRef, err := name.NewDigest(ref)
+	if err != nil {
+		t.Fatalf("name.NewDigest: %v", err)
+	}
+	desc, err := remote.Get(digestRef, remote.WithTransport(registry.Transport()))
+	if err != nil {
+		t.Fatalf("remote.Get: %v", err)
+	}
+	return desc.Manifest
+}
+
+func documentsEqual(t *testing.T, left, right any) bool {
+	t.Helper()
+	leftJSON, err := json.Marshal(left)
+	if err != nil {
+		t.Fatalf("marshal left document: %v", err)
+	}
+	rightJSON, err := json.Marshal(right)
+	if err != nil {
+		t.Fatalf("marshal right document: %v", err)
+	}
+	return bytes.Equal(leftJSON, rightJSON)
 }
 
 func assertRemoteAnnotations(t *testing.T, registry *octest.Registry, result Result) {
