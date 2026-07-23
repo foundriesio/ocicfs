@@ -152,6 +152,22 @@ RUN command -v crane >/dev/null
 COPY --from=cfsctl-builder /usr/bin/cfsctl /usr/bin/cfsctl
 RUN command -v cfsctl >/dev/null
 
+# zot: a real OCI registry, statically linked, for the smoke test's registry
+# legs and for manual push/seal/pull testing. Unlike an in-process test
+# registry it enforces the distribution spec on manifest PUTs (Content-Type
+# handling, referenced-blob existence), so the `knarr seal` push path is
+# exercised against real registry behavior. The entrypoint serves a persistent
+# instance at 127.0.0.1:5000 from the baked config; the smoke test runs its
+# own ephemeral instance on another port.
+ARG ZOT_VERSION=2.1.17
+RUN arch="$(dpkg --print-architecture)" \
+ && case "$arch" in amd64|arm64) ;; *) echo "unsupported architecture for zot: $arch" >&2; exit 1 ;; esac \
+ && curl -sSfL -o /usr/bin/zot \
+        "https://github.com/project-zot/zot/releases/download/v${ZOT_VERSION}/zot-linux-${arch}" \
+ && chmod 0755 /usr/bin/zot \
+ && zot --version
+COPY .devcontainer/zot-config.json /etc/zot/config.json
+
 # Share the toolchain caches with bind-mounted workspaces.
 ENV GOMODCACHE=/go/pkg/mod
 ENV GOCACHE=/root/.cache/go-build

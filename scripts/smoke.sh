@@ -10,12 +10,14 @@
 # writable consumer assembles over it (the objects/fsverity-sha256-12 view as
 # lowerdir, verity=require), and finally remove -- three times: for an image
 # sideloaded with pull --from-dir, for the same image pulled digest-pinned from
-# a loopback HTTP registry (crane registry serve), and for the same image
+# a loopback HTTP registry (zot), and for the same image
 # pulled and addressed by tag (checked to resolve to the same pinned digest),
 # so the currently implemented functionality can be checked by hand in one
 # command. A final differential leg diffs the mounted rootfs against the same
 # image flattened by crane export, so the layer merge is checked against an
-# independent implementation on a real image. It needs a privileged,
+# independent implementation on a real image. The registry legs run against a
+# local zot instance -- a real OCI registry that enforces the distribution spec
+# on manifest PUTs, unlike an in-process test registry. It needs a privileged,
 # fs-verity-capable environment with mkcomposefs and mount.composefs on PATH
 # -- i.e. the dev container. Either open the dev container and run the target
 # inside it:
@@ -27,10 +29,13 @@
 #   docker run --rm --privileged -v "$PWD":/work knarr-dev make smoke
 #
 # Env:
-#   SMOKE_IMAGE   registry image to pull (default docker.io/library/busybox:latest)
-#   SMOKE_LAYOUT  OCI layout directory; cached across runs, so a repeat run needs no
-#                 network (pre-populate it to run fully offline; the registry leg is
-#                 loopback-local and needs no network either)
+#   SMOKE_IMAGE     registry image to pull (default docker.io/library/busybox:latest)
+#   SMOKE_LAYOUT    OCI layout directory; cached across runs, so a repeat run needs no
+#                   network (pre-populate it to run fully offline; the registry leg is
+#                   loopback-local and needs no network either)
+#   SMOKE_REG_PORT  loopback port for the smoke run's own zot instance
+#                   (default 5001; the dev container's persistent registry
+#                   owns 5000)
 set -euo pipefail
 
 IMAGE="${SMOKE_IMAGE:-docker.io/library/busybox:latest}"
@@ -39,6 +44,7 @@ STORE=""
 MNT=""
 OVL=""
 REGPID=""
+REGDIR=""
 EXPORTDIR=""
 
 cleanup() {
@@ -50,6 +56,7 @@ cleanup() {
 	fi
 	[ -n "$MNT" ] && bin/knarr --root "$STORE" unmount "$MNT" 2>/dev/null
 	[ -n "$REGPID" ] && kill "$REGPID" 2>/dev/null
+	[ -n "$REGDIR" ] && rm -rf "$REGDIR"
 	[ -n "$STORE" ] && rm -rf "$STORE"
 	[ -n "$MNT" ] && rm -rf "$MNT"
 	[ -n "$EXPORTDIR" ] && rm -rf "$EXPORTDIR"
@@ -152,16 +159,26 @@ echo "==== lifecycle 1: image sideloaded from a local directory ===="
 run_lifecycle "smoke@$digest" "$digest" pull --from-dir "$LAYOUT" "smoke@$digest"
 
 echo "==== lifecycle 2: image pulled from a loopback HTTP registry ===="
-REGLOG="$(mktemp)"
-crane registry serve --address 127.0.0.1:0 >"$REGLOG" 2>&1 &
+# The run gets its own empty zot instance rather than the dev container's
+# persistent one on 5000, so every assertion runs against hermetic per-run
+# registry state untouched by manual testing or previous runs.
+port="${SMOKE_REG_PORT:-5001}"
+REGDIR="$(mktemp -d)"
+cat >"$REGDIR/config.json" <<EOF
+{
+  "distSpecVersion": "1.1.1",
+  "storage": { "rootDirectory": "$REGDIR/storage" },
+  "http": { "address": "127.0.0.1", "port": "$port" }
+}
+EOF
+zot serve "$REGDIR/config.json" >"$REGDIR/zot.log" 2>&1 &
 REGPID=$!
-port=""
-for _ in $(seq 50); do
-	port="$(sed -n 's/.*serving on port \([0-9][0-9]*\).*/\1/p' "$REGLOG")"
-	[ -n "$port" ] && break
+for _ in $(seq 100); do
+	curl -fsS "http://127.0.0.1:$port/v2/" >/dev/null 2>&1 && break
 	sleep 0.1
 done
-[ -n "$port" ] || { cat "$REGLOG" >&2; fail "crane registry serve reported no port"; }
+curl -fsS "http://127.0.0.1:$port/v2/" >/dev/null 2>&1 \
+	|| { cat "$REGDIR/zot.log" >&2; fail "zot did not become ready on port $port"; }
 crane push "$LAYOUT" "127.0.0.1:$port/smoke"
 run_lifecycle "127.0.0.1:$port/smoke@$digest" "$digest" pull "127.0.0.1:$port/smoke@$digest"
 
