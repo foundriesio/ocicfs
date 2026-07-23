@@ -29,7 +29,7 @@ import (
 
 func TestCommandsCoverM1Verbs(t *testing.T) {
 	root, _ := newRootCommand(io.Discard, io.Discard)
-	want := []string{"inspect", "ls", "mount", "publish", "pull", "remove", "unmount"}
+	want := []string{"inspect", "ls", "mount", "publish", "pull", "remove", "seal", "unmount"}
 
 	// cobra adds its own "help" and "completion" commands; compare only knarr's.
 	builtins := map[string]bool{"help": true, "completion": true}

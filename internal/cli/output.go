@@ -18,9 +18,11 @@ import (
 	"text/tabwriter"
 	"unicode"
 
+	"github.com/opencontainers/go-digest"
 	"github.com/spf13/cobra"
 
 	"github.com/foundriesio/knarr/internal/ocilayout"
+	"github.com/foundriesio/knarr/internal/ociseal"
 	"github.com/foundriesio/knarr/pkg/knarr"
 )
 
@@ -133,6 +135,76 @@ type LayerOutput struct {
 	ChainID   string `json:"chainID"`
 	Size      int64  `json:"size"`
 	CreatedBy string `json:"createdBy,omitempty"`
+}
+
+// SealResultOutput is the JSON shape for `knarr seal` output. Every digest is
+// paired with the reference that names it in the sealed repository, so sealing
+// the next platform of an index consumes the previous call's output verbatim
+// instead of rebuilding the reference from its parts.
+type SealResultOutput struct {
+	Original    string               `json:"original"`
+	OriginalRef string               `json:"original_ref"`
+	Sealed      string               `json:"sealed"`
+	SealedRef   string               `json:"sealed_ref"`
+	Platforms   []SealPlatformOutput `json:"platforms"`
+}
+
+// SealPlatformOutput is one platform manifest in `knarr seal` output. For an
+// index reference the top-level digests are the index's, so the manifest this
+// platform had before sealing is reported here; equal original and sealed
+// manifests mean the platform was already sealed.
+type SealPlatformOutput struct {
+	Platform            string `json:"platform"`
+	OriginalManifest    string `json:"original_manifest"`
+	OriginalManifestRef string `json:"original_manifest_ref"`
+	SealedManifest      string `json:"sealed_manifest"`
+	SealedManifestRef   string `json:"sealed_manifest_ref"`
+	Fsverity            string `json:"fsverity"`
+}
+
+// WriteSealResult renders a seal result to w in the requested format.
+func WriteSealResult(w io.Writer, format Format, result ociseal.Result) error {
+	out := SealResultOutput{
+		Original:    result.Original.String(),
+		OriginalRef: digestRef(result.Repository, result.Original),
+		Sealed:      result.Sealed.String(),
+		SealedRef:   digestRef(result.Repository, result.Sealed),
+		Platforms:   make([]SealPlatformOutput, 0, len(result.Platforms)),
+	}
+	for _, platform := range result.Platforms {
+		out.Platforms = append(out.Platforms, SealPlatformOutput{
+			Platform:            ocilayout.PlatformString(&platform.Platform),
+			OriginalManifest:    platform.Original.String(),
+			OriginalManifestRef: digestRef(result.Repository, platform.Original),
+			SealedManifest:      platform.Sealed.String(),
+			SealedManifestRef:   digestRef(result.Repository, platform.Sealed),
+			Fsverity:            platform.MergedFsverity,
+		})
+	}
+	if format == FormatJSON {
+		return emitJSON(w, out)
+	}
+	if _, err := fmt.Fprintf(w, "original  %s\nsealed    %s\n", out.OriginalRef, out.SealedRef); err != nil {
+		return err
+	}
+	// A seal call handles exactly one platform, so this is one row; the sealed
+	// manifest digest stays JSON-only (for an index it is recoverable from the
+	// sealed index, and the text output reads as label/value rows).
+	for _, platform := range out.Platforms {
+		if _, err := fmt.Fprintf(w, "fsverity  %s\n", platform.Fsverity); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// digestRef names d in repo, the form a registry client accepts. A result
+// carrying no repository renders the bare digest.
+func digestRef(repo string, d digest.Digest) string {
+	if repo == "" {
+		return d.String()
+	}
+	return repo + "@" + d.String()
 }
 
 // WriteImageInfo renders an inspected image to w in the requested format.
