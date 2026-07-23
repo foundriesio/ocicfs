@@ -6,7 +6,14 @@
 # knarr smoke test: exercise the image lifecycle and sealing against a real
 # image and a real registry.
 #
-# Drives the built knarr binary through the full lifecycle -- pull -> ls ->
+# Phase 0 builds a purpose-built image offline with umoci -- object, inline,
+# and empty files, a symlink, /run content the canonical transform drops, and
+# a second layer with a whiteout and an override, deliberately hardlink-free
+# -- pushes it to the local registry, seals it as a plain manifest target,
+# runs seal-crosscheck.sh on it expecting the exact three-way digest match,
+# and drives the sealed image through the full verb lifecycle.
+#
+# The rest exercises a real image: the full lifecycle -- pull -> ls ->
 # inspect -> mount -> unmount, then mount --metadata-only with the overlay a
 # writable consumer assembles over it (the objects/fsverity-sha256-12 view as
 # lowerdir, verity=require), and finally remove -- three times: for an image
@@ -50,6 +57,7 @@ MNT=""
 OVL=""
 REGPID=""
 REGDIR=""
+IMGDIR=""
 EXPORTDIR=""
 
 cleanup() {
@@ -62,6 +70,7 @@ cleanup() {
 	[ -n "$MNT" ] && bin/knarr --root "$STORE" unmount "$MNT" 2>/dev/null
 	[ -n "$REGPID" ] && kill "$REGPID" 2>/dev/null
 	[ -n "$REGDIR" ] && rm -rf "$REGDIR"
+	[ -n "$IMGDIR" ] && rm -rf "$IMGDIR"
 	[ -n "$STORE" ] && rm -rf "$STORE"
 	[ -n "$MNT" ] && rm -rf "$MNT"
 	[ -n "$EXPORTDIR" ] && rm -rf "$EXPORTDIR"
@@ -154,19 +163,10 @@ run_lifecycle() {
 
 [ -x bin/knarr ] || make build
 
-if [ ! -f "$LAYOUT/index.json" ]; then
-	echo "== crane pull $IMAGE -> $LAYOUT =="
-	crane pull --format=oci "$IMAGE" "$LAYOUT"
-fi
-digest="$(jq -r '.manifests[0].digest' "$LAYOUT/index.json")"
-
-echo "==== lifecycle 1: image sideloaded from a local directory ===="
-run_lifecycle "smoke@$digest" "$digest" pull --from-dir "$LAYOUT" "smoke@$digest"
-
-echo "==== lifecycle 2: image pulled from a loopback HTTP registry ===="
-# The run gets its own empty zot instance rather than the dev container's
-# persistent one on 5000, so every assertion runs against hermetic per-run
-# registry state untouched by manual testing or previous runs.
+# Every phase talks to the run's own empty zot instance rather than the dev
+# container's persistent one on 5000, so every assertion runs against
+# hermetic per-run registry state untouched by manual testing or previous
+# runs.
 port="${SMOKE_REG_PORT:-5001}"
 REGDIR="$(mktemp -d)"
 cat >"$REGDIR/config.json" <<EOF
@@ -184,6 +184,70 @@ for _ in $(seq 100); do
 done
 curl -fsS "http://127.0.0.1:$port/v2/" >/dev/null 2>&1 \
 	|| { cat "$REGDIR/zot.log" >&2; fail "zot did not become ready on port $port"; }
+
+echo "==== phase 0: purpose-built image -> seal -> cross-check -> lifecycle ===="
+# An offline, hardlink-free image covering the content classes and merge
+# semantics the busybox legs cannot pin down: an object-sized and an
+# inline-sized file, an empty file, a symlink, an empty directory, /run
+# content the canonical transform drops, and a second layer carrying a
+# whiteout and an override. Hardlink-free so the cross-check below must
+# reach the exact three-way digest match, not its fallback.
+echo "== build with umoci and push =="
+IMGDIR="$(mktemp -d /var/lib/knarr/smoke-img-XXXXXX)"
+umoci init --layout "$IMGDIR/layout"
+umoci new --image "$IMGDIR/layout:custom"
+umoci unpack --image "$IMGDIR/layout:custom" "$IMGDIR/b1" >/dev/null 2>&1
+r="$IMGDIR/b1/rootfs"
+mkdir -p "$r/usr/bin" "$r/usr/share/empty" "$r/etc" "$r/run"
+seq 1 40 >"$r/usr/bin/app" && chmod 0755 "$r/usr/bin/app"
+printf 'inline config\n' >"$r/etc/config"
+: >"$r/etc/empty"
+ln -s ../../etc/config "$r/usr/share/link"
+printf 'scratch\n' >"$r/run/junk"
+printf 'doomed\n' >"$r/etc/doomed"
+umoci repack --image "$IMGDIR/layout:custom" "$IMGDIR/b1" >/dev/null 2>&1
+umoci unpack --image "$IMGDIR/layout:custom" "$IMGDIR/b2" >/dev/null 2>&1
+rm "$IMGDIR/b2/rootfs/etc/doomed"
+printf 'overridden\n' >"$IMGDIR/b2/rootfs/etc/config"
+umoci repack --image "$IMGDIR/layout:custom" "$IMGDIR/b2" >/dev/null 2>&1
+umoci config --image "$IMGDIR/layout:custom" --os linux --architecture "$(go env GOARCH)" >/dev/null 2>&1
+umoci gc --layout "$IMGDIR/layout" >/dev/null 2>&1
+cdigest="$(jq -r '.manifests[0].digest' "$IMGDIR/layout/index.json")"
+crane push "$IMGDIR/layout" "127.0.0.1:$port/custom"
+cref="127.0.0.1:$port/custom@$cdigest"
+
+echo "== seal (plain manifest target: dry-run parity, then push) =="
+cdry="$("${KN[@]}" seal --dry-run --format json "$cref" | jq -r .sealed)"
+[[ "$cdry" == sha256:* ]] || fail "custom seal --dry-run reported no sealed digest"
+csealed="$("${KN[@]}" seal --format json "$cref" | jq -r .sealed)"
+[ "$csealed" = "$cdry" ] || fail "custom sealed digest differs between dry-run and push"
+cman="$(crane manifest "127.0.0.1:$port/custom@$csealed")"
+jq -e '.annotations["composefs.merged.erofs.v1.fsverity-sha256-12"] | test("^[0-9a-f]{64}$")' \
+	<<<"$cman" >/dev/null || fail "custom sealed manifest lacks a well-formed merged fsverity annotation"
+jq -e '.config.annotations["composefs.config.fsverity-sha256-12"] | test("^[0-9a-f]{64}$")' \
+	<<<"$cman" >/dev/null || fail "custom sealed manifest lacks a well-formed config fsverity annotation"
+
+echo "== seal-crosscheck (expect the exact three-way match) =="
+ccheck="$(CROSSCHECK_REGISTRY="127.0.0.1:$port" scripts/seal-crosscheck.sh "$cref")"
+printf '%s\n' "$ccheck" | grep -E "knarr:|cfsctl:|mkcomposefs:|RESULT"
+printf '%s\n' "$ccheck" | grep -qF "RESULT: all three digests MATCH" \
+	|| fail "seal-crosscheck did not reach the exact three-way match"
+
+echo "==== lifecycle 0: the sealed purpose-built image ===="
+run_lifecycle "127.0.0.1:$port/custom@$csealed" "$csealed" pull "127.0.0.1:$port/custom@$csealed"
+rm -rf "$IMGDIR"
+IMGDIR=""
+
+if [ ! -f "$LAYOUT/index.json" ]; then
+	echo "== crane pull $IMAGE -> $LAYOUT =="
+	crane pull --format=oci "$IMAGE" "$LAYOUT"
+fi
+digest="$(jq -r '.manifests[0].digest' "$LAYOUT/index.json")"
+
+echo "==== lifecycle 1: image sideloaded from a local directory ===="
+run_lifecycle "smoke@$digest" "$digest" pull --from-dir "$LAYOUT" "smoke@$digest"
+
+echo "==== lifecycle 2: image pulled from a loopback HTTP registry ===="
 crane push "$LAYOUT" "127.0.0.1:$port/smoke"
 run_lifecycle "127.0.0.1:$port/smoke@$digest" "$digest" pull "127.0.0.1:$port/smoke@$digest"
 
@@ -253,4 +317,4 @@ jq -e '.config.annotations["composefs.config.fsverity-sha256-12"] | test("^[0-9a
 echo "==== lifecycle 4: the sealed image (pull re-verifies the seal) ===="
 run_lifecycle "127.0.0.1:$port/smoke@$sealed" "$sealed" pull "127.0.0.1:$port/smoke@$sealed"
 
-echo "SMOKE OK: pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export and a seal round against the registry (checks passed)"
+echo "SMOKE OK: purpose-built image sealed, cross-checked three ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export and a seal round against the registry (checks passed)"
