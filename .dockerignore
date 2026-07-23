@@ -1,0 +1,6 @@
+# The image build copies only the devcontainer entrypoint and config; keep
+# source trees, build output, and scratch data (which may be unreadable, e.g.
+# root-owned store dumps) out of the build context.
+*
+!.devcontainer
+!Containerfile
