@@ -90,11 +90,12 @@ func TestMergedAnnotationSharesPrefix(t *testing.T) {
 	}
 }
 
-// TestVerifyAnnotationsNonCanonical exercises the fail-closed rule for a
-// non-canonical construction: any annotation under the merged-EROFS namespace
-// is rejected regardless of suffix or value, while an image carrying no such
-// annotation is a valid unsealed pull. This path never measures a stored blob,
-// so a plain store on any filesystem suffices.
+// TestVerifyAnnotationsNonCanonical exercises the rules for a non-canonical
+// construction: any annotation under the merged-EROFS namespace is rejected
+// regardless of suffix or value, a present knarr fallback annotation must
+// match the measured fallback digest, and an image carrying neither is a
+// valid unsealed pull. These paths never measure a stored blob, so a plain
+// store on any filesystem suffices.
 func TestVerifyAnnotationsNonCanonical(t *testing.T) {
 	store, err := objectstore.New(t.TempDir())
 	if err != nil {
@@ -104,6 +105,7 @@ func TestVerifyAnnotationsNonCanonical(t *testing.T) {
 	tests := []struct {
 		name        string
 		annotations map[string]string
+		measured    string
 		wantErr     bool
 	}{
 		{name: "exact merged key", annotations: map[string]string{MergedAnnotation: hexDigest}, wantErr: true},
@@ -112,11 +114,14 @@ func TestVerifyAnnotationsNonCanonical(t *testing.T) {
 		{name: "config namespace only", annotations: map[string]string{ConfigAnnotation: hexDigest}, wantErr: false},
 		{name: "unrelated annotation", annotations: map[string]string{"org.opencontainers.image.title": "app"}, wantErr: false},
 		{name: "no annotations", annotations: nil, wantErr: false},
+		{name: "fallback match", annotations: map[string]string{FallbackMergedAnnotation: hexDigest}, measured: "sha256:" + hexDigest, wantErr: false},
+		{name: "fallback mismatch", annotations: map[string]string{FallbackMergedAnnotation: hexDigest}, measured: "sha256:" + strings.Repeat("b", 64), wantErr: true},
+		{name: "fallback beside merged key", annotations: map[string]string{FallbackMergedAnnotation: hexDigest, MergedAnnotation: hexDigest}, measured: "sha256:" + hexDigest, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			res := ocichain.Resolved{Manifest: ocispec.Manifest{Annotations: tt.annotations}}
-			err := VerifyAnnotations(context.Background(), store, res, "", false)
+			err := VerifyAnnotations(context.Background(), store, res, tt.measured, false)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("VerifyAnnotations error = %v, wantErr %t", err, tt.wantErr)
 			}
@@ -142,7 +147,7 @@ func TestAnnotateManifestPreservesUnknownFieldsAndIsIdempotent(t *testing.T) {
 	  "annotations": {"vendor.manifest": "kept"}
 	}`)
 
-	sealed, changed, err := annotateManifest(raw, merged, config)
+	sealed, changed, err := annotateManifest(raw, merged, config, true)
 	if err != nil {
 		t.Fatalf("annotateManifest: %v", err)
 	}
@@ -163,7 +168,7 @@ func TestAnnotateManifestPreservesUnknownFieldsAndIsIdempotent(t *testing.T) {
 		t.Fatal("vendor config field was not preserved")
 	}
 
-	resealed, changed, err := annotateManifest(sealed, merged, config)
+	resealed, changed, err := annotateManifest(sealed, merged, config, true)
 	if err != nil {
 		t.Fatalf("annotateManifest second pass: %v", err)
 	}
@@ -188,6 +193,7 @@ func TestAnnotateManifestRejectsMismatch(t *testing.T) {
 	_, _, err := annotateManifest(raw,
 		"sha256:"+strings.Repeat("c", 64),
 		"sha256:"+strings.Repeat("b", 64),
+		true,
 	)
 	if err == nil || !strings.Contains(err.Error(), "mismatch") {
 		t.Fatalf("annotateManifest error = %v, want mismatch", err)
@@ -216,7 +222,7 @@ func TestSealBareManifestDryRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("name.NewRepository: %v", err)
 	}
-	result, err := seal(context.Background(), src, repo, layout.Root, nil, nil, true)
+	result, err := seal(context.Background(), src, repo, layout.Root, nil, nil, true, false)
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
@@ -343,7 +349,7 @@ func TestSealGoldenDigest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("name.NewRepository: %v", err)
 	}
-	result, err := seal(context.Background(), src, repo, layout.Root, nil, nil, true)
+	result, err := seal(context.Background(), src, repo, layout.Root, nil, nil, true, false)
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
@@ -503,10 +509,104 @@ func TestSealDeclinesNonCanonical(t *testing.T) {
 		t.Fatalf("name.NewRepository: %v", err)
 	}
 	for _, dryRun := range []bool{false, true} {
-		_, err := seal(context.Background(), src, repo, layout.Root, nil, nil, dryRun)
+		_, err := seal(context.Background(), src, repo, layout.Root, nil, nil, dryRun, false)
 		if !errors.Is(err, ErrNotCanonical) {
 			t.Fatalf("dryRun=%v: err = %v, want ErrNotCanonical", dryRun, err)
 		}
+	}
+}
+
+// TestSealFallbackAllowed covers --allow-non-canonical: a non-canonical
+// construction is sealed with its deterministic fallback digest under the
+// knarr fallback annotations — never the standard namespace — resealing it
+// is a no-op, and a non-canonical manifest already wearing a standard merged
+// annotation is refused even with the permission, since pull rejects that
+// combination and sealing must not launder it.
+func TestSealFallbackAllowed(t *testing.T) {
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skipf("mkcomposefs unavailable: %v", err)
+	}
+	registry := octest.NewRegistry()
+	t.Cleanup(registry.Close)
+	oldTransport := remote.DefaultTransport
+	remote.DefaultTransport = registry.Transport()
+	t.Cleanup(func() {
+		remote.DefaultTransport = oldTransport
+	})
+
+	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	layout := nonCanonicalLayout(t, platform)
+	image := layoutImage(t, layout)
+	pushImage(t, registry, "registry.example.com/team/fallback:input", image)
+	ref := "registry.example.com/team/fallback@" + layout.Root.String()
+
+	result, err := Seal(context.Background(), ref, Options{AllowNonCanonical: true})
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if result.Sealed == result.Original {
+		t.Fatal("fallback seal did not change the manifest")
+	}
+	raw := fetchRawManifest(t, registry, "registry.example.com/team/fallback@"+result.Sealed.String())
+	var manifest ocispec.Manifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatalf("parse sealed manifest: %v", err)
+	}
+	if got := "sha256:" + manifest.Annotations[FallbackMergedAnnotation]; got != result.Platforms[0].MergedFsverity {
+		t.Fatalf("fallback merged annotation = %q, want %q", got, result.Platforms[0].MergedFsverity)
+	}
+	if _, err := ParseAnnotation(manifest.Config.Annotations[FallbackConfigAnnotation]); err != nil {
+		t.Fatalf("fallback config annotation: %v", err)
+	}
+	for key := range manifest.Annotations {
+		if strings.HasPrefix(key, MergedAnnotationPrefix) {
+			t.Fatalf("fallback seal wrote standard-namespace annotation %s", key)
+		}
+	}
+	if _, ok := manifest.Config.Annotations[ConfigAnnotation]; ok {
+		t.Fatal("fallback seal wrote the standard config annotation")
+	}
+
+	resealed, err := Seal(context.Background(), "registry.example.com/team/fallback@"+result.Sealed.String(), Options{AllowNonCanonical: true})
+	if err != nil {
+		t.Fatalf("reseal: %v", err)
+	}
+	if resealed.Sealed != result.Sealed {
+		t.Fatalf("reseal changed digest: %s -> %s", result.Sealed, resealed.Sealed)
+	}
+}
+
+func TestSealFallbackRefusesStandardAnnotation(t *testing.T) {
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skipf("mkcomposefs unavailable: %v", err)
+	}
+	registry := octest.NewRegistry()
+	t.Cleanup(registry.Close)
+	oldTransport := remote.DefaultTransport
+	remote.DefaultTransport = registry.Transport()
+	t.Cleanup(func() {
+		remote.DefaultTransport = oldTransport
+	})
+
+	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	layout := nonCanonicalLayout(t, platform)
+	image := layoutImage(t, layout)
+	pushImage(t, registry, "registry.example.com/team/launder:input", image)
+
+	repo, err := name.NewRepository("registry.example.com/team/launder")
+	if err != nil {
+		t.Fatalf("name.NewRepository: %v", err)
+	}
+	doc, err := decodeDocument(fetchRawManifest(t, registry, "registry.example.com/team/launder@"+layout.Root.String()))
+	if err != nil {
+		t.Fatalf("decode manifest: %v", err)
+	}
+	doc["annotations"] = map[string]any{MergedAnnotation: strings.Repeat("a", 64)}
+	tainted := pushDocument(t, repo, doc, ocispec.MediaTypeImageManifest)
+
+	_, err = Seal(context.Background(), "registry.example.com/team/launder@"+tainted.Digest.String(), Options{AllowNonCanonical: true})
+	if err == nil || !strings.Contains(err.Error(), "not canonical") {
+		t.Fatalf("Seal err = %v, want standard-annotation refusal", err)
 	}
 }
 

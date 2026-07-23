@@ -214,6 +214,89 @@ func TestSealedPullRejectsTamperedAnnotationsE2E(t *testing.T) {
 	}
 }
 
+// TestSealFallbackE2E covers the --allow-non-canonical escape hatch end to
+// end on an artifact-like tree (no /usr, so the canonical construction cannot
+// apply): sealing records the deterministic fallback digest under the knarr
+// fallback annotations, a device pull re-derives the same fallback digest and
+// verifies it, and a tampered fallback annotation fails the pull closed. A
+// fallback-sealed manifest rewritten to carry the standard merged annotation
+// is rejected outright, since that namespace promises a canonical digest.
+func TestSealFallbackE2E(t *testing.T) {
+	storeRoot := sealVerityStore(t)
+	registry := octest.NewRegistry()
+	t.Cleanup(registry.Close)
+	useRemoteDefaultTransport(t, registry.Transport())
+
+	lay, err := octest.BuildSingleLayerGzip(t.TempDir(), hostPlatform(),
+		octest.File{Name: "model", Dir: true},
+		octest.File{Name: "model/weights.bin", Mode: 0o644, Body: sealObjectBody},
+		octest.File{Name: "model/config.json", Mode: 0o644, Body: "{}"},
+	)
+	if err != nil {
+		t.Fatalf("BuildSingleLayerGzip: %v", err)
+	}
+	pushLayoutImage(t, registry, "registry.example.com/team/model:input", lay)
+
+	if _, err := ociseal.Seal(context.Background(), "registry.example.com/team/model@"+lay.Root.String(), ociseal.Options{}); !errors.Is(err, ociseal.ErrNotCanonical) {
+		t.Fatalf("Seal without permission err = %v, want ErrNotCanonical", err)
+	}
+	sealed, err := ociseal.Seal(context.Background(), "registry.example.com/team/model@"+lay.Root.String(), ociseal.Options{AllowNonCanonical: true})
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+
+	ref := "registry.example.com/team/model@" + sealed.Sealed.String()
+	eng, err := New(Config{Root: storeRoot})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := eng.Pull(context.Background(), ref); devtest.IsVerityUnsupported(err) {
+		t.Skipf("fs-verity unsupported on the test filesystem: %v", err)
+	} else if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	info, err := eng.Inspect(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if info.FsverityDigest != sealed.Platforms[0].MergedFsverity {
+		t.Fatalf("device fs-verity = %s, publisher computed %s", info.FsverityDigest, sealed.Platforms[0].MergedFsverity)
+	}
+
+	sealedRaw := fetchManifestRaw(t, registry, ref)
+	wrong := strings.Repeat("0", 64)
+	for _, tt := range []struct {
+		name    string
+		mutate  func(*ocispec.Manifest)
+		wantErr string
+	}{
+		{"tampered fallback", func(m *ocispec.Manifest) {
+			m.Annotations = map[string]string{ociseal.FallbackMergedAnnotation: wrong}
+		}, "annotation"},
+		{"standard key on fallback build", func(m *ocispec.Manifest) {
+			m.Annotations = map[string]string{ociseal.MergedAnnotation: m.Annotations[ociseal.FallbackMergedAnnotation]}
+		}, "non-canonical"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var manifest ocispec.Manifest
+			if err := json.Unmarshal(sealedRaw, &manifest); err != nil {
+				t.Fatalf("parse sealed manifest: %v", err)
+			}
+			tt.mutate(&manifest)
+			raw, err := json.Marshal(manifest)
+			if err != nil {
+				t.Fatalf("marshal tampered manifest: %v", err)
+			}
+			root := digest.FromBytes(raw)
+			tamperedRef := "registry.example.com/team/model@" + root.String()
+			pushRawManifest(t, registry, tamperedRef, raw, ocispec.MediaTypeImageManifest)
+			if _, err := eng.Pull(context.Background(), tamperedRef); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Pull error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 // TestSealedCachedPullRejectsTamperAfterRestartE2E proves the cached fast path
 // still fails closed after a restart: a second engine reading a previously
 // cached image whose stored manifest carries a merged annotation disagreeing

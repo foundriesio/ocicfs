@@ -41,6 +41,16 @@ const (
 	MergedAnnotation = "composefs.merged.erofs.v1.fsverity-sha256-12"
 	// ConfigAnnotation records the fs-verity digest of the config JSON bytes.
 	ConfigAnnotation = "composefs.config.fsverity-sha256-12"
+
+	// FallbackMergedAnnotation records the merged fs-verity digest of a
+	// non-canonical (fallback) construction. It lives in knarr's own
+	// namespace because the shared namespace above promises a digest the
+	// upstream canonical algorithm reproduces, which a fallback digest is
+	// not.
+	FallbackMergedAnnotation = "io.foundries.knarr.composefs.fallback.v1.fsverity-sha256-12"
+	// FallbackConfigAnnotation is the config-digest companion of
+	// FallbackMergedAnnotation.
+	FallbackConfigAnnotation = "io.foundries.knarr.composefs.config.fsverity-sha256-12"
 )
 
 // ErrNotCanonical reports that an image's composefs construction diverges from
@@ -56,6 +66,11 @@ type Options struct {
 	Platform string
 	Tag      string
 	DryRun   bool
+	// AllowNonCanonical permits sealing a non-canonical construction: its
+	// deterministic fallback digest is recorded under the knarr fallback
+	// annotations instead of declining. A canonical construction is sealed
+	// under the standard annotations regardless of this option.
+	AllowNonCanonical bool
 }
 
 // Result describes the root produced by Seal.
@@ -105,7 +120,7 @@ func Seal(ctx context.Context, ref string, opts Options) (Result, error) {
 		}
 		want = &ocispec.Platform{OS: parsed.OS, Architecture: parsed.Architecture, Variant: parsed.Variant}
 	}
-	result, err := seal(ctx, src, input.Context(), root, want, tag, opts.DryRun)
+	result, err := seal(ctx, src, input.Context(), root, want, tag, opts.DryRun, opts.AllowNonCanonical)
 	if err != nil {
 		return Result{}, err
 	}
@@ -175,7 +190,7 @@ func (hashSink) WriteObject(ctx context.Context, r io.Reader) (digest.Digest, st
 	return digest.NewDigest(digest.SHA256, h), fsv, nil
 }
 
-func seal(ctx context.Context, src ocichain.BlobSource, repo name.Repository, root digest.Digest, want *ocispec.Platform, tag *name.Tag, dryRun bool) (Result, error) {
+func seal(ctx context.Context, src ocichain.BlobSource, repo name.Repository, root digest.Digest, want *ocispec.Platform, tag *name.Tag, dryRun, allowFallback bool) (Result, error) {
 	rootRaw, err := ocichain.ReadRootBlob(ctx, src, root)
 	if err != nil {
 		return Result{}, fmt.Errorf("ociseal: read root: %w", err)
@@ -188,15 +203,15 @@ func seal(ctx context.Context, src ocichain.BlobSource, repo name.Repository, ro
 		if want == nil {
 			return Result{}, errors.New("ociseal: the reference names an image index; select one platform with --platform os/arch[/variant]")
 		}
-		return sealIndexPlatform(ctx, src, repo, root, rootRaw, *want, tag, dryRun)
+		return sealIndexPlatform(ctx, src, repo, root, rootRaw, *want, tag, dryRun, allowFallback)
 	}
 	if want != nil {
 		return Result{}, errors.New("ociseal: the reference names an image manifest; --platform applies only to an index")
 	}
-	return sealSingle(ctx, src, repo, root, rootRaw, tag, dryRun)
+	return sealSingle(ctx, src, repo, root, rootRaw, tag, dryRun, allowFallback)
 }
 
-func sealSingle(ctx context.Context, src ocichain.BlobSource, repo name.Repository, root digest.Digest, rootRaw []byte, tag *name.Tag, dryRun bool) (Result, error) {
+func sealSingle(ctx context.Context, src ocichain.BlobSource, repo name.Repository, root digest.Digest, rootRaw []byte, tag *name.Tag, dryRun, allowFallback bool) (Result, error) {
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(rootRaw, &manifest); err != nil {
 		return Result{}, fmt.Errorf("ociseal: parse root manifest: %w", err)
@@ -208,7 +223,7 @@ func sealSingle(ctx context.Context, src ocichain.BlobSource, repo name.Reposito
 	if err != nil {
 		return Result{}, err
 	}
-	sealed, err := sealPlatform(ctx, src, root, want)
+	sealed, err := sealPlatform(ctx, src, root, want, allowFallback)
 	if err != nil {
 		return Result{}, err
 	}
@@ -249,7 +264,7 @@ func sealSingle(ctx context.Context, src ocichain.BlobSource, repo name.Reposito
 // artifacts — is left byte-identical and never even fetched. The returned
 // sealed digest is the updated index's, so a multi-platform index is fully
 // sealed by chaining calls, each feeding the previous call's output digest.
-func sealIndexPlatform(ctx context.Context, src ocichain.BlobSource, repo name.Repository, root digest.Digest, rootRaw []byte, want ocispec.Platform, tag *name.Tag, dryRun bool) (Result, error) {
+func sealIndexPlatform(ctx context.Context, src ocichain.BlobSource, repo name.Repository, root digest.Digest, rootRaw []byte, want ocispec.Platform, tag *name.Tag, dryRun, allowFallback bool) (Result, error) {
 	var index ocispec.Index
 	if err := json.Unmarshal(rootRaw, &index); err != nil {
 		return Result{}, fmt.Errorf("ociseal: parse index: %w", err)
@@ -295,7 +310,7 @@ func sealIndexPlatform(ctx context.Context, src ocichain.BlobSource, repo name.R
 	if nested {
 		return Result{}, fmt.Errorf("ociseal: platform %s names a nested index: recursive sealing is not supported", scrubPlatform(&want))
 	}
-	manifest, err := sealPlatform(ctx, src, index.Manifests[child].Digest, want)
+	manifest, err := sealPlatform(ctx, src, index.Manifests[child].Digest, want, allowFallback)
 	if err != nil {
 		return Result{}, err
 	}
@@ -368,7 +383,7 @@ func indexPlatforms(index ocispec.Index) string {
 	return strings.Join(out, ", ")
 }
 
-func sealPlatform(ctx context.Context, src ocichain.BlobSource, root digest.Digest, want ocispec.Platform) (sealedManifest, error) {
+func sealPlatform(ctx context.Context, src ocichain.BlobSource, root digest.Digest, want ocispec.Platform, allowFallback bool) (sealedManifest, error) {
 	res, err := ocichain.Resolve(ctx, src, root, want)
 	if err != nil {
 		return sealedManifest{}, err
@@ -383,8 +398,8 @@ func sealPlatform(ctx context.Context, src ocichain.BlobSource, root digest.Dige
 	if err != nil {
 		return sealedManifest{}, fmt.Errorf("ociseal: build entries: %w", err)
 	}
-	if !canonical {
-		return sealedManifest{}, fmt.Errorf("ociseal: platform %s: %w", scrubPlatform(&res.Platform), ErrNotCanonical)
+	if !canonical && !allowFallback {
+		return sealedManifest{}, fmt.Errorf("ociseal: platform %s: %w (pass --allow-non-canonical to seal the fallback construction under the knarr annotations)", scrubPlatform(&res.Platform), ErrNotCanonical)
 	}
 	merged, err := mergedDigest(ctx, entries)
 	if err != nil {
@@ -394,7 +409,7 @@ func sealPlatform(ctx context.Context, src ocichain.BlobSource, root digest.Dige
 	if err != nil {
 		return sealedManifest{}, fmt.Errorf("ociseal: digest config: %w", err)
 	}
-	raw, changed, err := annotateManifest(res.ManifestBytes, merged, config)
+	raw, changed, err := annotateManifest(res.ManifestBytes, merged, config, canonical)
 	if err != nil {
 		return sealedManifest{}, err
 	}
@@ -452,7 +467,13 @@ func mergedDigest(ctx context.Context, entries []composefs.Entry) (string, error
 	return fsv, nil
 }
 
-func annotateManifest(raw []byte, merged, config string) ([]byte, bool, error) {
+// annotateManifest records merged and config under the standard annotations
+// for a canonical construction and under the knarr fallback annotations
+// otherwise: the standard namespace must only ever carry digests the upstream
+// algorithm reproduces. A non-canonical manifest that already carries any
+// standard merged annotation is refused — such an image is rejected at pull
+// time, and sealing must not launder it.
+func annotateManifest(raw []byte, merged, config string, canonical bool) ([]byte, bool, error) {
 	doc, err := decodeDocument(raw)
 	if err != nil {
 		return nil, false, fmt.Errorf("ociseal: parse manifest: %w", err)
@@ -478,19 +499,28 @@ func annotateManifest(raw []byte, merged, config string) ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	mergedPresent, err := checkExisting(annotations, MergedAnnotation, merged)
+	mergedKey, configKey := MergedAnnotation, ConfigAnnotation
+	if !canonical {
+		mergedKey, configKey = FallbackMergedAnnotation, FallbackConfigAnnotation
+		for key := range annotations {
+			if strings.HasPrefix(key, MergedAnnotationPrefix) {
+				return nil, false, fmt.Errorf("ociseal: manifest carries %s but the construction is not canonical", scrubControl(key))
+			}
+		}
+	}
+	mergedPresent, err := checkExisting(annotations, mergedKey, merged)
 	if err != nil {
 		return nil, false, err
 	}
-	configPresent, err := checkExisting(configAnnotations, ConfigAnnotation, config)
+	configPresent, err := checkExisting(configAnnotations, configKey, config)
 	if err != nil {
 		return nil, false, err
 	}
 	if mergedPresent && configPresent {
 		return raw, false, nil
 	}
-	annotations[MergedAnnotation] = mergedValue
-	configAnnotations[ConfigAnnotation] = configValue
+	annotations[mergedKey] = mergedValue
+	configAnnotations[configKey] = configValue
 	rewritten, err := json.Marshal(doc)
 	if err != nil {
 		return nil, false, fmt.Errorf("ociseal: marshal manifest: %w", err)

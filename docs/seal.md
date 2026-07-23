@@ -81,14 +81,43 @@ with the recomputed digest is an error.
 ## Non-canonical images are declined
 
 Seal only records a digest it can vouch for as upstream-reproducible. It
-refuses an image whose composefs construction diverges from the canonical form
-— for example one whose layers omit `/usr` or a file's parent directory —
-because such a tree's merged digest is not a stable value to seal. A declined
-seal pushes **nothing**, including under `--tag`. The decline is reported on
+refuses an image whose composefs construction diverges from the
+[canonical form](https://github.com/composefs/composefs-rs/blob/main/crates/composefs-oci/src/design.rs)
+— the construction upstream's OCI generation rules define, for example one
+whose layers omit `/usr` or a file's parent directory — because such a tree's
+merged digest is not a stable value to seal. A declined seal pushes
+**nothing**, including under `--tag`. The decline is reported on
 stderr with a non-zero exit and is independent of `--dry-run` — a dry run of
 an ineligible image is declined, not priced. The decline is per platform: a
 non-canonical platform does not block sealing its canonical siblings in their
 own calls.
+
+## Sealing non-canonical content
+
+`--allow-non-canonical` seals what the decline above would refuse: scratch
+images and OCI artifacts delivered as tar layers — ML models, data bundles —
+whose trees carry no `/usr` for the
+[canonical transforms](https://github.com/composefs/composefs-rs/blob/main/crates/composefs-oci/src/design.rs)
+to work from. knarr builds such trees with a deterministic fallback
+construction, and the option records that fallback digest under knarr's own
+annotations:
+
+- `io.foundries.knarr.composefs.fallback.v1.fsverity-sha256-12` on the
+  manifest, and
+- `io.foundries.knarr.composefs.config.fsverity-sha256-12` on the config
+  descriptor.
+
+The shared `composefs.merged.erofs.v1.*` namespace is never used for a
+fallback digest — it promises a value the upstream canonical algorithm
+reproduces — and a non-canonical manifest already carrying a standard merged
+annotation is refused even with the option. A canonical construction is
+sealed under the standard annotations regardless of the option, so passing it
+unconditionally is safe. On the device, pull verifies the fallback annotation
+against the digest it re-derives and fails closed on a mismatch — the same
+integrity story as a canonical seal, minus cross-tool reproducibility: the
+reference tooling cannot rebuild fallback constructions, so the crosscheck
+script does not apply to them. The target must still be an image manifest
+with tar-archive layers.
 
 ## What a call can target
 

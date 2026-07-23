@@ -12,10 +12,11 @@ import (
 
 func newSealCommand(*globalOptions) *cobra.Command {
 	var (
-		platform string
-		tag      string
-		dryRun   bool
-		format   = cli.FormatText
+		platform          string
+		tag               string
+		dryRun            bool
+		allowNonCanonical bool
+		format            = cli.FormatText
 	)
 
 	cmd := &cobra.Command{
@@ -24,9 +25,10 @@ func newSealCommand(*globalOptions) *cobra.Command {
 		Args:  cli.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			result, err := ociseal.Seal(cmd.Context(), args[0], ociseal.Options{
-				Platform: platform,
-				Tag:      tag,
-				DryRun:   dryRun,
+				Platform:          platform,
+				Tag:               tag,
+				DryRun:            dryRun,
+				AllowNonCanonical: allowNonCanonical,
 			})
 			if err != nil {
 				return err
@@ -38,6 +40,7 @@ func newSealCommand(*globalOptions) *cobra.Command {
 	cmd.Flags().StringVar(&platform, "platform", "", "index child to seal, as os/arch[/variant]; required for an index reference")
 	cmd.Flags().StringVar(&tag, "tag", "", "also tag the sealed root in the input repository")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "compute the sealed digest without pushing")
+	cmd.Flags().BoolVar(&allowNonCanonical, "allow-non-canonical", false, "seal a non-canonical construction under the knarr fallback annotations instead of declining")
 	cli.AddFormatFlag(cmd, &format)
 	return cmd
 }

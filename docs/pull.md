@@ -105,11 +105,15 @@ A **canonical** construction reproduces the sealed digest, so a present
 must match the measured value exactly; a mismatch aborts the pull, and an
 image carrying neither annotation is always a valid unsealed pull. A
 **non-canonical** construction cannot honestly claim a reproducible sealed
-digest, so pull rejects it outright if the manifest carries any annotation
-under the `composefs.merged.erofs.v1.` namespace — regardless of the suffix or
-value it records. A non-canonical image with no such annotation is likewise a
-valid unsealed pull. The annotation keys and their meaning are defined by the
-upstream
+digest under that namespace, so pull rejects it outright if the manifest
+carries any annotation under the `composefs.merged.erofs.v1.` prefix —
+regardless of the suffix or value it records. What it does reproduce is its
+own deterministic fallback digest, so a present knarr fallback annotation
+(`io.foundries.knarr.composefs.fallback.v1.fsverity-sha256-12`, written by
+`knarr seal --allow-non-canonical`) is verified against the re-derived value
+with the same fail-closed handling. A non-canonical image carrying neither is
+likewise a valid unsealed pull. The upstream annotation keys and their
+meaning are defined by the
 [composefs OCI sealing specification](https://github.com/composefs/composefs-rs/blob/main/crates/composefs-oci/src/sealing_spec.rs),
 which knarr follows verbatim.
 

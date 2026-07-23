@@ -24,10 +24,12 @@ const MergedAnnotationPrefix = "composefs.merged.erofs.v1."
 // or config annotation must equal the measured value; a mismatch fails closed
 // and a missing annotation is accepted as an unsealed pull.
 //
-// A non-canonical construction cannot reproduce the value a sealing annotation
-// claims, so any annotation under the merged-EROFS namespace fails closed
-// regardless of its suffix or value. A non-canonical image with no such
-// annotation is a valid unsealed pull.
+// A non-canonical construction cannot reproduce the value a standard sealing
+// annotation claims, so any annotation under the merged-EROFS namespace fails
+// closed regardless of its suffix or value. What it does reproduce is its own
+// deterministic fallback digest, so a present knarr fallback annotation must
+// equal the measured value, with the same fail-closed mismatch handling. A
+// non-canonical image with neither is a valid unsealed pull.
 func VerifyAnnotations(ctx context.Context, store *objectstore.Store, res ocichain.Resolved, mergedFsverity string, canonical bool) error {
 	if store == nil {
 		return errors.New("ociseal: nil object store")
@@ -35,25 +37,26 @@ func VerifyAnnotations(ctx context.Context, store *objectstore.Store, res ocicha
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	mergedKey, configKey := MergedAnnotation, ConfigAnnotation
 	if !canonical {
 		for key := range res.Manifest.Annotations {
 			if strings.HasPrefix(key, MergedAnnotationPrefix) {
 				return fmt.Errorf("ociseal: sealing annotation %s on non-canonical construction", scrubControl(key))
 			}
 		}
-		return nil
+		mergedKey, configKey = FallbackMergedAnnotation, FallbackConfigAnnotation
 	}
-	if value, ok := res.Manifest.Annotations[MergedAnnotation]; ok {
-		if err := verifyAnnotation(MergedAnnotation, value, mergedFsverity); err != nil {
+	if value, ok := res.Manifest.Annotations[mergedKey]; ok {
+		if err := verifyAnnotation(mergedKey, value, mergedFsverity); err != nil {
 			return err
 		}
 	}
-	if value, ok := res.Manifest.Config.Annotations[ConfigAnnotation]; ok {
+	if value, ok := res.Manifest.Config.Annotations[configKey]; ok {
 		measured, err := store.VerityDigest(res.ConfigDesc.Digest)
 		if err != nil {
 			return fmt.Errorf("ociseal: measure stored config: %w", err)
 		}
-		if err := verifyAnnotation(ConfigAnnotation, value, measured); err != nil {
+		if err := verifyAnnotation(configKey, value, measured); err != nil {
 			return err
 		}
 	}
