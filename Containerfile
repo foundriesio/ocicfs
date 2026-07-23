@@ -114,7 +114,11 @@ RUN apt-get update \
         # image and mkfs.ext4 (e2fsprogs) to format it with the verity feature.
         util-linux \
         e2fsprogs \
- && rm -rf /var/lib/apt/lists/*
+        # fsverity: the reference fs-verity-utils CLI, a userspace oracle the
+        # verity digest test measures against alongside the kernel measure.
+        fsverity \
+ && rm -rf /var/lib/apt/lists/* \
+ && command -v fsverity >/dev/null
 
 RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
     | sh -s -- -b "$(go env GOPATH)/bin" "${GOLANGCI_LINT_VERSION}" \
