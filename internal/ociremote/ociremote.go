@@ -48,8 +48,8 @@ func Open(ctx context.Context, ref string) (ocichain.BlobSource, digest.Digest, 
 		return nil, "", fmt.Errorf("ociremote: parse reference %q: %w", ref, err)
 	}
 	repo := parsed.Context()
-	if repo.Scheme() != "https" && !isLoopback(repo.RegistryStr()) {
-		return nil, "", fmt.Errorf("ociremote: registry %s does not use HTTPS", repo.RegistryStr())
+	if err := RequireSecureRegistry(repo); err != nil {
+		return nil, "", err
 	}
 	puller, err := remote.NewPuller(remote.WithAuthFromKeychain(authn.DefaultKeychain))
 	if err != nil {
@@ -120,6 +120,18 @@ func (s *source) Open(ctx context.Context, desc ocispec.Descriptor) (io.ReadClos
 // registry does not serve.
 func (s *source) DescribeMissingRoot(root digest.Digest, _ error) error {
 	return fmt.Errorf("ociremote: root %s is not present in registry %s; verify the pinned digest and that the image is pushed and pullable", root, s.repo.Name())
+}
+
+// RequireSecureRegistry rejects a repository whose registry would be contacted
+// over plain HTTP, unless it is a loopback address (localhost or a loopback
+// IP): content integrity comes from a pinned digest, not the channel, and a
+// loopback registry is standard tooling. Every path that talks to a registry
+// must apply this policy, whether it fetches or only pushes.
+func RequireSecureRegistry(repo name.Repository) error {
+	if repo.Scheme() != "https" && !isLoopback(repo.RegistryStr()) {
+		return fmt.Errorf("ociremote: registry %s does not use HTTPS", repo.RegistryStr())
+	}
+	return nil
 }
 
 // isLoopback reports whether registry (a host or host:port) is localhost or a

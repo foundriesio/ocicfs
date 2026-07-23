@@ -327,6 +327,91 @@ func TestSealRegistryAndReseal(t *testing.T) {
 	}
 }
 
+// TestSealFromDir seals from a local OCI image layout: the dry run completes
+// with no network access at all, and the push run computes the same sealed
+// digest while touching no registry blob endpoint — only manifests move.
+func TestSealFromDir(t *testing.T) {
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skipf("mkcomposefs unavailable: %v", err)
+	}
+	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	layout, err := octest.BuildSingleLayerGzip(t.TempDir(), platform,
+		octest.File{Name: "usr", Dir: true},
+		octest.File{Name: "usr/bin", Dir: true},
+		octest.File{Name: "usr/bin/app", Mode: 0o755, Body: "#!/bin/sh\n"},
+	)
+	if err != nil {
+		t.Fatalf("BuildSingleLayerGzip: %v", err)
+	}
+	ref := "registry.example.com/team/app@" + layout.Root.String()
+
+	oldTransport := remote.DefaultTransport
+	remote.DefaultTransport = failTransport{}
+	t.Cleanup(func() {
+		remote.DefaultTransport = oldTransport
+	})
+	dryRun, err := Seal(context.Background(), ref, Options{FromDir: layout.Dir, DryRun: true})
+	if err != nil {
+		t.Fatalf("Seal --from-dir dry run: %v", err)
+	}
+	if dryRun.Sealed == layout.Root {
+		t.Fatal("dry run did not change the root digest")
+	}
+
+	registry := octest.NewRegistry()
+	t.Cleanup(registry.Close)
+	remote.DefaultTransport = registry.Transport()
+	pushImage(t, registry, "registry.example.com/team/app:input", layoutImage(t, layout))
+
+	blobs := &blobCounter{inner: registry.Transport()}
+	remote.DefaultTransport = blobs
+	result, err := Seal(context.Background(), ref, Options{FromDir: layout.Dir})
+	if err != nil {
+		t.Fatalf("Seal --from-dir: %v", err)
+	}
+	if result.Sealed != dryRun.Sealed {
+		t.Fatalf("sealed digest = %s, offline dry run computed %s", result.Sealed, dryRun.Sealed)
+	}
+	if n := blobs.hits.Load(); n != 0 {
+		t.Fatalf("seal touched registry blob endpoints %d times; --from-dir must read blobs from the layout", n)
+	}
+	remote.DefaultTransport = registry.Transport()
+	assertRemoteAnnotations(t, registry, result)
+}
+
+// TestSealFromDirRejectsInsecureRegistry applies the registry HTTPS policy to
+// the local-layout path too: a reference whose pushes would travel over plain
+// HTTP to a non-loopback registry is rejected before anything is read.
+func TestSealFromDirRejectsInsecureRegistry(t *testing.T) {
+	ref := "10.0.0.5:5000/team/app@sha256:" + strings.Repeat("a", 64)
+	_, err := Seal(context.Background(), ref, Options{FromDir: t.TempDir(), DryRun: true})
+	if err == nil || !strings.Contains(err.Error(), "does not use HTTPS") {
+		t.Fatalf("err = %v, want an HTTPS policy rejection", err)
+	}
+}
+
+// failTransport fails every request, so a test can assert an operation is
+// fully offline.
+type failTransport struct{}
+
+func (failTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("unexpected network request: %s %s", req.Method, req.URL)
+}
+
+// blobCounter tallies requests to registry blob endpoints (reads and upload
+// starts alike), so a test can assert every blob byte came from elsewhere.
+type blobCounter struct {
+	inner http.RoundTripper
+	hits  atomic.Int64
+}
+
+func (c *blobCounter) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.Contains(req.URL.Path, "/blobs/") {
+		c.hits.Add(1)
+	}
+	return c.inner.RoundTrip(req)
+}
+
 func TestSealGoldenDigest(t *testing.T) {
 	if _, err := exec.LookPath("mkcomposefs"); err != nil {
 		t.Skipf("mkcomposefs unavailable: %v", err)

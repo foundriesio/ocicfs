@@ -9,9 +9,12 @@
 # Phase 0 builds a purpose-built image offline with umoci -- object, inline,
 # and empty files, a symlink, /run content the canonical transform drops, and
 # a second layer with a whiteout and an override, deliberately hardlink-free
-# -- pushes it to the local registry, seals it as a plain manifest target,
-# runs seal-crosscheck.sh on it expecting the exact three-way digest match,
-# and drives the sealed image through the full verb lifecycle.
+# -- pushes it to the local registry, seals it as a plain manifest target
+# (the pushing seal reads from the local layout via --from-dir, after a
+# dry-run parity check against the registry source; the busybox seal leg
+# below covers the registry-sourced push), runs seal-crosscheck.sh on it
+# expecting the exact three-way digest match, and drives the sealed image
+# through the full verb lifecycle.
 #
 # The rest exercises a real image: the full lifecycle -- pull -> ls ->
 # inspect -> mount -> unmount, then mount --metadata-only with the overlay a
@@ -216,11 +219,13 @@ cdigest="$(jq -r '.manifests[0].digest' "$IMGDIR/layout/index.json")"
 crane push "$IMGDIR/layout" "127.0.0.1:$port/custom"
 cref="127.0.0.1:$port/custom@$cdigest"
 
-echo "== seal (plain manifest target: dry-run parity, then push) =="
+echo "== seal (plain manifest target: dry-run parity, then --from-dir push) =="
 cdry="$("${KN[@]}" seal --dry-run --format json "$cref" | jq -r .sealed)"
 [[ "$cdry" == sha256:* ]] || fail "custom seal --dry-run reported no sealed digest"
-csealed="$("${KN[@]}" seal --format json "$cref" | jq -r .sealed)"
-[ "$csealed" = "$cdry" ] || fail "custom sealed digest differs between dry-run and push"
+cfromdir="$("${KN[@]}" seal --dry-run --from-dir "$IMGDIR/layout" --format json "$cref" | jq -r .sealed)"
+[ "$cfromdir" = "$cdry" ] || fail "custom seal --from-dir dry-run digest differs from the registry dry-run"
+csealed="$("${KN[@]}" seal --from-dir "$IMGDIR/layout" --format json "$cref" | jq -r .sealed)"
+[ "$csealed" = "$cdry" ] || fail "custom sealed digest differs between dry-run and --from-dir push"
 cman="$(crane manifest "127.0.0.1:$port/custom@$csealed")"
 jq -e '.annotations["composefs.merged.erofs.v1.fsverity-sha256-12"] | test("^[0-9a-f]{64}$")' \
 	<<<"$cman" >/dev/null || fail "custom sealed manifest lacks a well-formed merged fsverity annotation"

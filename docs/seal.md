@@ -65,7 +65,8 @@ its descriptor was left alone.
 
 - `mkcomposefs` on `PATH` (from the composefs tools).
 - A digest-pinned reference the registry serves, and push access to its
-  repository.
+  repository (with `--from-dir` the reads come from a local layout instead,
+  and a `--from-dir` dry run needs no registry at all).
 
 ## What seal computes
 
@@ -128,6 +129,54 @@ image-manifest media type and carries a regular image config, and only its
 layer types (in-toto JSON, not tar) reveal that it holds no filesystem to
 seal. Selecting such a child, or naming one directly, is an error. A selected
 child that is itself an index is declined: recursive sealing is not supported.
+
+## Sealing from a local image layout
+
+`--from-dir <dir>` reads the image from a local OCI image layout directory
+instead of pulling it from the registry. Straight from a build, when the host
+already holds every byte seal needs:
+
+```sh
+docker buildx build --provenance=false -o type=oci,tar=false,dest=./layout .
+crane push ./layout ghcr.io/example/app:1.2.3
+digest=$(crane digest ghcr.io/example/app:1.2.3)
+knarr seal --from-dir ./layout "ghcr.io/example/app@$digest"
+```
+
+Or export an already-published image with `crane pull`. With `--platform`
+the layout roots at that platform's manifest, so the digest to pin is the
+layout's own index entry:
+
+```sh
+crane pull --platform linux/amd64 --format=oci ghcr.io/example/app:1.2.3 ./layout
+digest=$(jq -r '.manifests[0].digest' ./layout/index.json)
+knarr seal --from-dir ./layout "ghcr.io/example/app@$digest"
+```
+
+`docker save` piped through `tar` is a third source when the daemon runs the
+containerd image store (`docker info` reports `io.containerd.snapshotter.v1`):
+it exports the registry's exact index, so a multi-arch image needs
+`--platform` and holds only the platforms the daemon pulled. The legacy
+graphdriver store instead reconstructs manifests whose digests match nothing
+published — don't seal from those:
+
+```sh
+docker save ghcr.io/example/app:1.2.3 | tar -x -C ./layout
+digest=$(jq -r '.manifests[0].digest' ./layout/index.json)
+knarr seal --from-dir ./layout "ghcr.io/example/app@$digest" --platform linux/amd64
+```
+
+Only the reads move local: the annotated manifests are still pushed to the
+repository the reference names, and the registry accepts them only when it
+already holds the blobs they reference — so the flow is build, push, then
+seal. A never-pushed image cannot be sealed into a registry this way, because
+seal pushes manifests, not layers. The layout must contain the pinned root
+and everything the seal reads through it — for an index target, the index
+and the selected child. Watch what roots the layout: without
+`--provenance=false` buildx attaches an attestation and the root becomes an
+index, so sealing it needs `--platform`; `crane pull --format=oci` exports
+the full index unless `--platform` narrows it to one child. With `--dry-run`
+the command is fully offline.
 
 ## Local testing
 

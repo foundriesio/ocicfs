@@ -66,6 +66,11 @@ type Options struct {
 	Platform string
 	Tag      string
 	DryRun   bool
+	// FromDir reads the image from a local OCI image layout directory
+	// instead of the registry. The reference still names the repository the
+	// sealed manifests are pushed to, and the registry accepts them only if
+	// it already holds the blobs they reference.
+	FromDir string
 	// AllowNonCanonical permits sealing a non-canonical construction: its
 	// deterministic fallback digest is recorded under the knarr fallback
 	// annotations instead of declining. A canonical construction is sealed
@@ -100,13 +105,29 @@ type PlatformResult struct {
 // or the Options.Platform child of the index ref names — and pushes the
 // changed manifests in the same repository unless DryRun is set.
 func Seal(ctx context.Context, ref string, opts Options) (Result, error) {
-	src, root, err := ociremote.Open(ctx, ref)
-	if err != nil {
-		return Result{}, err
-	}
 	input, err := name.NewDigest(ref)
 	if err != nil {
 		return Result{}, fmt.Errorf("ociseal: parse reference: %w", err)
+	}
+	var (
+		src  ocichain.BlobSource
+		root digest.Digest
+	)
+	if opts.FromDir != "" {
+		if err := ociremote.RequireSecureRegistry(input.Context()); err != nil {
+			return Result{}, err
+		}
+		root = digest.Digest(input.DigestStr())
+		if err := digestutil.ValidateSHA256(root); err != nil {
+			return Result{}, fmt.Errorf("ociseal: %w", err)
+		}
+		if src, err = ocilayout.Open(opts.FromDir); err != nil {
+			return Result{}, err
+		}
+	} else {
+		if src, root, err = ociremote.Open(ctx, ref); err != nil {
+			return Result{}, err
+		}
 	}
 	tag, err := outputTag(input.Context(), opts.Tag)
 	if err != nil {

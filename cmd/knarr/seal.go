@@ -16,6 +16,7 @@ func newSealCommand(*globalOptions) *cobra.Command {
 		tag               string
 		dryRun            bool
 		allowNonCanonical bool
+		fromDir           string
 		format            = cli.FormatText
 	)
 
@@ -29,6 +30,7 @@ func newSealCommand(*globalOptions) *cobra.Command {
 				Tag:               tag,
 				DryRun:            dryRun,
 				AllowNonCanonical: allowNonCanonical,
+				FromDir:           fromDir,
 			})
 			if err != nil {
 				return err
@@ -41,6 +43,7 @@ func newSealCommand(*globalOptions) *cobra.Command {
 	cmd.Flags().StringVar(&tag, "tag", "", "also tag the sealed root in the input repository")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "compute the sealed digest without pushing")
 	cmd.Flags().BoolVar(&allowNonCanonical, "allow-non-canonical", false, "seal a non-canonical construction under the knarr fallback annotations instead of declining")
+	cmd.Flags().StringVar(&fromDir, "from-dir", "", "read the image from a local OCI image layout directory instead of the registry; pushes still go to the reference's repository")
 	cli.AddFormatFlag(cmd, &format)
 	return cmd
 }
