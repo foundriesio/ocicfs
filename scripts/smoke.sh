@@ -3,7 +3,8 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: Apache-2.0
 #
-# knarr smoke test: exercise the local image lifecycle against a real image.
+# knarr smoke test: exercise the image lifecycle and sealing against a real
+# image and a real registry.
 #
 # Drives the built knarr binary through the full lifecycle -- pull -> ls ->
 # inspect -> mount -> unmount, then mount --metadata-only with the overlay a
@@ -15,9 +16,13 @@
 # so the currently implemented functionality can be checked by hand in one
 # command. A final differential leg diffs the mounted rootfs against the same
 # image flattened by crane export, so the layer merge is checked against an
-# independent implementation on a real image. The registry legs run against a
-# local zot instance -- a real OCI registry that enforces the distribution spec
-# on manifest PUTs, unlike an in-process test registry. It needs a privileged,
+# independent implementation on a real image. A sealing leg then runs
+# `knarr seal` against the registry for the host platform of the multi-arch
+# image -- dry-run parity, the annotation check on the raw pushed manifest,
+# and the sealed image's own full lifecycle, whose pull verifies the seal
+# device-side. The registry legs run against a local zot
+# instance -- a real OCI registry that enforces the distribution spec on
+# manifest PUTs, unlike an in-process test registry. It needs a privileged,
 # fs-verity-capable environment with mkcomposefs and mount.composefs on PATH
 # -- i.e. the dev container. Either open the dev container and run the target
 # inside it:
@@ -205,4 +210,47 @@ diff -r -q --no-dereference "$EXPORTDIR" "$MNT" || fail "mounted rootfs differs 
 "${KN[@]}" unmount "$MNT"
 "${KN[@]}" remove "$ref"
 
-echo "SMOKE OK: pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export (checks passed)"
+echo "==== seal: publisher-side sealing, then the sealed image's lifecycle ===="
+# Seal handles one platform per call; the smoke image is a multi-arch index,
+# so select the host platform. --platform matches the index descriptors
+# exactly, including the variant (busybox lists arm64 only as linux/arm64/v8),
+# so read the full platform string from the index rather than assuming a bare
+# os/arch pair. The printed sealed digest is the updated index's.
+platform="$(crane manifest "$ref" | jq -r --arg arch "$(go env GOARCH)" \
+	'first(.manifests[].platform | select(.os == "linux" and .architecture == $arch))
+		| [.os, .architecture, .variant // empty] | join("/")')"
+[[ "$platform" == linux/* ]] || fail "smoke index lists no linux/$(go env GOARCH) platform"
+echo "== seal --dry-run (expect a sealed digest, nothing pushed) =="
+dryrun="$("${KN[@]}" seal --dry-run --platform "$platform" --format json "$ref")"
+sealed_dry="$(jq -r .sealed <<<"$dryrun")"
+[[ "$sealed_dry" == sha256:* ]] || fail "seal --dry-run reported no sealed digest"
+if crane manifest "127.0.0.1:$port/smoke@$sealed_dry" >/dev/null 2>&1; then
+	fail "seal --dry-run pushed the sealed manifest"
+fi
+
+echo "== seal (expect the dry-run digest, pushed) =="
+sealout="$("${KN[@]}" seal --platform "$platform" --format json "$ref")"
+sealed="$(jq -r .sealed <<<"$sealout")"
+[ "$sealed" = "$sealed_dry" ] || fail "sealed digest differs between dry-run and push"
+[ "$sealed" != "$digest" ] || fail "sealing left the manifest digest unchanged"
+
+echo "== raw sealed manifest (expect both fsverity annotations, bare hex) =="
+# The annotations live on each platform image manifest. A multi-arch image
+# seals as an index, so descend to the host platform's child first.
+manifest="$(crane manifest "127.0.0.1:$port/smoke@$sealed")"
+if jq -e '.manifests' <<<"$manifest" >/dev/null; then
+	child="$(jq -r --arg arch "$(go env GOARCH)" \
+		'[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)][0].digest' \
+		<<<"$manifest")"
+	[[ "$child" == sha256:* ]] || fail "sealed index has no host-platform manifest"
+	manifest="$(crane manifest "127.0.0.1:$port/smoke@$child")"
+fi
+jq -e '.annotations["composefs.merged.erofs.v1.fsverity-sha256-12"] | test("^[0-9a-f]{64}$")' \
+	<<<"$manifest" >/dev/null || fail "sealed manifest lacks a well-formed merged fsverity annotation"
+jq -e '.config.annotations["composefs.config.fsverity-sha256-12"] | test("^[0-9a-f]{64}$")' \
+	<<<"$manifest" >/dev/null || fail "sealed manifest lacks a well-formed config fsverity annotation"
+
+echo "==== lifecycle 4: the sealed image (pull re-verifies the seal) ===="
+run_lifecycle "127.0.0.1:$port/smoke@$sealed" "$sealed" pull "127.0.0.1:$port/smoke@$sealed"
+
+echo "SMOKE OK: pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export and a seal round against the registry (checks passed)"

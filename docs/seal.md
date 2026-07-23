@@ -100,6 +100,44 @@ layer types (in-toto JSON, not tar) reveal that it holds no filesystem to
 seal. Selecting such a child, or naming one directly, is an error. A selected
 child that is itself an index is declined: recursive sealing is not supported.
 
+## Local testing
+
+The dev container serves zot, a real OCI registry, at `127.0.0.1:5000`, so
+sealing is testable end to end by hand without external push access (busybox
+is a multi-arch index, so the platform must be selected):
+
+```sh
+crane copy docker.io/library/busybox:latest 127.0.0.1:5000/app
+digest=$(crane digest 127.0.0.1:5000/app:latest)
+knarr seal "127.0.0.1:5000/app@$digest" --platform linux/amd64
+knarr pull "127.0.0.1:5000/app@<sealed digest>"
+```
+
+The registry persists for the container's lifetime (storage under
+`/var/lib/zot`, log at `/var/tmp/zot.log`). `make smoke` runs the same round
+automatically — dry-run parity, the annotation check on the raw pushed
+manifest, then a device-side pull of the sealed image — against its own
+ephemeral zot instance, so smoke runs never see manual state.
+
+The failure path is worth exercising by hand too: a sealed manifest whose
+annotation disagrees with its content must not pull. Overwrite the recorded
+merged digest and pull the result — `crane mutate` pushes the tampered
+manifest under its own new digest and prints its reference (resealing is a
+no-op, so rerunning seal just reports the sealed manifest's reference):
+
+```sh
+mref=$(knarr seal "127.0.0.1:5000/app@$digest" --platform linux/amd64 \
+        --format json | jq -r '.platforms[0].sealed_manifest_ref')
+tampered=$(crane mutate "$mref" \
+        --annotation composefs.merged.erofs.v1.fsverity-sha256-12=$(printf '%064d' 0))
+knarr pull "$tampered"
+```
+
+The pull materializes the content, measures it, finds the recorded annotation
+disagrees, and fails closed without recording the image. The e2e suite runs
+the same tamper check automatically in both directions — against a fresh pull
+and against a restart over an already-stored image.
+
 ## Authority boundary
 
 Sealing establishes **publisher-side consistency**: it proves the recorded
