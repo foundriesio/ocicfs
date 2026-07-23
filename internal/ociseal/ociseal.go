@@ -597,12 +597,19 @@ func isImageManifest(m ocispec.Manifest) bool {
 // replaced by spaces, so an os/arch/variant derived from publisher-controlled
 // config JSON cannot inject escape sequences into terminal error output.
 func scrubPlatform(p *ocispec.Platform) string {
+	return scrubControl(ocilayout.PlatformString(p))
+}
+
+// scrubControl replaces control characters in s with spaces, so a value
+// derived from untrusted input cannot inject escape sequences into terminal
+// output.
+func scrubControl(s string) string {
 	return strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {
 			return ' '
 		}
 		return r
-	}, ocilayout.PlatformString(p))
+	}, s)
 }
 
 func documentMediaType(doc map[string]any, fallback string) string {

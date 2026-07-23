@@ -18,6 +18,7 @@ import (
 	"github.com/foundriesio/knarr/internal/imagestore"
 	"github.com/foundriesio/knarr/internal/objectstore"
 	"github.com/foundriesio/knarr/internal/ocichain"
+	"github.com/foundriesio/knarr/internal/ociseal"
 	"github.com/foundriesio/knarr/internal/rootfs"
 )
 
@@ -60,6 +61,9 @@ func Materialize(ctx context.Context, store *objectstore.Store, img *imagestore.
 	built, err := rootfs.Assemble(ctx, store, openLayer, res.DiffIDs)
 	if err != nil {
 		return Built{}, err
+	}
+	if err := ociseal.VerifyAnnotations(ctx, store, res, built.FsverityDigest, built.Canonical); err != nil {
+		return Built{}, fmt.Errorf("materialize: verify sealing annotations: %w", err)
 	}
 
 	if err := store.Sync(); err != nil {

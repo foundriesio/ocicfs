@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/opencontainers/go-digest"
@@ -22,8 +23,19 @@ import (
 	"github.com/foundriesio/knarr/internal/imagestore"
 	"github.com/foundriesio/knarr/internal/objectstore"
 	"github.com/foundriesio/knarr/internal/ocilayout"
+	"github.com/foundriesio/knarr/internal/ociseal"
 	"github.com/foundriesio/knarr/internal/octest"
 )
+
+// canonicalLayerFiles is a standard-layout single-layer tree — /usr and its
+// intermediate directories are explicit, so the construction is canonical.
+func canonicalLayerFiles(body string) []octest.File {
+	return []octest.File{
+		{Name: "usr", Dir: true},
+		{Name: "usr/bin", Dir: true},
+		{Name: "usr/bin/app", Mode: 0o755, Body: body},
+	}
+}
 
 func TestMaterializeMatchesDirectoryAndMemorySources(t *testing.T) {
 	if _, err := exec.LookPath("mkcomposefs"); err != nil {
@@ -260,6 +272,111 @@ func TestMaterializeCorruptLayerWritesNoBinding(t *testing.T) {
 	}
 }
 
+// TestMaterializeRejectsTamperedSealingAnnotations pins the fresh-path
+// fail-closed behavior for a canonical image: a merged or config sealing
+// annotation that disagrees with the measured content aborts the pull before
+// any binding is written.
+func TestMaterializeRejectsTamperedSealingAnnotations(t *testing.T) {
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+	tampered := strings.Repeat("0", 64)
+	tests := []struct {
+		name        string
+		manifestAnn map[string]string
+		configAnn   map[string]string
+	}{
+		{name: "merged", manifestAnn: map[string]string{ociseal.MergedAnnotation: tampered}},
+		{name: "config", configAnn: map[string]string{ociseal.ConfigAnnotation: tampered}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lay, err := octest.BuildSingleLayerGzip(t.TempDir(), ocispec.Platform{OS: "linux", Architecture: "amd64"},
+				canonicalLayerFiles("hello from knarr - a payload past the inline limit\n")...,
+			)
+			if err != nil {
+				t.Fatalf("build layout: %v", err)
+			}
+			root := rewriteManifestAnnotations(t, lay, tt.manifestAnn, tt.configAnn)
+			storeRoot, obj, img := newStores(t)
+			src, err := ocilayout.Open(lay.Dir)
+			if err != nil {
+				t.Fatalf("ocilayout.Open: %v", err)
+			}
+			_, err = Materialize(context.Background(), obj, img, src, root, lay.Platform)
+			skipIfNoVerity(t, err)
+			if err == nil || !strings.Contains(err.Error(), "annotation") {
+				t.Fatalf("Materialize error = %v, want annotation failure", err)
+			}
+			if _, statErr := os.Stat(octest.BindingPath(storeRoot, root, lay.Platform)); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("binding must not exist after annotation failure, stat: %v", statErr)
+			}
+		})
+	}
+}
+
+// TestMaterializeNonCanonicalSealingPolicy pins the fresh-path rule for a
+// non-canonical image: a merged-EROFS annotation under any suffix key fails
+// closed, while the same image with no such annotation is a valid unsealed
+// pull.
+func TestMaterializeNonCanonicalSealingPolicy(t *testing.T) {
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+	body := "a payload larger than the sixty-four byte inline limit so it becomes an object\n"
+	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+
+	t.Run("sealed rejected", func(t *testing.T) {
+		lay, err := octest.BuildSingleLayerGzip(t.TempDir(), platform,
+			octest.File{Name: "etc/config", Mode: 0o644, Body: body},
+		)
+		if err != nil {
+			t.Fatalf("build layout: %v", err)
+		}
+		root := rewriteManifestAnnotations(t, lay,
+			map[string]string{"composefs.merged.erofs.v1.fsverity-sha512-12": strings.Repeat("a", 64)}, nil)
+		storeRoot, obj, img := newStores(t)
+		src, err := ocilayout.Open(lay.Dir)
+		if err != nil {
+			t.Fatalf("ocilayout.Open: %v", err)
+		}
+		_, err = Materialize(context.Background(), obj, img, src, root, lay.Platform)
+		skipIfNoVerity(t, err)
+		if err == nil || !strings.Contains(err.Error(), "non-canonical") {
+			t.Fatalf("Materialize error = %v, want non-canonical failure", err)
+		}
+		if _, statErr := os.Stat(octest.BindingPath(storeRoot, root, lay.Platform)); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("binding must not exist after annotation failure, stat: %v", statErr)
+		}
+	})
+
+	t.Run("unsealed accepted", func(t *testing.T) {
+		lay, err := octest.BuildSingleLayerGzip(t.TempDir(), platform,
+			octest.File{Name: "etc/config", Mode: 0o644, Body: body},
+		)
+		if err != nil {
+			t.Fatalf("build layout: %v", err)
+		}
+		_, obj, img := newStores(t)
+		src, err := ocilayout.Open(lay.Dir)
+		if err != nil {
+			t.Fatalf("ocilayout.Open: %v", err)
+		}
+		_, err = Materialize(context.Background(), obj, img, src, lay.Root, lay.Platform)
+		skipIfNoVerity(t, err)
+		if err != nil {
+			t.Fatalf("Materialize: %v", err)
+		}
+		b, err := img.Get(lay.Root, lay.Platform)
+		if err != nil {
+			t.Fatalf("imagestore.Get: %v", err)
+		}
+		if b.Canonical {
+			t.Fatal("divergent binding recorded canonical = true")
+		}
+	})
+}
+
 // corruptLayerBlob flips the last byte of the layout's single layer blob in
 // place, keeping its length so only content verification can catch the change.
 func corruptLayerBlob(t *testing.T, lay octest.Layout) {
@@ -281,4 +398,34 @@ func corruptLayerBlob(t *testing.T, lay octest.Layout) {
 	if err := os.WriteFile(layerPath, blob, 0o644); err != nil { // #nosec G703 -- test corrupts a layer blob in the layout it built
 		t.Fatalf("write corrupt layer: %v", err)
 	}
+}
+
+// rewriteManifestAnnotations rewrites lay's manifest with the given manifest and
+// config-descriptor annotations, writes it under its new digest, and returns
+// that digest as the pinned root.
+func rewriteManifestAnnotations(t *testing.T, lay octest.Layout, manifestAnn, configAnn map[string]string) digest.Digest {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(lay.Dir, "blobs", "sha256", lay.Manifest.Encoded())) // #nosec G304 -- test fixture path
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	var manifest ocispec.Manifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatalf("parse manifest: %v", err)
+	}
+	if manifestAnn != nil {
+		manifest.Annotations = manifestAnn
+	}
+	if configAnn != nil {
+		manifest.Config.Annotations = configAnn
+	}
+	raw, err = json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	root := digest.FromBytes(raw)
+	if err := os.WriteFile(filepath.Join(lay.Dir, "blobs", "sha256", root.Encoded()), raw, 0o600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	return root
 }

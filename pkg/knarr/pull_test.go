@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -23,8 +24,10 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/foundriesio/knarr/internal/devtest"
+	"github.com/foundriesio/knarr/internal/imagestore"
 	"github.com/foundriesio/knarr/internal/objectstore"
 	"github.com/foundriesio/knarr/internal/ocilayout"
+	"github.com/foundriesio/knarr/internal/ociseal"
 	"github.com/foundriesio/knarr/internal/octest"
 	"github.com/foundriesio/knarr/internal/rootfs"
 )
@@ -444,6 +447,175 @@ func TestPullRegistryE2ESkipsExistingImage(t *testing.T) {
 	if legacy.RootfsSize != 0 {
 		t.Fatalf("RootfsSize = %d after a cache-hit pull of a legacy binding, want 0 (no backfill)", legacy.RootfsSize)
 	}
+}
+
+// TestVerifiedPulledImageRejectsTamperedSealingAnnotations pins the cached-path
+// fail-closed behavior for a canonical image: a merged or config sealing
+// annotation that disagrees with the measured content propagates as an error
+// rather than a silent cache miss.
+func TestVerifiedPulledImageRejectsTamperedSealingAnnotations(t *testing.T) {
+	lay, err := octest.BuildSingleLayerGzip(t.TempDir(), hostPlatform(),
+		canonicalPullFiles("cached image payload past the sixty-four byte inline limit\n")...,
+	)
+	if err != nil {
+		t.Fatalf("BuildSingleLayerGzip: %v", err)
+	}
+	obj, imgStore, binding := pullForSealingTest(t, lay)
+
+	tampered := strings.Repeat("0", 64)
+	tests := []struct {
+		name        string
+		manifestAnn map[string]string
+		configAnn   map[string]string
+	}{
+		{name: "merged", manifestAnn: map[string]string{ociseal.MergedAnnotation: tampered}},
+		{name: "config", configAnn: map[string]string{ociseal.ConfigAnnotation: tampered}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := rebindManifestAnnotations(t, obj, imgStore, lay, binding, tt.manifestAnn, tt.configAnn)
+			_, ok, err := verifiedPulledImage(context.Background(), obj, imgStore, root, lay.Platform)
+			if err == nil || !strings.Contains(err.Error(), "annotation") {
+				t.Fatalf("verifiedPulledImage error = %v, want annotation failure", err)
+			}
+			if ok {
+				t.Fatal("verifiedPulledImage accepted tampered annotation")
+			}
+		})
+	}
+}
+
+// TestVerifiedPulledImageNonCanonicalSealingPolicy pins the cached-path rule for
+// a non-canonical image: a merged-EROFS annotation under any suffix key
+// propagates as an error, while the same image with no such annotation stays a
+// valid cache hit.
+func TestVerifiedPulledImageNonCanonicalSealingPolicy(t *testing.T) {
+	body := "a payload larger than the sixty-four byte inline limit so it becomes an object\n"
+
+	t.Run("sealed rejected", func(t *testing.T) {
+		lay, err := octest.BuildSingleLayerGzip(t.TempDir(), hostPlatform(),
+			octest.File{Name: "etc/config", Mode: 0o644, Body: body},
+		)
+		if err != nil {
+			t.Fatalf("BuildSingleLayerGzip: %v", err)
+		}
+		obj, imgStore, binding := pullForSealingTest(t, lay)
+		if binding.Canonical {
+			t.Fatal("divergent binding recorded canonical = true")
+		}
+		root := rebindManifestAnnotations(t, obj, imgStore, lay, binding,
+			map[string]string{"composefs.merged.erofs.v1.fsverity-sha512-12": strings.Repeat("a", 64)}, nil)
+		_, ok, err := verifiedPulledImage(context.Background(), obj, imgStore, root, lay.Platform)
+		if err == nil || !strings.Contains(err.Error(), "non-canonical") {
+			t.Fatalf("verifiedPulledImage error = %v, want non-canonical failure", err)
+		}
+		if ok {
+			t.Fatal("verifiedPulledImage accepted a sealed non-canonical image")
+		}
+	})
+
+	t.Run("unsealed accepted", func(t *testing.T) {
+		lay, err := octest.BuildSingleLayerGzip(t.TempDir(), hostPlatform(),
+			octest.File{Name: "etc/config", Mode: 0o644, Body: body},
+		)
+		if err != nil {
+			t.Fatalf("BuildSingleLayerGzip: %v", err)
+		}
+		obj, imgStore, binding := pullForSealingTest(t, lay)
+		if binding.Canonical {
+			t.Fatal("divergent binding recorded canonical = true")
+		}
+		_, ok, err := verifiedPulledImage(context.Background(), obj, imgStore, lay.Root, lay.Platform)
+		if err != nil {
+			t.Fatalf("verifiedPulledImage: %v", err)
+		}
+		if !ok {
+			t.Fatal("verifiedPulledImage missed an unsealed non-canonical cache hit")
+		}
+	})
+}
+
+// canonicalPullFiles is a standard-layout single-layer tree — /usr and its
+// intermediate directories are explicit, so the construction is canonical.
+func canonicalPullFiles(body string) []octest.File {
+	return []octest.File{
+		{Name: "usr", Dir: true},
+		{Name: "usr/bin", Dir: true},
+		{Name: "usr/bin/app", Mode: 0o755, Body: body},
+	}
+}
+
+// pullForSealingTest pulls lay from its layout directory into a fresh
+// verity-capable store and returns the store handles and the recorded binding.
+func pullForSealingTest(t *testing.T, lay octest.Layout) (*objectstore.Store, *imagestore.Store, imagestore.Binding) {
+	t.Helper()
+	storeRoot, cleanup, err := devtest.VerityRoot()
+	if errors.Is(err, devtest.ErrNoVerity) {
+		t.Skipf("verity-capable store root unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("VerityRoot: %v", err)
+	}
+	t.Cleanup(cleanup)
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+	eng, err := New(Config{Root: storeRoot})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := eng.Pull(context.Background(), lay.Ref, WithFromDir(lay.Dir)); err != nil {
+		if devtest.IsVerityUnsupported(err) {
+			t.Skipf("fs-verity unsupported on the test filesystem: %v", err)
+		}
+		t.Fatalf("Pull: %v", err)
+	}
+	obj, err := objectstore.New(storeRoot)
+	if err != nil {
+		t.Fatalf("objectstore.New: %v", err)
+	}
+	imgStore, err := imagestore.New(storeRoot)
+	if err != nil {
+		t.Fatalf("imagestore.New: %v", err)
+	}
+	binding, err := imgStore.Get(lay.Root, lay.Platform)
+	if err != nil {
+		t.Fatalf("imagestore.Get: %v", err)
+	}
+	return obj, imgStore, binding
+}
+
+// rebindManifestAnnotations rewrites lay's manifest with the given manifest and
+// config-descriptor annotations, stores it in obj under its new digest, rebinds
+// binding to that digest in imgStore, and returns the new root digest.
+func rebindManifestAnnotations(t *testing.T, obj *objectstore.Store, imgStore *imagestore.Store, lay octest.Layout, binding imagestore.Binding, manifestAnn, configAnn map[string]string) digest.Digest {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(lay.Dir, "blobs", "sha256", lay.Manifest.Encoded())) // #nosec G304 -- test fixture path
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	var manifest ocispec.Manifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatalf("parse manifest: %v", err)
+	}
+	if manifestAnn != nil {
+		manifest.Annotations = manifestAnn
+	}
+	if configAnn != nil {
+		manifest.Config.Annotations = configAnn
+	}
+	raw, err = json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	root := digest.FromBytes(raw)
+	if err := obj.WriteBlob(context.Background(), root, strings.NewReader(string(raw))); err != nil {
+		t.Fatalf("WriteBlob: %v", err)
+	}
+	if err := imgStore.Put(root, lay.Platform, binding); err != nil {
+		t.Fatalf("imagestore.Put: %v", err)
+	}
+	return root
 }
 
 type (

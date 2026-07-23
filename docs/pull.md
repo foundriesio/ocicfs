@@ -91,6 +91,25 @@ find /var/lib/knarr -maxdepth 5 -type f | head
 
 See [on-disk-layout.md](on-disk-layout.md) for the full tree and JSON schemas.
 
+## Sealing Verification
+
+If a resolved manifest carries composefs sealing annotations, pull checks them
+against the content it actually materialized and measured, and fails closed on
+disagreement rather than recording a mismatched image. The same check runs on a
+fresh pull and on the cached fast path, so a previously stored image cannot skip
+it.
+
+A **canonical** construction reproduces the sealed digest, so a present
+`composefs.merged.erofs.v1.fsverity-sha256-12` (on the manifest) or
+`composefs.config.fsverity-sha256-12` (on the config descriptor) annotation
+must match the measured value exactly; a mismatch aborts the pull, and an
+image carrying neither annotation is always a valid unsealed pull. A
+**non-canonical** construction cannot honestly claim a reproducible sealed
+digest, so pull rejects it outright if the manifest carries any annotation
+under the `composefs.merged.erofs.v1.` namespace — regardless of the suffix or
+value it records. A non-canonical image with no such annotation is likewise a
+valid unsealed pull.
+
 ## Notes
 
 - **Reference forms.** Registry pull accepts `name@sha256:<hex>` and `name:tag`

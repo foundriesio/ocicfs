@@ -22,6 +22,7 @@ import (
 	"github.com/foundriesio/knarr/internal/ocichain"
 	"github.com/foundriesio/knarr/internal/ocilayout"
 	"github.com/foundriesio/knarr/internal/ociremote"
+	"github.com/foundriesio/knarr/internal/ociseal"
 	"github.com/foundriesio/knarr/internal/refstore"
 )
 
@@ -107,9 +108,12 @@ type cachedImage struct {
 // verifiedPulledImage reports whether (root, platform) is already materialized
 // and trustworthy: a binding exists, the bound composefs object measures to the
 // recorded fs-verity digest, and the metadata chain resolves from the local
-// store. Any failure short of a canceled context reports "not cached" rather
-// than an error, so the caller falls through to a full pull, which rewrites the
-// same content idempotently and heals whatever was stale or missing.
+// store. Every failure reports "not cached" rather than an error, so the caller
+// falls through to a full pull, which rewrites the same content idempotently and
+// heals whatever was stale or missing — except a canceled context or a
+// sealing-verification failure, both of which propagate as errors; a sealing
+// mismatch signals that the recorded content and its claimed integrity
+// annotation disagree rather than merely being stale.
 func verifiedPulledImage(ctx context.Context, obj *objectstore.Store, imgStore *imagestore.Store, root digest.Digest, platform ocispec.Platform) (cachedImage, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return cachedImage{}, false, err
@@ -134,6 +138,9 @@ func verifiedPulledImage(ctx context.Context, obj *objectstore.Store, imgStore *
 			return cachedImage{}, false, err
 		}
 		return cachedImage{}, false, nil
+	}
+	if err := ociseal.VerifyAnnotations(ctx, obj, res, b.FsverityDigest, b.Canonical); err != nil {
+		return cachedImage{}, false, fmt.Errorf("verify cached sealing annotations: %w", err)
 	}
 	return cachedImage{rootDesc: res.RootDesc, platform: res.Platform, descriptor: b.Descriptor}, true, nil
 }

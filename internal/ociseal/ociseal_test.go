@@ -22,6 +22,8 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"github.com/foundriesio/knarr/internal/objectstore"
+	"github.com/foundriesio/knarr/internal/ocichain"
 	"github.com/foundriesio/knarr/internal/ocilayout"
 	"github.com/foundriesio/knarr/internal/octest"
 )
@@ -54,6 +56,69 @@ func TestParseAnnotation(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Fatalf("ParseAnnotation = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestVerifyAnnotation(t *testing.T) {
+	hexDigest := strings.Repeat("a", 64)
+	actual := "sha256:" + hexDigest
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "match", value: hexDigest},
+		{name: "mismatch", value: strings.Repeat("b", 64), wantErr: true},
+		{name: "prefixed", value: actual, wantErr: true},
+		{name: "uppercase", value: strings.ToUpper(hexDigest), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := verifyAnnotation(MergedAnnotation, tt.value, actual)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("verifyAnnotation error = %v, wantErr %t", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestMergedAnnotationSharesPrefix(t *testing.T) {
+	if !strings.HasPrefix(MergedAnnotation, MergedAnnotationPrefix) {
+		t.Fatalf("%q does not share prefix %q", MergedAnnotation, MergedAnnotationPrefix)
+	}
+}
+
+// TestVerifyAnnotationsNonCanonical exercises the fail-closed rule for a
+// non-canonical construction: any annotation under the merged-EROFS namespace
+// is rejected regardless of suffix or value, while an image carrying no such
+// annotation is a valid unsealed pull. This path never measures a stored blob,
+// so a plain store on any filesystem suffices.
+func TestVerifyAnnotationsNonCanonical(t *testing.T) {
+	store, err := objectstore.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("objectstore.New: %v", err)
+	}
+	hexDigest := strings.Repeat("a", 64)
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		wantErr     bool
+	}{
+		{name: "exact merged key", annotations: map[string]string{MergedAnnotation: hexDigest}, wantErr: true},
+		{name: "sha512 suffix", annotations: map[string]string{"composefs.merged.erofs.v1.fsverity-sha512-12": hexDigest}, wantErr: true},
+		{name: "signature suffix", annotations: map[string]string{"composefs.merged.erofs.v1.fsverity-sha256-12.sig": "not-a-digest"}, wantErr: true},
+		{name: "config namespace only", annotations: map[string]string{ConfigAnnotation: hexDigest}, wantErr: false},
+		{name: "unrelated annotation", annotations: map[string]string{"org.opencontainers.image.title": "app"}, wantErr: false},
+		{name: "no annotations", annotations: nil, wantErr: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := ocichain.Resolved{Manifest: ocispec.Manifest{Annotations: tt.annotations}}
+			err := VerifyAnnotations(context.Background(), store, res, "", false)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("VerifyAnnotations error = %v, wantErr %t", err, tt.wantErr)
 			}
 		})
 	}
