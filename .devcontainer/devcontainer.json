@@ -7,6 +7,9 @@
   "runArgs": [
     "--privileged"
   ],
+  "containerEnv": {
+    "KNARR_TEST_VERITY_SIZE_MB": "${localEnv:KNARR_TEST_VERITY_SIZE_MB}"
+  },
   "postStartCommand": "/usr/local/bin/dev-entrypoint",
   "customizations": {
     "vscode": {
