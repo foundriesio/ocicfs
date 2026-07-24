@@ -58,6 +58,54 @@ func WriteFile(path string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
+// Mark creates an empty marker file at path and fsyncs its parent directory so
+// the file's existence survives a crash. Unlike WriteFile it uses no temp file,
+// so a crash can never leave a partial artifact in the directory: a caller that
+// enumerates the directory as state can trust every entry is a real marker. It
+// is idempotent — marking an existing path succeeds — and never truncates, so a
+// marker's emptiness is a contract of its callers, not enforced here.
+func Mark(path string, perm os.FileMode) error {
+	if path == "" {
+		return errors.New("durable: empty path")
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, perm) // #nosec G304 -- caller-selected metadata path
+	if err != nil {
+		return fmt.Errorf("durable: create marker: %w", err)
+	}
+	if err := f.Chmod(perm); err != nil {
+		if cerr := f.Close(); cerr != nil {
+			slog.Warn("durable: failed to close marker after chmod error", "path", path, "err", cerr)
+		}
+		return fmt.Errorf("durable: chmod marker: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("durable: close marker: %w", err)
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("durable: fsync parent: %w", err)
+	}
+	return nil
+}
+
+// Remove deletes the file at path and fsyncs its parent directory so the
+// deletion is crash-durable. A missing target file is tolerated, but a missing
+// parent directory surfaces as os.ErrNotExist from the parent fsync, so a
+// caller that treats a fully-absent path as success must check for ErrNotExist
+// on the returned error. It does not recurse into directories: a non-empty
+// directory at path is reported as an error.
+func Remove(path string) error {
+	if path == "" {
+		return errors.New("durable: empty path")
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("durable: remove %s: %w", path, err)
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("durable: fsync parent: %w", err)
+	}
+	return nil
+}
+
 // MkdirAll creates dir and any missing ancestors, fsyncing the parent of each
 // directory it creates.
 func MkdirAll(dir string, perm os.FileMode) error {

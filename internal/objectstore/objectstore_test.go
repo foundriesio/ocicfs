@@ -372,6 +372,59 @@ func TestOpenMissingObject(t *testing.T) {
 	}
 }
 
+func TestHas(t *testing.T) {
+	s := newTestStore(t)
+	d := digest.SHA256.FromString("object")
+
+	// Absent.
+	if has, err := s.Has(d); err != nil || has {
+		t.Fatalf("Has absent = (%v, %v), want (false, nil)", has, err)
+	}
+
+	path, err := s.ObjectPath(d)
+	if err != nil {
+		t.Fatalf("ObjectPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	// A directory planted at the object path is not a stored object.
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatalf("Mkdir at object path: %v", err)
+	}
+	if has, err := s.Has(d); err != nil || has {
+		t.Fatalf("Has of a directory node = (%v, %v), want (false, nil)", has, err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("Remove dir: %v", err)
+	}
+
+	// A symlink at the object path (even one pointing at a real file) is not a
+	// stored object: Lstat judges it on its own type.
+	target := filepath.Join(t.TempDir(), "real")
+	if err := os.WriteFile(target, []byte("real"), 0o600); err != nil {
+		t.Fatalf("WriteFile target: %v", err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatalf("Symlink at object path: %v", err)
+	}
+	if has, err := s.Has(d); err != nil || has {
+		t.Fatalf("Has of a symlink node = (%v, %v), want (false, nil)", has, err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("Remove symlink: %v", err)
+	}
+
+	// A regular file is present.
+	if err := os.WriteFile(path, []byte("object"), 0o600); err != nil {
+		t.Fatalf("WriteFile object: %v", err)
+	}
+	if has, err := s.Has(d); err != nil || !has {
+		t.Fatalf("Has of a regular object = (%v, %v), want (true, nil)", has, err)
+	}
+}
+
 func TestOpenRoundTrip(t *testing.T) {
 	s := newVerityStore(t)
 	content := []byte("metadata blob bytes")

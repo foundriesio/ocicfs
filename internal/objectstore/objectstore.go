@@ -119,6 +119,26 @@ func (s *Store) Open(d digest.Digest) (io.ReadCloser, error) {
 	return f, nil
 }
 
+// Has reports whether the object d is present as a regular file in the store.
+// A missing path is reported as (false, nil); a non-regular node at the path
+// (a directory, symlink, or other special file) is not a stored object and
+// reports (false, nil) too. Any other stat failure is returned. Lstat is used
+// so a symlink is judged on its own type, never followed.
+func (s *Store) Has(d digest.Digest) (bool, error) {
+	path, err := s.ObjectPath(d)
+	if err != nil {
+		return false, err
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("objectstore: stat object %s: %w", d, err)
+	}
+	return fi.Mode().IsRegular(), nil
+}
+
 // CheckVerity verifies the store filesystem can enable fs-verity, which knarr
 // requires for every content object. It enables verity on a throwaway probe file
 // so a pull fails fast with a clear error when the store is on a filesystem

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -85,11 +86,7 @@ func (e *engine) remove(ctx context.Context, ref string, opts ...RemoveOption) e
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	_ = cfg.Force
 
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	normalized, err := normalizeRef(ref)
 	if err != nil {
 		return err
@@ -101,6 +98,39 @@ func (e *engine) remove(ctx context.Context, ref string, opts ...RemoveOption) e
 	if err != nil {
 		return err
 	}
+
+	// Hold the digest's lock across the holder check and the delete, so a
+	// concurrent hold cannot slip a holder in after the check and be stranded by
+	// the delete. Without --force a present holder declines the removal by name;
+	// with --force the holds are cleared first.
+	root := rec.Resolved.Digest
+	unlock, err := e.holds.Lock(root)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	// This is the single cancellation gate, checked under the lock and before any
+	// mutation: the lock wait is not interruptible, and everything past this point
+	// — clearing holds and deleting the ref and bindings — runs atomically with
+	// respect to cancellation, so a forced remove never clears holds and then
+	// bails partway through.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if cfg.Force {
+		if err := e.holds.Clear(root); err != nil {
+			return err
+		}
+	} else {
+		holders, err := e.holds.Holders(root)
+		if err != nil {
+			return err
+		}
+		if len(holders) > 0 {
+			return fmt.Errorf("image is held by %s; release the hold or use --force", strings.Join(holders, ", "))
+		}
+	}
+
 	platforms, err := parseRecordPlatforms(rec.Platforms)
 	if err != nil {
 		return err
@@ -111,9 +141,6 @@ func (e *engine) remove(ctx context.Context, ref string, opts ...RemoveOption) e
 	}
 	toDelete, err := unsharedBindings(rec.Ref, rec.Resolved.Digest, platforms, records)
 	if err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
 		return err
 	}
 	// Delete the ref before its bindings, the reverse of the write order (a pull

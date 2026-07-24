@@ -11,6 +11,7 @@ seals every content object with it and refuses a store that cannot.
 ├── objects/fsverity-sha256-12/<vv>/<rest>   # fs-verity view into the CAS — auxiliary
 ├── images/sha256/<aa>/<rest>/<os>-<arch>[-<variant>].json   # image bindings — auxiliary
 ├── refs/sha256/<kk>/<rest>.json # reference records — auxiliary
+├── holds/sha256/<aa>/<rest>/<holder>   # GC-protection holds — auxiliary
 └── tmp/                         # staging + build scratch
 ```
 
@@ -121,6 +122,39 @@ trust anchor:
 remove <ref>` deletes the matching ref record and any unshared image binding for
 the recorded root digest and platform; it does not delete content from
 `objects/`.
+
+## `holds/` — GC-protection holds (auxiliary)
+
+A hold pins an image's content so a `remove` declines while any holder is
+present. Each hold is an empty marker file named for its holder under the
+digest's holder directory:
+
+```
+holds/sha256/<aa>/<rest>/<holder>
+```
+
+Holds are keyed by the **root digest**, not the reference: holds protect content
+identity, and the reference records are auxiliary (a tag can be repointed, and a
+holder may pin an image by bare digest that no local ref names). A holder name is
+restricted to `[a-z0-9._-]` so it can only ever name a single file inside the
+directory. The holder directory is removed with its last holder; the content in
+`objects/` is never touched.
+
+`remove <ref>` reads the holders for the recorded root digest and declines,
+naming them, while any are present; `remove --force <ref>` clears the holds
+first and proceeds.
+
+Mutating a digest's holders — and the `remove` check-then-delete, which must be
+atomic against a concurrent hold — runs under a per-digest advisory lock
+(`flock`) on a dedicated lock file:
+
+```
+holds/.locks/sha256/<aa>/<rest>
+```
+
+The lock file is created on demand and **never removed**, so a last-holder
+cleanup that removes the holder directory cannot invalidate a lock a concurrent
+caller is waiting on. The lock files are empty and carry no content.
 
 ## Authoritative vs. auxiliary
 

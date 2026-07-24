@@ -19,6 +19,7 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"github.com/foundriesio/knarr/internal/holdstore"
 	"github.com/foundriesio/knarr/internal/imagestore"
 	"github.com/foundriesio/knarr/internal/objectstore"
 	"github.com/foundriesio/knarr/internal/refstore"
@@ -183,7 +184,8 @@ func WithMetadataOnly() MountOption {
 // RemoveOptions is the resolved configuration a Remove acts on. Callers pass
 // the With* options to Remove, which apply to a zero RemoveOptions.
 type RemoveOptions struct {
-	// Force is accepted and currently has no effect.
+	// Force removes the image even while holds pin it, clearing all of the
+	// image's holds first.
 	Force bool
 }
 
@@ -240,7 +242,18 @@ type Engine interface {
 	Inspect(ctx context.Context, ref string) (*ImageInfo, error)
 	// List returns the images present in the local store.
 	List(ctx context.Context) ([]Image, error)
-	// Remove forgets a local image.
+	// Hold pins ref's root digest under a named holder so a Remove of that
+	// image declines while the holder is present. It reads only local state; a
+	// ref that does not pin a digest resolves through the most recent pull, and
+	// an image not present locally is reported as an error satisfying
+	// errors.Is(err, ErrNotFound). Recording an already-present holder succeeds
+	// without change.
+	Hold(ctx context.Context, ref, holder string) error
+	// Release drops a named holder's hold on ref's root digest. Releasing a
+	// holder that is not present succeeds.
+	Release(ctx context.Context, ref, holder string) error
+	// Remove forgets a local image. It declines while a hold pins the image
+	// unless WithForce is set, which clears the holds first.
 	Remove(ctx context.Context, ref string, opts ...RemoveOption) error
 }
 
@@ -261,6 +274,7 @@ type engine struct {
 	obj         *objectstore.Store
 	img         *imagestore.Store
 	refs        *refstore.Store
+	holds       *holdstore.Store
 }
 
 // New returns an Engine backed by the store under cfg.Root, creating the
@@ -281,5 +295,9 @@ func New(cfg Config) (Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("knarr: open ref store: %w", err)
 	}
-	return &engine{root: cfg.Root, overlayRoot: cfg.OverlayRoot, obj: obj, img: img, refs: refs}, nil
+	holds, err := holdstore.New(cfg.Root)
+	if err != nil {
+		return nil, fmt.Errorf("knarr: open hold store: %w", err)
+	}
+	return &engine{root: cfg.Root, overlayRoot: cfg.OverlayRoot, obj: obj, img: img, refs: refs, holds: holds}, nil
 }
