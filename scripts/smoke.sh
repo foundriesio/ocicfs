@@ -19,7 +19,8 @@
 # The rest exercises a real image: the full lifecycle -- pull -> ls ->
 # inspect -> mount -> unmount, then mount --metadata-only with the overlay a
 # writable consumer assembles over it (the objects/fsverity-sha256-12 view as
-# lowerdir, verity=require), and finally remove -- three times: for an image
+# lowerdir, verity=require), then hold (a plain remove must decline naming
+# the holder) -> release -> remove -- three times: for an image
 # sideloaded with pull --from-dir, for the same image pulled digest-pinned from
 # a loopback HTTP registry (zot), and for the same image
 # pulled and addressed by tag (checked to resolve to the same pinned digest),
@@ -156,7 +157,19 @@ run_lifecycle() {
 	rm -rf "$OVL"
 	OVL=""
 
-	echo "== remove =="
+	echo "== hold (expect a plain remove to decline, naming the holder) =="
+	"${KN[@]}" hold "$ref"
+	local declined
+	if declined="$("${KN[@]}" remove "$ref" 2>&1)"; then
+		fail "remove succeeded while $ref was held"
+	fi
+	printf '%s\n' "$declined"
+	printf '%s\n' "$declined" | grep -qF "held by cli" || fail "declined remove did not name the holder"
+	listed="$("${KN[@]}" ls)"
+	printf '%s\n' "$listed" | grep -qF "$ref" || fail "ls does not list $ref after the declined remove"
+
+	echo "== release, then remove =="
+	"${KN[@]}" release "$ref"
 	"${KN[@]}" remove "$ref"
 	echo "== ls (expect the image gone) =="
 	listed="$("${KN[@]}" ls)"
@@ -322,4 +335,4 @@ jq -e '.config.annotations["composefs.config.fsverity-sha256-12"] | test("^[0-9a
 echo "==== lifecycle 4: the sealed image (pull re-verifies the seal) ===="
 run_lifecycle "127.0.0.1:$port/smoke@$sealed" "$sealed" pull "127.0.0.1:$port/smoke@$sealed"
 
-echo "SMOKE OK: purpose-built image sealed, cross-checked three ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export and a seal round against the registry (checks passed)"
+echo "SMOKE OK: purpose-built image sealed, cross-checked three ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export and a seal round against the registry (checks passed)"

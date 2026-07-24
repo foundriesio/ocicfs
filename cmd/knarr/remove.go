@@ -30,6 +30,6 @@ func newRemoveCommand(g *globalOptions) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().BoolVar(&force, "force", false, "accepted; currently no effect")
+	cmd.Flags().BoolVar(&force, "force", false, "remove even while held, clearing any holds first")
 	return cmd
 }

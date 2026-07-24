@@ -7,8 +7,8 @@
 // holds no version-management, activation, or update-orchestration policy.
 //
 // The current surface covers the basic primitives — publish, pull, mount,
-// unmount, inspect, list, remove. The remaining primitives (verify, hold,
-// release, status, gc) are added as they are implemented.
+// unmount, inspect, list, hold, release, remove. The remaining primitives
+// (verify, status, gc) are added as they are implemented.
 package knarr
 
 import (

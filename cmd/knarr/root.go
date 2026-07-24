@@ -45,7 +45,7 @@ func newRootCommand(stdout, stderr io.Writer) (*cobra.Command, *globalOptions) {
 		Use:   "knarr",
 		Short: "OCI-native content delivery and mount engine for IoT/edge devices",
 		Long: "knarr pulls, verifies, and mounts OCI content as composefs images. It " +
-			"provides primitives — publish, seal, pull, mount, unmount, inspect, ls, remove — " +
+			"provides primitives — publish, seal, pull, mount, unmount, inspect, ls, hold, release, remove — " +
 			"and leaves version management and update orchestration to the upper-layer " +
 			"agent that drives it.",
 		Version:       version.String(),
@@ -79,6 +79,8 @@ func newRootCommand(stdout, stderr io.Writer) (*cobra.Command, *globalOptions) {
 		newUnmountCommand(g),
 		newLsCommand(g),
 		newInspectCommand(g),
+		newHoldCommand(g),
+		newReleaseCommand(g),
 		newRemoveCommand(g),
 	)
 	return root, g

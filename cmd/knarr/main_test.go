@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -29,7 +30,7 @@ import (
 
 func TestCommandsCoverM1Verbs(t *testing.T) {
 	root, _ := newRootCommand(io.Discard, io.Discard)
-	want := []string{"inspect", "ls", "mount", "publish", "pull", "remove", "seal", "unmount"}
+	want := []string{"hold", "inspect", "ls", "mount", "publish", "pull", "release", "remove", "seal", "unmount"}
 
 	// cobra adds its own "help" and "completion" commands; compare only knarr's.
 	builtins := map[string]bool{"help": true, "completion": true}
@@ -286,6 +287,15 @@ func TestImageListJSONShape(t *testing.T) {
 
 func writeCLIImage(t *testing.T, root, ref string, d digest.Digest, size int64, p ocispec.Platform) {
 	t.Helper()
+	// The root blob in the object store is the authoritative presence signal the
+	// hold verbs check, so a "pulled" image seeds it alongside the ref and binding.
+	objectPath := octest.ObjectPath(root, d)
+	if err := os.MkdirAll(filepath.Dir(objectPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll object: %v", err)
+	}
+	if err := os.WriteFile(objectPath, []byte("root"), 0o600); err != nil {
+		t.Fatalf("WriteFile object: %v", err)
+	}
 	refStore, err := refstore.New(root)
 	if err != nil {
 		t.Fatalf("refstore.New: %v", err)

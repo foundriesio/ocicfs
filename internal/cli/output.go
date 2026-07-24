@@ -102,6 +102,30 @@ func WriteImages(w io.Writer, format Format, imgs []knarr.Image) error {
 	return nil
 }
 
+// HoldOutput is the JSON/text shape for `knarr hold`/`knarr release` output.
+// Its JSON field names are a stable contract for callers that parse knarr's
+// output; Held is true for a recorded hold and false for a released one.
+type HoldOutput struct {
+	Ref    string `json:"ref"`
+	Holder string `json:"holder"`
+	Held   bool   `json:"held"`
+}
+
+// WriteHold renders the result of a hold or release to w in the requested
+// format. held is true for a hold, false for a release.
+func WriteHold(w io.Writer, format Format, ref, holder string, held bool) error {
+	out := HoldOutput{Ref: ref, Holder: holder, Held: held}
+	if format == FormatJSON {
+		return emitJSON(w, out)
+	}
+	verb := "released"
+	if held {
+		verb = "held"
+	}
+	_, err := fmt.Fprintf(w, "%s\t%s by %s\n", out.Ref, verb, out.Holder)
+	return err
+}
+
 // ImageInfoOutput is the JSON/text shape for `knarr inspect` output. Its JSON
 // field names are a stable contract for callers that parse knarr's output.
 // RootfsSize is the merged rootfs's apparent size in bytes (regular-file
