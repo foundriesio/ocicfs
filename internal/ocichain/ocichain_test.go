@@ -435,6 +435,43 @@ func TestResolveRejectsNonSHA256Root(t *testing.T) {
 	}
 }
 
+func TestIsIndex(t *testing.T) {
+	const (
+		dockerList = "application/vnd.docker.distribution.manifest.list.v2+json"
+		hex        = "1111111111111111111111111111111111111111111111111111111111111111"
+		child      = `{"mediaType":"` + ocispec.MediaTypeImageManifest + `","digest":"sha256:` + hex + `","size":1}`
+		config     = `{"mediaType":"` + ocispec.MediaTypeImageConfig + `","digest":"sha256:` + hex + `","size":1}`
+	)
+	tests := []struct {
+		name string
+		doc  string
+		want bool
+	}{
+		{"index media type", `{"mediaType":"` + ocispec.MediaTypeImageIndex + `","manifests":[]}`, true},
+		{"docker manifest list", `{"mediaType":"` + dockerList + `","manifests":[]}`, true},
+		// Structure wins over a media type that claims otherwise, so an index
+		// nested under a manifest label is still recognized as one.
+		{"index wearing a manifest media type", `{"mediaType":"` + ocispec.MediaTypeImageManifest + `","manifests":[` + child + `]}`, true},
+		{"index without a media type", `{"manifests":[` + child + `]}`, true},
+		{"manifest", `{"mediaType":"` + ocispec.MediaTypeImageManifest + `","config":` + config + `,"layers":[]}`, false},
+		{"manifest without a media type", `{"config":` + config + `,"layers":[]}`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := IsIndex([]byte(tt.doc))
+			if err != nil {
+				t.Fatalf("IsIndex: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("IsIndex = %v, want %v", got, tt.want)
+			}
+		})
+	}
+	if _, err := IsIndex([]byte("{")); err == nil {
+		t.Fatal("expected an error for malformed JSON")
+	}
+}
+
 // --- OpenLayer: streaming decompress + verify-at-EOF ---
 
 // openLayerRaw writes raw as a layer blob and opens it; the descriptor digest is

@@ -56,7 +56,7 @@ func Resolve(ctx context.Context, src BlobSource, root digest.Digest, want ocisp
 
 	// Step 1: Read and verify root blob. The root has no parent descriptor, so it
 	// carries no declared size and is bounded by maxMetadataBytes.
-	rootBytes, err := readVerifyMetaBlob(ctx, src, ocispec.Descriptor{Digest: root}, sizeUnknown)
+	rootBytes, err := ReadRootBlob(ctx, src, root)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			if describer, ok := src.(missingRootDescriber); ok {
@@ -67,30 +67,9 @@ func Resolve(ctx context.Context, src BlobSource, root digest.Digest, want ocisp
 	}
 	rootDesc := ocispec.Descriptor{Digest: root, Size: int64(len(rootBytes))}
 
-	// Determine if root is an index or a manifest. Both an OCI image index and
-	// an image manifest carry schemaVersion 2, so the schema version alone does
-	// not distinguish them: the decisive signal is the mediaType, and failing
-	// that the structure (an index carries `manifests`; a manifest carries
-	// `config`). Probing both fields avoids misclassifying a bare manifest as a
-	// single-entry index (or vice versa).
-	var probe struct {
-		MediaType string               `json:"mediaType"`
-		Manifests []ocispec.Descriptor `json:"manifests"`
-		Config    ocispec.Descriptor   `json:"config"`
-	}
-	if err := json.Unmarshal(rootBytes, &probe); err != nil {
-		return Resolved{}, fmt.Errorf("ocichain: parse root blob: %w", err)
-	}
-
-	var isIndex bool
-	switch probe.MediaType {
-	case ocispec.MediaTypeImageIndex, "application/vnd.docker.distribution.manifest.list.v2+json":
-		isIndex = true
-	case ocispec.MediaTypeImageManifest, "application/vnd.docker.distribution.manifest.v2+json":
-		isIndex = false
-	default:
-		// No decisive mediaType: an index has manifest entries and no config.
-		isIndex = len(probe.Manifests) > 0 && probe.Config.Digest == ""
+	isIndex, err := IsIndex(rootBytes)
+	if err != nil {
+		return Resolved{}, err
 	}
 
 	// For a bare manifest the root blob is itself the manifest; for an index we
@@ -143,6 +122,46 @@ func OpenLayer(ctx context.Context, src BlobSource, desc ocispec.Descriptor) (io
 		return nil, err
 	}
 	return rc, nil
+}
+
+// ReadRootBlob reads, bounds, and digest-verifies the pinned root metadata blob
+// a digest names directly — an image index or an image manifest. The root has no
+// parent descriptor to vouch for its length, so it is bounded by the metadata
+// cap rather than by an authenticated size.
+func ReadRootBlob(ctx context.Context, src BlobSource, root digest.Digest) ([]byte, error) {
+	return readVerifyMetaBlob(ctx, src, ocispec.Descriptor{Digest: root}, sizeUnknown)
+}
+
+// ReadMetaBlob reads, bounds, and digest-verifies a metadata blob — a manifest
+// or a config — named by a descriptor that came out of an already digest-verified
+// parent. That parent declares the size, so it is authenticated: it bounds the
+// read and is enforced exactly. Layer blobs are streamed by OpenLayer instead;
+// they may be far larger than the metadata bound.
+func ReadMetaBlob(ctx context.Context, src BlobSource, desc ocispec.Descriptor) ([]byte, error) {
+	return readVerifyMetaBlob(ctx, src, desc, sizeRequired)
+}
+
+// IsIndex reports whether raw is an image index rather than an image manifest.
+// Both carry schemaVersion 2, so the schema version alone does not distinguish
+// them: an index media type is decisive, and otherwise the structure decides —
+// an index carries manifest entries and no config. Letting the structure decide
+// rather than trusting a manifest media type detects an index that wears one,
+// and probing both fields avoids misclassifying a bare manifest as a
+// single-entry index (or vice versa).
+func IsIndex(raw []byte) (bool, error) {
+	var probe struct {
+		MediaType string               `json:"mediaType"`
+		Manifests []ocispec.Descriptor `json:"manifests"`
+		Config    ocispec.Descriptor   `json:"config"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return false, fmt.Errorf("ocichain: parse metadata blob: %w", err)
+	}
+	switch probe.MediaType {
+	case ocispec.MediaTypeImageIndex, "application/vnd.docker.distribution.manifest.list.v2+json":
+		return true, nil
+	}
+	return len(probe.Manifests) > 0 && probe.Config.Digest == "", nil
 }
 
 type (
@@ -421,9 +440,9 @@ func readVerifyMetaBlob(ctx context.Context, src BlobSource, desc ocispec.Descri
 
 // readVerifyConfigDesc reads and verifies config from a descriptor in the manifest.
 func readVerifyConfigDesc(ctx context.Context, src BlobSource, configDesc ocispec.Descriptor) (ocispec.Descriptor, []byte, *ocispec.Image, error) {
-	// readVerifyMetaBlob bounds, exact-size-checks, digest-validates, and
+	// ReadMetaBlob bounds, exact-size-checks, digest-validates, and
 	// digest-verifies the blob.
-	bytes, err := readVerifyMetaBlob(ctx, src, configDesc, sizeRequired)
+	bytes, err := ReadMetaBlob(ctx, src, configDesc)
 	if err != nil {
 		return ocispec.Descriptor{}, nil, nil, err
 	}
@@ -462,7 +481,7 @@ func selectFromIndex(ctx context.Context, src BlobSource, index *ocispec.Index, 
 
 	// Read and verify the manifest for this platform. readVerifyMetaBlob bounds,
 	// exact-size-checks, digest-validates, and digest-verifies the blob.
-	manifestBytes, err := readVerifyMetaBlob(ctx, src, selectedDesc, sizeRequired)
+	manifestBytes, err := ReadMetaBlob(ctx, src, selectedDesc)
 	if err != nil {
 		return ocispec.Descriptor{}, nil, err
 	}
