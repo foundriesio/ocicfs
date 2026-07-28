@@ -10,6 +10,9 @@
   "containerEnv": {
     "KNARR_TEST_VERITY_SIZE_MB": "${localEnv:KNARR_TEST_VERITY_SIZE_MB}"
   },
+  "remoteEnv": {
+    "PATH": "${containerEnv:PATH}:${containerWorkspaceFolder}/bin"
+  },
   "postStartCommand": "/usr/local/bin/dev-entrypoint",
   "customizations": {
     "vscode": {

@@ -102,9 +102,11 @@ child that is itself an index is declined: recursive sealing is not supported.
 
 ## Local testing
 
-The dev container serves zot, a real OCI registry, at `127.0.0.1:5000`, so
-sealing is testable end to end by hand without external push access (busybox
-is a multi-arch index, so the platform must be selected):
+The dev container serves zot, a real OCI registry, at `127.0.0.1:5000`, and
+keeps the workspace `bin/` directory on `PATH`, so after `make build` the
+examples' bare `knarr` resolves to the freshly built binary and sealing is
+testable end to end by hand without external push access (busybox is a
+multi-arch index, so the platform must be selected):
 
 ```sh
 crane copy docker.io/library/busybox:latest 127.0.0.1:5000/app
