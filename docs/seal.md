@@ -12,7 +12,10 @@ writes two annotations:
 - `composefs.config.fsverity-sha256-12` on the manifest's config descriptor —
   the fs-verity digest of the config JSON.
 
-Both values are recorded as bare lowercase hex.
+Both values are recorded as bare lowercase hex. The annotations are defined
+by the upstream
+[composefs OCI sealing specification](https://github.com/composefs/composefs-rs/blob/main/crates/composefs-oci/src/sealing_spec.rs),
+which knarr follows verbatim.
 
 ```sh
 digest=$(crane digest ghcr.io/example/app:1.2.3)

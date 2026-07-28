@@ -108,7 +108,10 @@ image carrying neither annotation is always a valid unsealed pull. A
 digest, so pull rejects it outright if the manifest carries any annotation
 under the `composefs.merged.erofs.v1.` namespace — regardless of the suffix or
 value it records. A non-canonical image with no such annotation is likewise a
-valid unsealed pull.
+valid unsealed pull. The annotation keys and their meaning are defined by the
+upstream
+[composefs OCI sealing specification](https://github.com/composefs/composefs-rs/blob/main/crates/composefs-oci/src/sealing_spec.rs),
+which knarr follows verbatim.
 
 ## Notes
 
