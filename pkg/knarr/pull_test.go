@@ -4,9 +4,12 @@
 package knarr
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -447,6 +450,305 @@ func TestPullRegistryE2ESkipsExistingImage(t *testing.T) {
 	if legacy.RootfsSize != 0 {
 		t.Fatalf("RootfsSize = %d after a cache-hit pull of a legacy binding, want 0 (no backfill)", legacy.RootfsSize)
 	}
+}
+
+// TestPullBlobSourceMatchesFromDirE2E pulls one image twice into two fresh
+// stores — once from its layout directory, once through a caller-supplied blob
+// source serving the same blobs from memory — and requires the resulting object
+// and image-binding trees to be byte-identical: the source of the bytes is the
+// only thing the option changes. A failing transport is installed for the whole
+// test, so either pull touching the network fails it.
+func TestPullBlobSourceMatchesFromDirE2E(t *testing.T) {
+	layoutStore := verityStoreRoot(t)
+	sourceStore := verityStoreRoot(t)
+	useRemoteDefaultTransport(t, failTransport{})
+
+	lay, err := octest.BuildSingleLayerGzip(t.TempDir(), hostPlatform(),
+		canonicalPullFiles("blob source payload past the sixty-four byte inline limit\n")...,
+	)
+	if err != nil {
+		t.Fatalf("BuildSingleLayerGzip: %v", err)
+	}
+
+	fromLayout := pullInto(t, layoutStore, lay.Ref, WithFromDir(lay.Dir))
+	fromSource := pullInto(t, sourceStore, lay.Ref, WithBlobSource(layoutBlobs(t, lay.Dir)))
+	if fromSource.Digest != fromLayout.Digest || fromSource.Size != fromLayout.Size {
+		t.Fatalf("blob-source image = %#v, layout image = %#v", fromSource, fromLayout)
+	}
+	assertTreesEqual(t, layoutStore, sourceStore, "objects")
+	assertTreesEqual(t, layoutStore, sourceStore, "images")
+	assertRefsEqual(t, layoutStore, sourceStore)
+}
+
+// TestPullBlobSourceTagE2E pulls a tagged reference through a blob source with
+// the root digest the caller resolved, and requires the tag to be recorded as
+// an alias for that digest so a later local lookup resolves it.
+func TestPullBlobSourceTagE2E(t *testing.T) {
+	storeRoot := verityStoreRoot(t)
+	useRemoteDefaultTransport(t, failTransport{})
+
+	lay, err := octest.BuildSingleLayerGzip(t.TempDir(), hostPlatform(),
+		canonicalPullFiles("tagged payload past the sixty-four byte inline limit\n")...,
+	)
+	if err != nil {
+		t.Fatalf("BuildSingleLayerGzip: %v", err)
+	}
+
+	ref := "registry.example.com/team/app:v1"
+	img := pullInto(t, storeRoot, ref, WithBlobSource(layoutBlobs(t, lay.Dir)), WithResolvedRoot(lay.Root))
+	if img.Digest != lay.Root.String() {
+		t.Fatalf("digest = %q, want %s", img.Digest, lay.Root)
+	}
+
+	record := readPullRef(t, storeRoot, mustNormalizeRef(t, ref))
+	if record.Resolved.Digest != lay.Root {
+		t.Fatalf("ref record = %#v, want %q -> %s", record, ref, lay.Root)
+	}
+
+	eng, err := New(Config{Root: storeRoot})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	info, err := eng.Inspect(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("Inspect(%q): %v", ref, err)
+	}
+	if info.Root != lay.Root {
+		t.Fatalf("Inspect Root = %s, want %s", info.Root, lay.Root)
+	}
+}
+
+// TestPullBlobSourceResolvedManifestOfIndexPinE2E pulls an index-pinned
+// reference with a resolved root naming the platform manifest inside that
+// index. The two digests legitimately disagree, and the pull roots at the
+// resolved one.
+func TestPullBlobSourceResolvedManifestOfIndexPinE2E(t *testing.T) {
+	storeRoot := verityStoreRoot(t)
+	useRemoteDefaultTransport(t, failTransport{})
+
+	body := "index payload past the sixty-four byte inline limit for the object store\n"
+	lay, err := octest.BuildImage(t.TempDir(),
+		octest.ImageSpec{Platform: hostPlatform(), Layers: []octest.LayerSpec{{Files: canonicalPullFiles(body)}}},
+		octest.ImageSpec{Platform: ocispec.Platform{OS: "plan9", Architecture: "mips"}, Layers: []octest.LayerSpec{{Files: canonicalPullFiles(body)}}},
+	)
+	if err != nil {
+		t.Fatalf("BuildImage: %v", err)
+	}
+	if lay.Root == lay.Manifest {
+		t.Fatal("fixture must pin an index, not a manifest")
+	}
+
+	img := pullInto(t, storeRoot, lay.Ref, WithBlobSource(layoutBlobs(t, lay.Dir)), WithResolvedRoot(lay.Manifest))
+	if img.Digest != lay.Manifest.String() {
+		t.Fatalf("digest = %q, want the resolved manifest %s", img.Digest, lay.Manifest)
+	}
+
+	binding := readPullBinding(t, storeRoot, lay.Manifest, lay.Platform)
+	if binding.RootFS.Descriptor.Size != img.Size {
+		t.Fatalf("binding size = %d, returned image size = %d", binding.RootFS.Descriptor.Size, img.Size)
+	}
+	record := readPullRef(t, storeRoot, mustNormalizeRef(t, lay.Ref))
+	if record.Resolved.Digest != lay.Manifest {
+		t.Fatalf("ref record = %#v, want %q -> %s", record, lay.Ref, lay.Manifest)
+	}
+}
+
+func TestPullBlobSourceOptionErrors(t *testing.T) {
+	pinned := "registry.example.com/team/app@sha256:" + strings.Repeat("a", 64)
+	tagged := "registry.example.com/team/app:v1"
+	root := digest.Digest("sha256:" + strings.Repeat("b", 64))
+	tests := []struct {
+		name    string
+		ref     string
+		opts    []PullOption
+		wantErr string
+	}{
+		{"tag without resolved root", tagged, []PullOption{WithBlobSource(&memBlobSource{})}, "digest-pinned reference is required"},
+		{"resolved root without blob source", tagged, []PullOption{WithResolvedRoot(root)}, "requires a blob source"},
+		{"blob source with layout dir", pinned, []PullOption{WithBlobSource(&memBlobSource{}), WithFromDir(t.TempDir())}, "mutually exclusive"},
+		{"malformed resolved root", tagged, []PullOption{WithBlobSource(&memBlobSource{}), WithResolvedRoot("sha256:bad")}, "invalid digest"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			eng, err := New(Config{Root: t.TempDir()})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			_, err = eng.Pull(context.Background(), tt.ref, tt.opts...)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// memBlobSource serves blobs from memory, so a pull through it reaches neither
+// a registry nor a layout directory.
+type memBlobSource struct {
+	blobs map[digest.Digest][]byte
+}
+
+func (s *memBlobSource) Open(_ context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
+	data, ok := s.blobs[desc.Digest]
+	if !ok {
+		return nil, fmt.Errorf("memBlobSource: blob %s absent: %w", desc.Digest, os.ErrNotExist)
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+// failTransport fails every request, so a test can assert an operation is
+// fully offline.
+type failTransport struct{}
+
+func (failTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("unexpected network request: %s %s", req.Method, req.URL)
+}
+
+// layoutBlobs reads every blob of the OCI image layout at dir into a
+// memBlobSource, keyed by the digest its file name encodes.
+func layoutBlobs(t *testing.T, dir string) *memBlobSource {
+	t.Helper()
+	blobDir := filepath.Join(dir, "blobs", "sha256")
+	entries, err := os.ReadDir(blobDir)
+	if err != nil {
+		t.Fatalf("read blobs: %v", err)
+	}
+	src := &memBlobSource{blobs: make(map[digest.Digest][]byte, len(entries))}
+	for _, e := range entries {
+		data, err := os.ReadFile(filepath.Join(blobDir, e.Name())) // #nosec G304 -- test fixture path
+		if err != nil {
+			t.Fatalf("read blob %s: %v", e.Name(), err)
+		}
+		src.blobs[digest.Digest("sha256:"+e.Name())] = data
+	}
+	return src
+}
+
+// verityStoreRoot returns a fresh verity-capable store root, skipping the test
+// when the privileged dev container's filesystem or mkcomposefs is missing.
+func verityStoreRoot(t *testing.T) string {
+	t.Helper()
+	storeRoot, cleanup, err := devtest.VerityRoot()
+	if errors.Is(err, devtest.ErrNoVerity) {
+		t.Skipf("verity-capable store root unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("VerityRoot: %v", err)
+	}
+	t.Cleanup(cleanup)
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+	return storeRoot
+}
+
+// pullInto pulls ref into a store rooted at storeRoot through a fresh engine.
+func pullInto(t *testing.T, storeRoot, ref string, opts ...PullOption) *Image {
+	t.Helper()
+	eng, err := New(Config{Root: storeRoot})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	img, err := eng.Pull(context.Background(), ref, opts...)
+	if devtest.IsVerityUnsupported(err) {
+		t.Skipf("fs-verity unsupported on the test filesystem: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("Pull(%q): %v", ref, err)
+	}
+	return img
+}
+
+// assertTreesEqual requires subdirectory sub of two store roots to hold the
+// same file paths with the same content.
+func assertTreesEqual(t *testing.T, wantRoot, gotRoot, sub string) {
+	t.Helper()
+	assertSameContents(t, sub, wantRoot, gotRoot,
+		treeContents(t, filepath.Join(wantRoot, sub)),
+		treeContents(t, filepath.Join(gotRoot, sub)))
+}
+
+// assertRefsEqual compares the two stores' ref records with the pulledAt
+// timestamp stripped, the one wall-clock field a pull writes.
+func assertRefsEqual(t *testing.T, wantRoot, gotRoot string) {
+	t.Helper()
+	assertSameContents(t, "refs", wantRoot, gotRoot,
+		refContents(t, wantRoot), refContents(t, gotRoot))
+}
+
+// refContents reads every ref record under root's refs tree with the pulledAt
+// field removed, keyed by path relative to that tree.
+func refContents(t *testing.T, root string) map[string][]byte {
+	t.Helper()
+	out := treeContents(t, filepath.Join(root, "refs"))
+	for path, data := range out {
+		var rec map[string]any
+		if err := json.Unmarshal(data, &rec); err != nil {
+			t.Fatalf("decode refs/%s: %v", path, err)
+		}
+		delete(rec, "pulledAt")
+		stripped, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatalf("re-encode refs/%s: %v", path, err)
+		}
+		out[path] = stripped
+	}
+	return out
+}
+
+func assertSameContents(t *testing.T, sub, wantRoot, gotRoot string, want, got map[string][]byte) {
+	t.Helper()
+	if len(want) == 0 {
+		t.Fatalf("%s is empty in %s", sub, wantRoot)
+	}
+	for path, data := range want {
+		other, ok := got[path]
+		if !ok {
+			t.Fatalf("%s/%s missing from %s", sub, path, gotRoot)
+		}
+		if !bytes.Equal(data, other) {
+			t.Fatalf("%s/%s differs between the two stores", sub, path)
+		}
+	}
+	for path := range got {
+		if _, ok := want[path]; !ok {
+			t.Fatalf("%s/%s present only in %s", sub, path, gotRoot)
+		}
+	}
+}
+
+// treeContents reads every regular file under dir, keyed by its path relative
+// to dir.
+func treeContents(t *testing.T, dir string) map[string][]byte {
+	t.Helper()
+	var files []string
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		files = append(files, rel)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", dir, err)
+	}
+
+	out := make(map[string][]byte, len(files))
+	for _, rel := range files {
+		data, err := os.ReadFile(filepath.Join(dir, rel)) // #nosec G304 -- test reads a store it just wrote
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		out[rel] = data
+	}
+	return out
 }
 
 // TestVerifiedPulledImageRejectsTamperedSealingAnnotations pins the cached-path

@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -88,12 +89,30 @@ type LayerInfo struct {
 	CreatedBy string
 }
 
+// BlobSource opens the raw blob bytes for a descriptor. An embedder supplies
+// one to pull an image out of content it already holds, for example a container
+// runtime's content store.
+type BlobSource interface {
+	Open(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error)
+}
+
 // PullOptions is the resolved configuration a Pull acts on. Callers pass the
-// With* options to Pull, which apply to a zero PullOptions.
+// With* options to Pull, which apply to a zero PullOptions. Exactly one
+// source feeds a pull: FromDir, BlobSource, or — when neither is set — the
+// registry the reference names; setting both is an error.
 type PullOptions struct {
 	// FromDir sources content from an OCI image layout directory instead of a
 	// registry (air-gapped sideload). Empty means pull from a registry.
 	FromDir string
+	// BlobSource sources every blob from the caller instead of a registry or a
+	// layout directory. Nil means the reference is pulled from its own source.
+	BlobSource BlobSource
+	// ResolvedRoot is the root digest the pull anchors on, for a caller that
+	// has already resolved the reference. Empty means no caller-supplied
+	// resolution, like the zero value of every other field here: a pinned
+	// reference then carries its digest, and a registry pull resolves a tag
+	// itself.
+	ResolvedRoot digest.Digest
 }
 
 // PullOption opts a Pull into a particular behaviour.
@@ -103,6 +122,25 @@ type PullOption func(*PullOptions)
 // registry (air-gapped sideload).
 func WithFromDir(dir string) PullOption {
 	return func(o *PullOptions) { o.FromDir = dir }
+}
+
+// WithBlobSource reads every blob of the pull — root, manifest, config, and
+// layers — from src instead of fetching them from a registry. The reference
+// must pin the root digest unless WithResolvedRoot supplies it. It cannot be
+// combined with WithFromDir.
+func WithBlobSource(src BlobSource) PullOption {
+	return func(o *PullOptions) { o.BlobSource = src }
+}
+
+// WithResolvedRoot anchors the pull on a root digest the caller resolved
+// itself, so a reference that pins no digest — a tag — can still be pulled.
+// The reference is then recorded only as an alias for that digest, exactly as
+// a registry tag resolution records it, so a later local lookup of the
+// reference finds the image. The digest need not be the one the reference
+// pins: a caller may pull a platform manifest out of an index-pinned
+// reference. It requires WithBlobSource.
+func WithResolvedRoot(root digest.Digest) PullOption {
+	return func(o *PullOptions) { o.ResolvedRoot = root }
 }
 
 // MountOptions is the resolved configuration a Mount acts on. Callers do not

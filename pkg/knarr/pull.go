@@ -41,25 +41,9 @@ func (e *engine) pull(ctx context.Context, ref string, opts ...PullOption) (*Ima
 		opt(&cfg)
 	}
 
-	var (
-		src  ocichain.BlobSource
-		root digest.Digest
-		err  error
-	)
-	if cfg.FromDir == "" {
-		src, root, err = ociremote.Open(ctx, ref)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		root, err = parseDigestPinnedRef(ref)
-		if err != nil {
-			return nil, err
-		}
-		src, err = ocilayout.Open(cfg.FromDir)
-		if err != nil {
-			return nil, err
-		}
+	src, root, err := pullSource(ctx, ref, cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	platform := hostPlatform()
@@ -97,6 +81,46 @@ func (e *engine) pull(ctx context.Context, ref string, opts ...PullOption) (*Ima
 		Digest: root.String(),
 		Size:   built.Descriptor.Size,
 	}, nil
+}
+
+// pullSource picks where a pull reads its blobs from and the root digest it
+// anchors on: a registry, which resolves a tag to the digest it currently
+// serves; a local OCI image layout directory; or a source the caller supplied.
+// The latter two fetch nothing and so cannot resolve a tag, which is why the
+// reference must pin the root digest — unless the caller resolved it and passed
+// it in, in which case that digest is the anchor and the reference is left to
+// the ref store as an alias for it.
+func pullSource(ctx context.Context, ref string, cfg PullOptions) (ocichain.BlobSource, digest.Digest, error) {
+	switch {
+	case cfg.BlobSource != nil && cfg.FromDir != "":
+		return nil, "", errors.New("a blob source and a layout directory are mutually exclusive")
+	case cfg.BlobSource == nil && cfg.ResolvedRoot != "":
+		return nil, "", errors.New("a resolved root digest requires a blob source")
+
+	case cfg.BlobSource != nil:
+		if cfg.ResolvedRoot == "" {
+			root, err := parseDigestPinnedRef(ref)
+			return cfg.BlobSource, root, err
+		}
+		if err := digestutil.ValidateSHA256(cfg.ResolvedRoot); err != nil {
+			return nil, "", err
+		}
+		return cfg.BlobSource, cfg.ResolvedRoot, nil
+
+	case cfg.FromDir != "":
+		root, err := parseDigestPinnedRef(ref)
+		if err != nil {
+			return nil, "", err
+		}
+		src, err := ocilayout.Open(cfg.FromDir)
+		if err != nil {
+			return nil, "", err
+		}
+		return src, root, nil
+
+	default:
+		return ociremote.Open(ctx, ref)
+	}
 }
 
 type cachedImage struct {
