@@ -87,13 +87,23 @@ KN=(bin/knarr --root "$STORE")
 
 fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
 
+# host_child prints the digest of the manifest an image index offers for the
+# host platform -- the identity knarr keys the image by. $1 is the index JSON.
+host_child() {
+	jq -r --arg arch "$(go env GOARCH)" \
+		'[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)][0].digest' \
+		<<<"$1"
+}
+
 # run_lifecycle drives every implemented verb for one image: $1 is the
-# reference the store ends up holding (digest-pinned or a tag), $2 the root
-# digest it must resolve to, and the remaining arguments are the pull
-# invocation that puts it there.
+# reference the store ends up holding (digest-pinned or a tag), $2 the image
+# identity it must resolve to (the platform manifest), $3 the digest the
+# reference itself lands on (the same as $2 unless the reference names an
+# index), and the remaining arguments are the pull invocation that puts it
+# there.
 run_lifecycle() {
-	local ref="$1" digest="$2"
-	shift 2
+	local ref="$1" digest="$2" pulled="$3"
+	shift 3
 
 	echo "== pull ($*) =="
 	"${KN[@]}" "$@"
@@ -108,7 +118,16 @@ run_lifecycle() {
 	"${KN[@]}" inspect "$ref"
 	local inspected
 	inspected="$("${KN[@]}" inspect --format json "$ref")"
-	[ "$(jq -r .root <<<"$inspected")" = "$digest" ] || fail "inspect root is not the pulled digest"
+	[ "$(jq -r .root <<<"$inspected")" = "$digest" ] || fail "inspect root is not the image identity"
+
+	echo "== ref record (expect identity keyed, provenance preserved) =="
+	# One image is in the store at this point, so the single ref record under
+	# refs/ is this leg's. The on-disk layout is a documented contract.
+	local record
+	record="$(cat "$STORE"/refs/sha256/*/*.json)"
+	printf '%s\n' "$record"
+	[ "$(jq -r .identity.digest <<<"$record")" = "$digest" ] || fail "ref record identity is not the image identity"
+	[ "$(jq -r .resolved.digest <<<"$record")" = "$pulled" ] || fail "ref record resolved is not the pulled digest"
 	jq -e '.composefs.digest | startswith("sha256:")' <<<"$inspected" >/dev/null || fail "inspect reports no composefs digest"
 	jq -e '.fsverity != ""' <<<"$inspected" >/dev/null || fail "inspect reports no fsverity digest"
 	jq -e '.rootfs_size > 0' <<<"$inspected" >/dev/null || fail "inspect reports no merged rootfs size"
@@ -252,7 +271,8 @@ printf '%s\n' "$ccheck" | grep -qF "RESULT: all three digests MATCH" \
 	|| fail "seal-crosscheck did not reach the exact three-way match"
 
 echo "==== lifecycle 0: the sealed purpose-built image ===="
-run_lifecycle "127.0.0.1:$port/custom@$csealed" "$csealed" pull "127.0.0.1:$port/custom@$csealed"
+# The purpose-built image is a plain manifest, so it is its own identity.
+run_lifecycle "127.0.0.1:$port/custom@$csealed" "$csealed" "$csealed" pull "127.0.0.1:$port/custom@$csealed"
 rm -rf "$IMGDIR"
 IMGDIR=""
 
@@ -261,16 +281,20 @@ if [ ! -f "$LAYOUT/index.json" ]; then
 	crane pull --format=oci "$IMAGE" "$LAYOUT"
 fi
 digest="$(jq -r '.manifests[0].digest' "$LAYOUT/index.json")"
+# The layout pins a multi-arch index, so the identity these legs must land on is
+# the child manifest it offers for the host platform.
+identity="$(host_child "$(cat "$LAYOUT/blobs/sha256/${digest#sha256:}")")"
+[[ "$identity" == sha256:* ]] || fail "smoke layout index lists no linux/$(go env GOARCH) manifest"
 
 echo "==== lifecycle 1: image sideloaded from a local directory ===="
-run_lifecycle "smoke@$digest" "$digest" pull --from-dir "$LAYOUT" "smoke@$digest"
+run_lifecycle "smoke@$digest" "$identity" "$digest" pull --from-dir "$LAYOUT" "smoke@$digest"
 
 echo "==== lifecycle 2: image pulled from a loopback HTTP registry ===="
 crane push "$LAYOUT" "127.0.0.1:$port/smoke"
-run_lifecycle "127.0.0.1:$port/smoke@$digest" "$digest" pull "127.0.0.1:$port/smoke@$digest"
+run_lifecycle "127.0.0.1:$port/smoke@$digest" "$identity" "$digest" pull "127.0.0.1:$port/smoke@$digest"
 
 echo "==== lifecycle 3: image pulled and addressed by tag ===="
-run_lifecycle "127.0.0.1:$port/smoke:latest" "$digest" pull "127.0.0.1:$port/smoke:latest"
+run_lifecycle "127.0.0.1:$port/smoke:latest" "$identity" "$digest" pull "127.0.0.1:$port/smoke:latest"
 
 echo "==== differential: mounted rootfs vs crane's image-level flatten ===="
 # crane export flattens the image the same way knarr's merge must (docker
@@ -320,10 +344,9 @@ echo "== raw sealed manifest (expect both fsverity annotations, bare hex) =="
 # The annotations live on each platform image manifest. A multi-arch image
 # seals as an index, so descend to the host platform's child first.
 manifest="$(crane manifest "127.0.0.1:$port/smoke@$sealed")"
+child="$sealed"
 if jq -e '.manifests' <<<"$manifest" >/dev/null; then
-	child="$(jq -r --arg arch "$(go env GOARCH)" \
-		'[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)][0].digest' \
-		<<<"$manifest")"
+	child="$(host_child "$manifest")"
 	[[ "$child" == sha256:* ]] || fail "sealed index has no host-platform manifest"
 	manifest="$(crane manifest "127.0.0.1:$port/smoke@$child")"
 fi
@@ -333,6 +356,8 @@ jq -e '.config.annotations["composefs.config.fsverity-sha256-12"] | test("^[0-9a
 	<<<"$manifest" >/dev/null || fail "sealed manifest lacks a well-formed config fsverity annotation"
 
 echo "==== lifecycle 4: the sealed image (pull re-verifies the seal) ===="
-run_lifecycle "127.0.0.1:$port/smoke@$sealed" "$sealed" pull "127.0.0.1:$port/smoke@$sealed"
+# $child is the sealed image's identity: the host platform's manifest when the
+# seal produced an index, and the sealed manifest itself otherwise.
+run_lifecycle "127.0.0.1:$port/smoke@$sealed" "$child" "$sealed" pull "127.0.0.1:$port/smoke@$sealed"
 
 echo "SMOKE OK: purpose-built image sealed, cross-checked three ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export and a seal round against the registry (checks passed)"

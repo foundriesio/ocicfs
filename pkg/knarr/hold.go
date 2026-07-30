@@ -5,13 +5,16 @@ package knarr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/opencontainers/go-digest"
+
+	"github.com/foundriesio/knarr/internal/ocichain"
 )
 
-// Hold pins ref's root digest under holder so a remove of that image declines
-// while the holder is present.
+// Hold pins ref's identity digest under holder so a remove of that image
+// declines while the holder is present.
 func (e *engine) Hold(ctx context.Context, ref, holder string) error {
 	if err := e.hold(ctx, ref, holder); err != nil {
 		return fmt.Errorf("hold %s: %w", ref, err)
@@ -19,7 +22,7 @@ func (e *engine) Hold(ctx context.Context, ref, holder string) error {
 	return nil
 }
 
-// Release drops holder's hold on ref's root digest.
+// Release drops holder's hold on ref's identity digest.
 func (e *engine) Release(ctx context.Context, ref, holder string) error {
 	if err := e.release(ctx, ref, holder); err != nil {
 		return fmt.Errorf("release %s: %w", ref, err)
@@ -28,8 +31,18 @@ func (e *engine) Release(ctx context.Context, ref, holder string) error {
 }
 
 func (e *engine) hold(ctx context.Context, ref, holder string) error {
-	root, err := e.resolveLocalRef(ref)
-	if err != nil {
+	root, err := e.resolveLocalRef(ctx, ref)
+	if root == "" {
+		return err
+	}
+	// A blob that does not hash to the digest naming it is store corruption, and
+	// a hold recorded under a digest nothing checks would be false protection:
+	// that is the one resolution failure a hold refuses. Every other one holds
+	// the digest as given — an absent blob reaches the presence check below and
+	// is reported as not pulled, while a verified blob that is not an OCI index
+	// (a loose content object, say) is held as the object it is, its presence
+	// decided by the object store.
+	if errors.Is(err, ocichain.ErrDigestMismatch) {
 		return err
 	}
 	unlock, err := e.holds.Lock(root)
@@ -53,8 +66,12 @@ func (e *engine) hold(ctx context.Context, ref, holder string) error {
 }
 
 func (e *engine) release(ctx context.Context, ref, holder string) error {
-	root, err := e.resolveLocalRef(ref)
-	if err != nil {
+	// A release is best-effort about store state: whatever the descent made of
+	// the digest — absent, corrupt, unreadable — the holder is dropped from the
+	// digest as given. A holder that could not release would linger forever,
+	// and the callers that release during teardown only warn.
+	root, err := e.resolveLocalRef(ctx, ref)
+	if root == "" {
 		return err
 	}
 	unlock, err := e.holds.Lock(root)
@@ -69,9 +86,9 @@ func (e *engine) release(ctx context.Context, ref, holder string) error {
 }
 
 // ensurePresent reports whether root's content is present in the authoritative
-// object store. A hold is keyed by the root digest and protects content
-// identity, so presence is decided digest-wide by the root blob in the CAS, not
-// by the auxiliary, regenerable, per-host-platform binding. An absent root is
+// object store. A hold is keyed by the identity digest and protects content
+// identity, so presence is decided digest-wide by that blob in the CAS, not by
+// the auxiliary, regenerable, per-host-platform binding. An absent root is
 // reported as ErrNotFound.
 func (e *engine) ensurePresent(root digest.Digest) error {
 	present, err := e.obj.Has(root)

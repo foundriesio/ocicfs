@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package holdstore records GC-protection holds: named holders that pin an
-// image's root digest so a remove declines while any holder is present. A hold
-// is an empty marker file under the digest's holder directory:
+// image's identity digest so a remove declines while any holder is present. A
+// hold is an empty marker file under the digest's holder directory:
 //
 //	<root>/holds/sha256/<aa>/<rest>/<holder>
 //
-// keyed by the root digest (holds protect content identity, and the reference
-// records are auxiliary). Mutating a digest's holders — and any check-then-act
+// keyed by the identity digest -- the platform image manifest (holds protect
+// content identity, and the reference records are auxiliary). Every verb
+// resolves down to that one digest before it marks, drops, or checks a holder,
+// so an image has exactly one holder directory and one lock however the caller
+// named it: a hold errors rather than mark a digest whose stored blob does not
+// hash to it, while a release drops the holder whatever state the store is in.
+// Mutating a digest's holders — and any check-then-act
 // that must be atomic against them, such as a remove reading the holders and
 // then deleting the image — runs under the digest's advisory lock, taken with
 // Lock. The lock file lives under a dedicated area and is never removed, so a

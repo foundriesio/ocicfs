@@ -35,7 +35,7 @@ func (e *engine) mountChain(ctx context.Context, chainID, target string, opts ..
 // record and returns the first image whose final layer chain ID equals chainID;
 // images that share a full chain have byte-identical rootfs by construction, so
 // the first match is as good as any. A zero-layer image has no final chain ID
-// and is never a match. Records are enumerated by their resolved digest alone;
+// and is never a match. Records are enumerated by their identity digest alone;
 // their platform strings are not parsed here, so a record with an unparseable
 // platform is inspected like any other rather than aborting the scan.
 //
@@ -67,9 +67,9 @@ func (e *engine) resolveChain(ctx context.Context, chainID string) (*ImageInfo, 
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		info, err := e.inspect(ctx, rec.Resolved.Digest.String())
+		info, err := e.inspect(ctx, rec.Identity.Digest.String())
 		if err != nil {
-			scanErrs = append(scanErrs, fmt.Errorf("inspect %s: %w", rec.Resolved.Digest, err))
+			scanErrs = append(scanErrs, fmt.Errorf("inspect %s: %w", rec.Identity.Digest, err))
 			continue
 		}
 		if n := len(info.Layers); n > 0 && info.Layers[n-1].ChainID == want {

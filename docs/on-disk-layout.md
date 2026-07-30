@@ -53,9 +53,22 @@ and a re-pull regenerates them while deduplicating against the objects already
 present. The compressed wire form of a layer is **never** persisted — only its
 decompressed per-file content.
 
+## Image identity — the digest everything is keyed by
+
+An image is keyed by its **identity digest**: the digest of the platform image
+manifest. A reference that lands on an image index — a tag usually does — is
+descended one level, inside the index's own digest-verified bytes, to the
+manifest it offers for the host platform, and that manifest's digest is what
+`images/`, `holds/`, and every verb use. Pulling one image by its index digest
+and by its platform manifest digest therefore stores it once, under one key,
+with one set of holds. The digest `knarr pull`, `knarr ls`, and `knarr inspect`
+report is the identity, which may differ from the digest the reference pinned;
+it is the digest to pin, hold, and look the image up by. See
+[ADR 0002](adr/0002-image-identity.md).
+
 ## `images/` — image bindings (auxiliary)
 
-One JSON file per (pinned root digest, platform). It's a convenience index that
+One JSON file per (identity digest, platform). It's a convenience index that
 lets a mount go straight to the already-built composefs image without re-resolving
 or rebuilding, and records the locally measured fs-verity digest:
 
@@ -87,7 +100,7 @@ verifies the image as already present does not rewrite the binding, so the
 field appears when the image is next actually built (after the binding's last
 ref is removed, or on an image update).
 
-At mount time, knarr reads the host-platform binding for the pinned root digest,
+At mount time, knarr reads the host-platform binding for the identity digest,
 opens the referenced composefs image from `objects/sha256`, re-measures that
 image object's fs-verity digest, and requires it to match `rootfs.fsverity.digest`
 before mounting. The mount uses the binding's `objectStore.path`
@@ -108,20 +121,34 @@ trust anchor:
 
 ```json
 {
-  "schema": "application/vnd.knarr.ref.v1+json",
-  "ref": "app@sha256:…",
+  "schema": "application/vnd.knarr.ref.v2+json",
+  "ref": "app:v1",
   "refKey": { "algorithm": "sha256", "digest": "sha256:…" },
-  "resolved": { "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "resolved": { "mediaType": "", "digest": "sha256:…", "size": 6694 },
+  "identity": { "mediaType": "application/vnd.oci.image.manifest.v1+json",
                 "digest": "sha256:…", "size": 481 },
   "pulledAt": "2026-07-01T11:47:00Z",
   "platforms": ["linux/arm64"]
 }
 ```
 
-`knarr ls` reads these records and reports one row per stored reference. `knarr
-remove <ref>` deletes the matching ref record and any unshared image binding for
-the recorded root digest and platform; it does not delete content from
-`objects/`.
+The two descriptors say different things. `resolved` is **provenance**: the
+document the reference itself landed on — an image index for the tag above, and
+the manifest itself for a manifest-pinned reference, in which case the two
+descriptors are the same one. It is unauthenticated local bookkeeping; nothing
+verifies against it. `identity` is the platform image manifest the reference
+names, the digest the bindings and holds are keyed by and the one every verb
+looks the image up under. A descriptor records a `mediaType` only when the
+document that named it declared one, so `resolved` carries an empty one (a
+pinned root has no parent descriptor), as does `identity` when the reference
+already named the manifest. A record carrying an older schema is rejected on read,
+naming the remedy (recreate the store); `ls` skips such a record with a warning
+rather than failing the whole listing.
+
+`knarr ls` reads these records and reports one row per stored reference, showing
+the identity digest. `knarr remove <ref>` deletes the matching ref record and
+any unshared image binding for the recorded identity digest and platform; it
+does not delete content from `objects/`.
 
 ## `holds/` — GC-protection holds (auxiliary)
 
@@ -133,16 +160,29 @@ digest's holder directory:
 holds/sha256/<aa>/<rest>/<holder>
 ```
 
-Holds are keyed by the **root digest**, not the reference: holds protect content
-identity, and the reference records are auxiliary (a tag can be repointed, and a
-holder may pin an image by bare digest that no local ref names). A holder name is
+Holds are keyed by the **identity digest**, not the reference: holds protect
+content identity, and the reference records are auxiliary (a tag can be
+repointed, and a holder may pin an image by bare digest that no local ref
+names). Both verbs resolve their argument down to that one digest first, so a
+hold taken on an image under one name is seen by a `remove` of any other name
+for it. A holder name is
 restricted to `[a-z0-9._-]` so it can only ever name a single file inside the
 directory. The holder directory is removed with its last holder; the content in
 `objects/` is never touched.
 
-`remove <ref>` reads the holders for the recorded root digest and declines,
-naming them, while any are present; `remove --force <ref>` clears the holds
-first and proceeds.
+The two verbs differ in what they make of a store they cannot read. `hold`
+fails on exactly one condition — a stored blob that does not hash to the digest
+naming it, which is corruption a hold must not paper over. Any other resolution
+failure holds the digest as given: content absent from the store is reported as
+not pulled, and a plain content object (anything that does not parse as OCI
+metadata) is held as the object it is. `release` never fails on store state at
+all: whatever shape the store is in, the holder is dropped, so a hold can always
+be undone.
+
+`remove <ref>` reads the holders for the record's identity digest and declines
+while any are present, naming each holder **and the digest they sit under** —
+that digest is what a `release` takes, and it is not always the one typed at the
+prompt. `remove --force <ref>` clears the holds first and proceeds.
 
 Mutating a digest's holders — and the `remove` check-then-delete, which must be
 atomic against a concurrent hold — runs under a per-digest advisory lock

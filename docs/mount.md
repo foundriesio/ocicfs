@@ -5,8 +5,9 @@ filesystem. It does not pull, rebuild, or execute anything; it reads the local
 binding and object store produced by `knarr pull`. The reference may pin a
 digest (`name@sha256:<hex>` or a bare `sha256:<hex>`) or be any ref string a
 previous pull recorded, such as a tag: an unpinned ref resolves locally —
-never over the network — to the digest its most recent pull recorded, and
-every verification keys on that digest.
+never over the network — to the identity its most recent pull recorded, and a
+pinned index digest resolves to the manifest that index offers for the host
+platform. Every verification keys on that identity digest.
 
 ## Prerequisites
 
@@ -93,10 +94,13 @@ stacking depth. The upper and work directories must not live on an overlayfs.
 
 ## Notes
 
-- **Digest-pinned only.** Accepted forms are `name@sha256:<hex>` or a bare
-  `sha256:<hex>`. A tag-only reference is rejected.
+- **Locally resolved only.** Accepted forms are `name@sha256:<hex>`, a bare
+  `sha256:<hex>`, and any ref string a previous pull recorded, such as a tag. A
+  ref that pins no digest is resolved from the local reference record, never
+  over the network, so a tag this store has not pulled is rejected.
 - **Host platform only.** Mount looks for the binding matching the local OS and
-  architecture. If that binding is absent, pull the image for this platform first.
+  architecture, under the image identity for that platform. If that binding is
+  absent, pull the image for this platform first.
 - **Read-only only.** `--rw` and writable overlay options are rejected with
   `writable mounts are not supported`. A writable rootfs is assembled by the
   consumer over a `--metadata-only` mount instead (see above).
@@ -106,4 +110,4 @@ stacking depth. The upper and work directories must not live on an overlayfs.
   fs-verity digest on the composefs image and requires fs-verity on every
   backing object, so tampered or unsealed content cannot be served. The binding
   itself is an untrusted, regenerable index: it selects which locally verified
-  image is mounted for the requested root digest, and is not itself sealed.
+  image is mounted for the requested identity digest, and is not itself sealed.

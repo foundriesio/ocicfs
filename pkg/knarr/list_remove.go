@@ -52,7 +52,7 @@ func (e *engine) list(ctx context.Context) ([]Image, error) {
 		}
 		images = append(images, Image{
 			Ref:    rec.Ref,
-			Digest: rec.Resolved.Digest.String(),
+			Digest: rec.Identity.Digest.String(),
 			Size:   size,
 		})
 	}
@@ -69,7 +69,7 @@ func bindingSize(imgStore *imagestore.Store, rec refstore.Record) (int64, error)
 	if len(platforms) == 0 {
 		return 0, fmt.Errorf("ref %s records no platforms", rec.Ref)
 	}
-	b, err := imgStore.Get(rec.Resolved.Digest, platforms[0])
+	b, err := imgStore.Get(rec.Identity.Digest, platforms[0])
 	if err != nil {
 		// The binding is an auxiliary, regenerable index: a missing or invalid
 		// one must not brick the whole listing (matching refstore.List's
@@ -99,11 +99,13 @@ func (e *engine) remove(ctx context.Context, ref string, opts ...RemoveOption) e
 		return err
 	}
 
-	// Hold the digest's lock across the holder check and the delete, so a
-	// concurrent hold cannot slip a holder in after the check and be stranded by
-	// the delete. Without --force a present holder declines the removal by name;
-	// with --force the holds are cleared first.
-	root := rec.Resolved.Digest
+	// Hold the identity digest's lock across the holder check and the delete, so
+	// a concurrent hold cannot slip a holder in after the check and be stranded
+	// by the delete. Every hold is keyed by the identity, so this one lock and
+	// this one holder directory cover the image however it was named. Without
+	// --force a present holder declines the removal by name; with --force the
+	// holds are cleared first.
+	root := rec.Identity.Digest
 	unlock, err := e.holds.Lock(root)
 	if err != nil {
 		return err
@@ -127,7 +129,9 @@ func (e *engine) remove(ctx context.Context, ref string, opts ...RemoveOption) e
 			return err
 		}
 		if len(holders) > 0 {
-			return fmt.Errorf("image is held by %s; release the hold or use --force", strings.Join(holders, ", "))
+			// Name the digest the holders sit under as well: releasing one takes
+			// that digest, and it is not always the one the caller typed.
+			return fmt.Errorf("image is held by %s under %s; release the hold or use --force", strings.Join(holders, ", "), root)
 		}
 	}
 
@@ -139,7 +143,7 @@ func (e *engine) remove(ctx context.Context, ref string, opts ...RemoveOption) e
 	if err != nil {
 		return err
 	}
-	toDelete, err := unsharedBindings(rec.Ref, rec.Resolved.Digest, platforms, records)
+	toDelete, err := unsharedBindings(rec.Ref, rec.Identity.Digest, platforms, records)
 	if err != nil {
 		return err
 	}
@@ -152,7 +156,7 @@ func (e *engine) remove(ctx context.Context, ref string, opts ...RemoveOption) e
 		return err
 	}
 	for _, platform := range toDelete {
-		if err := e.img.Delete(rec.Resolved.Digest, platform); err != nil {
+		if err := e.img.Delete(rec.Identity.Digest, platform); err != nil {
 			return fmt.Errorf("delete image binding: %w", err)
 		}
 	}
@@ -171,6 +175,8 @@ func parseRecordPlatforms(values []string) ([]ocispec.Platform, error) {
 	return platforms, nil
 }
 
+// unsharedBindings returns the platforms whose binding for the identity digest
+// root no reference other than ref still resolves to.
 func unsharedBindings(ref string, root digest.Digest, platforms []ocispec.Platform, records []refstore.Record) ([]ocispec.Platform, error) {
 	var out []ocispec.Platform
 	for _, platform := range platforms {
@@ -185,9 +191,13 @@ func unsharedBindings(ref string, root digest.Digest, platforms []ocispec.Platfo
 	return out, nil
 }
 
+// bindingUsedByOther reports whether a reference other than ref resolves to the
+// same binding. The comparison is between identities, the digest a binding is
+// keyed by: comparing the resolved descriptors instead would let a removed tag
+// delete the binding an index-pinned reference for the same image still needs.
 func bindingUsedByOther(ref string, root digest.Digest, platform ocispec.Platform, records []refstore.Record) (bool, error) {
 	for _, other := range records {
-		if other.Ref == ref || other.Resolved.Digest != root {
+		if other.Ref == ref || other.Identity.Digest != root {
 			continue
 		}
 		for _, value := range other.Platforms {
@@ -205,8 +215,8 @@ func bindingUsedByOther(ref string, root digest.Digest, platform ocispec.Platfor
 
 // samePlatform compares fields literally, without the default-variant
 // canonicalization the binding filename applies (arm64/v8 == arm64): records
-// for the same root always carry the identical config-derived platform string,
-// so the two equivalences cannot diverge here.
+// for the same identity always carry the identical config-derived platform
+// string, so the two equivalences cannot diverge here.
 func samePlatform(a, b ocispec.Platform) bool {
 	return a.OS == b.OS && a.Architecture == b.Architecture && a.Variant == b.Variant
 }

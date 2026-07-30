@@ -13,6 +13,7 @@ import (
 	"github.com/opencontainers/go-digest"
 
 	"github.com/foundriesio/knarr/internal/holdstore"
+	"github.com/foundriesio/knarr/internal/octest"
 )
 
 func TestEngineHoldThenRemoveDeclines(t *testing.T) {
@@ -124,10 +125,10 @@ func TestEngineBareDigestHold(t *testing.T) {
 
 func TestEngineBareDigestHoldObjectOnly(t *testing.T) {
 	root := t.TempDir()
-	// Only the root blob is present — no ref, no binding. Presence is decided by
-	// the object store, so a bare-digest hold of content-in-store succeeds.
-	imageRoot := digest.SHA256.FromString("root")
-	writeEngineObject(t, root, imageRoot)
+	// A plain content object is present — no ref, no binding, and nothing that
+	// parses as OCI metadata to descend. Presence is decided by the object
+	// store, so a bare-digest hold of content-in-store succeeds.
+	imageRoot, _ := writeEngineObject(t, root, []byte("loose object content"))
 	eng, err := New(Config{Root: root})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -255,21 +256,20 @@ func TestEngineRemoveContextCanceledUnderLock(t *testing.T) {
 }
 
 // seedHeldImage writes the state the hold verbs and remove treat as a pulled
-// image: the root blob in the object store (the authoritative presence signal),
-// plus a ref and host-platform binding for remove to delete. It returns the
-// engine, the image root digest, and the ref.
+// image: a real host-platform image manifest in the object store (the
+// authoritative presence signal, which the verbs read and descend), plus a ref
+// and host-platform binding for remove to delete. It returns the engine, the
+// image's identity digest, and the ref naming it.
 func seedHeldImage(t *testing.T, root string) (Engine, digest.Digest, string) {
 	t.Helper()
-	imageRoot := digest.SHA256.FromString("root")
-	ref := "registry.example.com/app@" + imageRoot.String()
-	writeEngineObject(t, root, imageRoot)
-	putEngineRef(t, root, ref, imageRoot, 45, hostPlatform())
-	putEngineBinding(t, root, imageRoot, hostPlatform(), digest.SHA256.FromString("composefs"))
+	lay := seedChainImage(t, root, "registry.example.com/app@%s", []octest.LayerSpec{
+		{Files: []octest.File{{Name: "a", Mode: 0o644, Body: "one"}}},
+	}, nil)
 	eng, err := New(Config{Root: root})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return eng, imageRoot, ref
+	return eng, lay.Root, "registry.example.com/app@" + lay.Root.String()
 }
 
 // assertHolders checks the holders recorded for imageRoot equal want (nil for

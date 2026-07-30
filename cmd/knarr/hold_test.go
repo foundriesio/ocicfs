@@ -38,10 +38,8 @@ func TestRunHoldNeverPulledIsNotFound(t *testing.T) {
 
 func TestRunHoldReleaseRemoveCycle(t *testing.T) {
 	root := t.TempDir()
-	imageRoot := digest.SHA256.FromString("root")
-	ref := "registry.example.com/app@" + imageRoot.String()
 	platform := ocispec.Platform{OS: runtime.GOOS, Architecture: runtime.GOARCH}
-	writeCLIImage(t, root, ref, imageRoot, 72, platform)
+	_, ref := writeCLIImage(t, root, "registry.example.com/app@%s", platform)
 
 	// hold --format json emits the machine-readable object on stdout.
 	var out, errOut bytes.Buffer
@@ -88,10 +86,8 @@ func TestRunHoldReleaseRemoveCycle(t *testing.T) {
 
 func TestRunRemoveForceClearsHold(t *testing.T) {
 	root := t.TempDir()
-	imageRoot := digest.SHA256.FromString("root")
-	ref := "registry.example.com/app@" + imageRoot.String()
 	platform := ocispec.Platform{OS: runtime.GOOS, Architecture: runtime.GOARCH}
-	writeCLIImage(t, root, ref, imageRoot, 72, platform)
+	_, ref := writeCLIImage(t, root, "registry.example.com/app@%s", platform)
 
 	var out, errOut bytes.Buffer
 	if code := run(context.Background(), []string{"--root", root, "hold", ref}, &out, &errOut); code != 0 {

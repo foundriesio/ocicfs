@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package refstore persists reference provenance: a record of the exact image
-// reference a pull was given and the immutable descriptor it resolved to. It is
-// auxiliary UX/provenance metadata, not a trust anchor and not required to run
-// an image -- a digest-pinned image is found via its resolved digest in the
-// object store; refs exist for listing, debugging, and naming. Being untrusted,
+// reference a pull was given, the immutable descriptor it resolved to, and the
+// identity of the image that descriptor leads to. It is auxiliary UX/provenance
+// metadata, not a trust anchor and not required to run an image -- a
+// digest-pinned image is found via its identity digest in the object store;
+// refs exist for listing, debugging, and naming. Being untrusted,
 // a record is checked on use: its stored ref must equal the reference looked up,
 // its refKey must equal sha256(ref), and its stored digests must be valid
 // sha256 digests. Each record is a JSON file keyed by the SHA-256 of the
@@ -18,16 +19,23 @@
 //	refKey = sha256(ref)
 //	<root>/refs/sha256/<refkey-xx>/<refkey-rest>.json
 //
-// The record holds the exact ref, its refKey, the resolved OCI root descriptor
-// (whose digest is the image identity, locating its content in the object store),
-// the pull time, and the platforms pulled. The file is written atomically and
-// durably.
+// The record holds the exact ref, its refKey, two descriptors, the pull time,
+// and the platforms pulled. The file is written atomically and durably.
 //
-//	{ "schema": "application/vnd.knarr.ref.v1+json",
+//	{ "schema": "application/vnd.knarr.ref.v2+json",
 //	  "ref": "registry.example.com/team/app@sha256:...",
 //	  "refKey":   {"algorithm":"sha256","digest":"sha256:..."},
 //	  "resolved": {"mediaType":"...","digest":"sha256:...","size":N},
+//	  "identity": {"mediaType":"...","digest":"sha256:...","size":N},
 //	  "pulledAt": "<RFC3339>", "platforms": ["linux/arm64"] }
+//
+// The two descriptors say different things. "resolved" is provenance: the
+// document the reference itself landed on, an image index for a tag or an
+// index-pinned ref and an image manifest otherwise. It is unauthenticated local
+// bookkeeping -- an operator reads it to see what a pull anchored on, and no
+// verification takes it as an input. "identity" is the platform image manifest
+// the reference names, the one digest the object store, the image bindings, and
+// the holds are all keyed by; every lookup a verb makes goes through it.
 package refstore
 
 import (
@@ -55,10 +63,13 @@ type Store struct {
 	root string
 }
 
-// Record is the validated reference record stored for a pulled image.
+// Record is the validated reference record stored for a pulled image. Resolved
+// is the descriptor the reference itself landed on (provenance); Identity is
+// the platform image manifest the image is keyed by.
 type Record struct {
 	Ref       string
 	Resolved  ocispec.Descriptor
+	Identity  ocispec.Descriptor
 	PulledAt  time.Time
 	Platforms []string
 }
@@ -74,8 +85,11 @@ func New(root string) (*Store, error) {
 	return &Store{root: root}, nil
 }
 
-// Put writes refs/sha256/<refkey-xx>/<refkey-rest>.json atomically.
-func (s *Store) Put(ref string, resolved ocispec.Descriptor, pulledAt time.Time, platforms []string) error {
+// Put writes refs/sha256/<refkey-xx>/<refkey-rest>.json atomically. resolved is
+// the descriptor the reference landed on and identity the platform image
+// manifest it names; the two are the same descriptor when the reference already
+// names a manifest.
+func (s *Store) Put(ref string, resolved, identity ocispec.Descriptor, pulledAt time.Time, platforms []string) error {
 	path, refKey := s.refPath(ref)
 	doc := refDoc{
 		Schema: refSchema,
@@ -85,6 +99,7 @@ func (s *Store) Put(ref string, resolved ocispec.Descriptor, pulledAt time.Time,
 			Digest:    refKey,
 		},
 		Resolved:  descriptorDoc{MediaType: resolved.MediaType, Digest: resolved.Digest, Size: resolved.Size},
+		Identity:  descriptorDoc{MediaType: identity.MediaType, Digest: identity.Digest, Size: identity.Size},
 		PulledAt:  pulledAt.Format(time.RFC3339),
 		Platforms: platforms,
 	}
@@ -166,7 +181,7 @@ func (s *Store) Delete(ref string) error {
 	return nil
 }
 
-const refSchema = "application/vnd.knarr.ref.v1+json"
+const refSchema = "application/vnd.knarr.ref.v2+json"
 
 // The on-disk ref JSON documents.
 type (
@@ -175,6 +190,7 @@ type (
 		Ref       string        `json:"ref"`
 		RefKey    refKeyDoc     `json:"refKey"`
 		Resolved  descriptorDoc `json:"resolved"`
+		Identity  descriptorDoc `json:"identity"`
 		PulledAt  string        `json:"pulledAt"`
 		Platforms []string      `json:"platforms"`
 	}
@@ -214,7 +230,10 @@ func readRecord(path, wantRef string) (Record, error) {
 
 func validateRecord(doc refDoc, wantRef string) (Record, error) {
 	if doc.Schema != refSchema {
-		return Record{}, fmt.Errorf("unsupported ref schema %q", doc.Schema)
+		// A record this version cannot read is not repaired in place: the digests
+		// it keys on may mean something else entirely, so it fails closed and the
+		// remedy is to recreate the store and pull again.
+		return Record{}, fmt.Errorf("unsupported ref schema %q, want %q: recreate the store and re-pull", doc.Schema, refSchema)
 	}
 	if doc.Ref == "" {
 		return Record{}, errors.New("empty ref")
@@ -237,6 +256,12 @@ func validateRecord(doc refDoc, wantRef string) (Record, error) {
 	if doc.Resolved.Size < 0 {
 		return Record{}, fmt.Errorf("resolved size is negative: %d", doc.Resolved.Size)
 	}
+	if err := digestutil.ValidateSHA256(doc.Identity.Digest); err != nil {
+		return Record{}, fmt.Errorf("identity digest: %w", err)
+	}
+	if doc.Identity.Size < 0 {
+		return Record{}, fmt.Errorf("identity size is negative: %d", doc.Identity.Size)
+	}
 	pulledAt, err := time.Parse(time.RFC3339, doc.PulledAt)
 	if err != nil {
 		return Record{}, fmt.Errorf("pulledAt: %w", err)
@@ -255,6 +280,11 @@ func validateRecord(doc refDoc, wantRef string) (Record, error) {
 			MediaType: doc.Resolved.MediaType,
 			Digest:    doc.Resolved.Digest,
 			Size:      doc.Resolved.Size,
+		},
+		Identity: ocispec.Descriptor{
+			MediaType: doc.Identity.MediaType,
+			Digest:    doc.Identity.Digest,
+			Size:      doc.Identity.Size,
 		},
 		PulledAt:  pulledAt,
 		Platforms: append([]string(nil), doc.Platforms...),

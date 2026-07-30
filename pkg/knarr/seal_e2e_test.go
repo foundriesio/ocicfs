@@ -327,7 +327,7 @@ func TestSealedCachedPullRejectsTamperAfterRestartE2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("imagestore.Get: %v", err)
 	}
-	root := rebindManifestAnnotations(t, obj, imgStore, lay, binding,
+	identity := rebindManifestAnnotations(t, obj, imgStore, lay, binding,
 		map[string]string{ociseal.MergedAnnotation: strings.Repeat("0", 64)}, nil)
 
 	// A fresh engine against the same on-disk store models a process restart
@@ -336,7 +336,7 @@ func TestSealedCachedPullRejectsTamperAfterRestartE2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New after restart: %v", err)
 	}
-	_, err = restarted.Pull(context.Background(), "registry.example.com/team/cached@"+root.String(), WithFromDir(lay.Dir))
+	_, err = restarted.Pull(context.Background(), "registry.example.com/team/cached@"+identity.Digest.String(), WithFromDir(lay.Dir))
 	if err == nil || !strings.Contains(err.Error(), "annotation") {
 		t.Fatalf("cached Pull error = %v, want an annotation mismatch", err)
 	}

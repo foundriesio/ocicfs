@@ -44,6 +44,12 @@ type Resolved struct {
 	DiffIDs       []digest.Digest // Extracted from config; verified to be sha256-only and count == layers
 }
 
+// ErrDigestMismatch reports that a metadata blob's bytes do not hash to the
+// digest that named them: the stored or served content is corrupt, as opposed
+// to merely absent or unparseable. Only the digest check reports it; a size
+// disagreement is a plain error.
+var ErrDigestMismatch = errors.New("ocichain: blob digest mismatch")
+
 // Resolve verifies the descriptor chain from root for the wanted platform:
 // root, manifest, and config bytes are authenticated against their digests, and
 // the manifest's layer descriptors and the config's diff_ids are validated
@@ -58,11 +64,6 @@ func Resolve(ctx context.Context, src BlobSource, root digest.Digest, want ocisp
 	// carries no declared size and is bounded by maxMetadataBytes.
 	rootBytes, err := ReadRootBlob(ctx, src, root)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			if describer, ok := src.(missingRootDescriber); ok {
-				return Resolved{}, describer.DescribeMissingRoot(root, err)
-			}
-		}
 		return Resolved{}, err
 	}
 	rootDesc := ocispec.Descriptor{Digest: root, Size: int64(len(rootBytes))}
@@ -77,12 +78,8 @@ func Resolve(ctx context.Context, src BlobSource, root digest.Digest, want ocisp
 	// descriptor and bytes then resolve through the same path.
 	manifestDesc, manifestBytes := rootDesc, rootBytes
 	if isIndex {
-		var index ocispec.Index
-		if err := json.Unmarshal(rootBytes, &index); err != nil {
-			return Resolved{}, fmt.Errorf("ocichain: parse index: %w", err)
-		}
 		var err error
-		manifestDesc, manifestBytes, err = selectFromIndex(ctx, src, &index, want)
+		manifestDesc, manifestBytes, err = selectFromIndex(ctx, src, rootBytes, want)
 		if err != nil {
 			return Resolved{}, err
 		}
@@ -127,9 +124,17 @@ func OpenLayer(ctx context.Context, src BlobSource, desc ocispec.Descriptor) (io
 // ReadRootBlob reads, bounds, and digest-verifies the pinned root metadata blob
 // a digest names directly — an image index or an image manifest. The root has no
 // parent descriptor to vouch for its length, so it is bounded by the metadata
-// cap rather than by an authenticated size.
+// cap rather than by an authenticated size. A source that can say something more
+// useful than "not found" about a root it does not serve is asked to render the
+// error, so every caller reading a pinned root gets that diagnostic.
 func ReadRootBlob(ctx context.Context, src BlobSource, root digest.Digest) ([]byte, error) {
-	return readVerifyMetaBlob(ctx, src, ocispec.Descriptor{Digest: root}, sizeUnknown)
+	data, err := readVerifyMetaBlob(ctx, src, ocispec.Descriptor{Digest: root}, sizeUnknown)
+	if err != nil && errors.Is(err, os.ErrNotExist) {
+		if describer, ok := src.(missingRootDescriber); ok {
+			return nil, describer.DescribeMissingRoot(root, err)
+		}
+	}
+	return data, err
 }
 
 // ReadMetaBlob reads, bounds, and digest-verifies a metadata blob — a manifest
@@ -162,6 +167,46 @@ func IsIndex(raw []byte) (bool, error) {
 		return true, nil
 	}
 	return len(probe.Manifests) > 0 && probe.Config.Digest == "", nil
+}
+
+// SelectManifestDesc returns the descriptor of the image manifest that raw, an
+// image index, offers for the wanted platform. It reads nothing: the caller
+// passes index bytes it has already digest-verified, and the returned
+// descriptor — digest and the size the index declares for it — is authenticated
+// by that verification. The match is exact under normalized platform equality
+// and more than one matching entry is ambiguous, so an index is descended to
+// exactly one manifest or to none. The selected digest is validated before it
+// is returned, so the descriptor always names a sha256 blob.
+func SelectManifestDesc(raw []byte, want ocispec.Platform) (ocispec.Descriptor, error) {
+	var index ocispec.Index
+	if err := json.Unmarshal(raw, &index); err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("ocichain: parse index: %w", err)
+	}
+
+	var matches []ocispec.Descriptor
+	for _, m := range index.Manifests {
+		if m.Platform == nil {
+			continue
+		}
+		if platformEquals(&want, m.Platform) {
+			matches = append(matches, m)
+		}
+	}
+	if len(matches) == 0 {
+		return ocispec.Descriptor{}, fmt.Errorf("ocichain: platform %s not found in index", platformString(&want))
+	}
+	if len(matches) > 1 {
+		return ocispec.Descriptor{}, fmt.Errorf("ocichain: multiple matches for platform %s in index (ambiguous)", platformString(&want))
+	}
+	// This is where a selected digest first leaves decoded JSON, and a caller
+	// that only selects — without going on to read the blob, whose read would
+	// validate it — would otherwise carry an empty or malformed digest onwards
+	// as if it named an image. An index naming one is malformed, which is a
+	// different fault from a blob that fails to hash to its digest.
+	if err := digestutil.ValidateSHA256(matches[0].Digest); err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("ocichain: index entry for platform %s: %w", platformString(&want), err)
+	}
+	return matches[0], nil
 }
 
 type (
@@ -432,7 +477,7 @@ func readVerifyMetaBlob(ctx context.Context, src BlobSource, desc ocispec.Descri
 	// Verify the hash accumulated during the read against the expected digest.
 	// NewDigest formats h's sum; it does not hash a second time.
 	if computed := digest.NewDigest(digest.SHA256, h); computed != d {
-		return nil, fmt.Errorf("ocichain: blob digest mismatch for %s: computed %s", d, computed)
+		return nil, fmt.Errorf("%w for %s: computed %s", ErrDigestMismatch, d, computed)
 	}
 
 	return data, nil
@@ -455,29 +500,14 @@ func readVerifyConfigDesc(ctx context.Context, src BlobSource, configDesc ocispe
 	return configDesc, bytes, &config, nil
 }
 
-// selectFromIndex selects the index entry matching the host platform and reads
-// and verifies its manifest blob. The match is exact under normalized platform
-// equality; more than one matching entry is ambiguous. The manifest bytes are
+// selectFromIndex selects the entry of the index in rootBytes that matches the
+// host platform and reads and verifies its manifest blob. The manifest bytes are
 // returned unparsed; resolveFromManifest unmarshals them.
-func selectFromIndex(ctx context.Context, src BlobSource, index *ocispec.Index, want ocispec.Platform) (ocispec.Descriptor, []byte, error) {
-	var matches []ocispec.Descriptor
-	for _, m := range index.Manifests {
-		if m.Platform == nil {
-			continue
-		}
-		if platformEquals(&want, m.Platform) {
-			matches = append(matches, m)
-		}
+func selectFromIndex(ctx context.Context, src BlobSource, rootBytes []byte, want ocispec.Platform) (ocispec.Descriptor, []byte, error) {
+	selectedDesc, err := SelectManifestDesc(rootBytes, want)
+	if err != nil {
+		return ocispec.Descriptor{}, nil, err
 	}
-
-	if len(matches) == 0 {
-		return ocispec.Descriptor{}, nil, fmt.Errorf("ocichain: platform %s not found in index", platformString(&want))
-	}
-	if len(matches) > 1 {
-		return ocispec.Descriptor{}, nil, fmt.Errorf("ocichain: multiple matches for platform %s in index (ambiguous)", platformString(&want))
-	}
-
-	selectedDesc := matches[0]
 
 	// Read and verify the manifest for this platform. readVerifyMetaBlob bounds,
 	// exact-size-checks, digest-validates, and digest-verifies the blob.

@@ -361,11 +361,12 @@ func seedPoisonImagePlatform(t *testing.T, root, refFmt, platform string) digest
 	seedObject(t, root, d, garbage)
 	ref := strings.Replace(refFmt, "%s", d.String(), 1)
 	refStore := newRefStore(t, root)
-	err := refStore.Put(ref, ocispec.Descriptor{
+	desc := ocispec.Descriptor{
 		MediaType: ocispec.MediaTypeImageManifest,
 		Digest:    d,
 		Size:      int64(len(garbage)),
-	}, time.Unix(0, 0).UTC(), []string{platform})
+	}
+	err := refStore.Put(ref, desc, desc, time.Unix(0, 0).UTC(), []string{platform})
 	if err != nil {
 		t.Fatalf("Put ref: %v", err)
 	}

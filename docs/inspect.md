@@ -9,11 +9,13 @@ knarr inspect app@sha256:<digest>
 
 The reference takes the same forms `mount` accepts — `name@sha256:<hex>`, a bare
 `sha256:<hex>`, or any ref string a previous pull recorded (a tag resolves locally to the
-digest its most recent pull recorded, never over the network). It prints, for the host
-platform:
+identity its most recent pull recorded, never over the network). A pinned index digest
+resolves to the manifest that index offers for the host platform, so inspecting an image
+by its index digest and by its manifest digest reports the same image. It prints, for the
+host platform:
 
 ```
-root       sha256:<digest>          # the pinned root (index or manifest)
+root       sha256:<digest>          # the image identity (the platform manifest)
 platform   linux/arm64/v8           # the resolved platform (config-declared)
 composefs  sha256:<digest>          # the composefs image blob in the store
 fsverity   sha256:<digest>          # the fs-verity digest a mount enforces
@@ -98,8 +100,8 @@ knarr inspect --layers --format json app@sha256:<digest>
 ## Success and failure
 
 `inspect` succeeds only when the image is fully materialized locally: its OCI metadata chain
-(root → manifest → config) resolves from the store **and** a composefs binding is recorded for
-the resolved `{root, platform}`. Otherwise it fails with an error satisfying
+(manifest → config) resolves from the store **and** a composefs binding is recorded for
+the resolved `{identity, platform}`. Otherwise it fails with an error satisfying
 `errors.Is(err, knarr.ErrNotFound)` and exits non-zero, pointing at `knarr pull`.
 
 - **Not pulled** (metadata or binding absent) → not-found; re-running `knarr pull` is a clean,

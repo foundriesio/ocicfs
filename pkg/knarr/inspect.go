@@ -30,8 +30,11 @@ func (e *engine) Inspect(ctx context.Context, ref string) (*ImageInfo, error) {
 }
 
 func (e *engine) inspect(ctx context.Context, ref string) (*ImageInfo, error) {
-	root, err := e.resolveLocalRef(ref)
-	if err != nil {
+	// A digest whose blob cannot be descended is passed through as it stands:
+	// the resolve below reads the same blob and reports the miss with the
+	// wording this verb already uses.
+	root, err := e.resolveLocalRef(ctx, ref)
+	if root == "" {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {

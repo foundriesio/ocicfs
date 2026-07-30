@@ -22,17 +22,22 @@ import (
 	"github.com/foundriesio/knarr/internal/rootfs"
 )
 
-// Built is the image data materialized into the local stores.
+// Built is the image data materialized into the local stores. Root and RootDesc
+// name the root the caller pinned, which may be an image index; Identity names
+// the platform image manifest that root resolved to, the descriptor the binding
+// is keyed by.
 type Built struct {
 	Root           digest.Digest
 	Platform       ocispec.Platform
 	Descriptor     ocispec.Descriptor
 	FsverityDigest string
 	RootDesc       ocispec.Descriptor
+	Identity       ocispec.Descriptor
 }
 
 // Materialize resolves root from src, builds the rootfs image, and records its
-// binding in img.
+// binding in img under the resolved platform manifest, the digest that
+// identifies the image however the caller named it.
 func Materialize(ctx context.Context, store *objectstore.Store, img *imagestore.Store, src ocichain.BlobSource, root digest.Digest, platform ocispec.Platform) (Built, error) {
 	if store == nil {
 		return Built{}, errors.New("materialize: nil object store")
@@ -69,7 +74,7 @@ func Materialize(ctx context.Context, store *objectstore.Store, img *imagestore.
 	if err := store.Sync(); err != nil {
 		return Built{}, err
 	}
-	if err := img.Put(root, res.Platform, imagestore.Binding{
+	if err := img.Put(res.ManifestDesc.Digest, res.Platform, imagestore.Binding{
 		Descriptor:     built.Descriptor,
 		FsverityDigest: built.FsverityDigest,
 		RootfsSize:     built.RootfsSize,
@@ -84,6 +89,7 @@ func Materialize(ctx context.Context, store *objectstore.Store, img *imagestore.
 		Descriptor:     built.Descriptor,
 		FsverityDigest: built.FsverityDigest,
 		RootDesc:       res.RootDesc,
+		Identity:       res.ManifestDesc,
 	}, nil
 }
 

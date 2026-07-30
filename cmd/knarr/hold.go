@@ -18,8 +18,9 @@ func newHoldCommand(g *globalOptions) *cobra.Command {
 		Short: "pin a local image so remove declines while held",
 		Long: `Hold records a named holder for an image already in the local store so that
 a plain remove of that image declines while the holder is present. Holds are
-keyed by the image's root digest and reading only local state; run knarr pull
-first. Recording an already-present holder is a no-op success.`,
+keyed by the image's identity digest -- the platform image manifest, which a
+reference naming an index is descended to -- and reading only local state; run
+knarr pull first. Recording an already-present holder is a no-op success.`,
 		Args: cli.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			eng, err := g.engine()
@@ -45,8 +46,9 @@ func newReleaseCommand(g *globalOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "release [--holder NAME] REF",
 		Short: "drop a hold on a local image",
-		Long: `Release drops a named holder's hold on an image's root digest. Releasing a
-holder that is not present is a no-op success.`,
+		Long: `Release drops a named holder's hold on an image's identity digest, resolving
+the reference the way hold does. Releasing a holder that is not present is a
+no-op success, as is releasing a digest whose content is gone from the store.`,
 		Args: cli.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			eng, err := g.engine()

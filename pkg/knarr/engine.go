@@ -30,8 +30,10 @@ import (
 type Image struct {
 	// Ref is the local reference the image is stored under.
 	Ref string
-	// Digest is the pinned OCI root digest (an image manifest or an image
-	// index), e.g. "sha256:…".
+	// Digest is the image's identity: the digest of the platform image
+	// manifest the store keys it by, e.g. "sha256:…". A reference that pins or
+	// resolves to an image index is descended to that manifest, so this is the
+	// digest to pin, hold, and look the image up by.
 	Digest string
 	// Size is the size of the image's composefs image object, in bytes; file
 	// content shared in the object store is not counted.
@@ -41,7 +43,9 @@ type Image struct {
 // ImageInfo is the identity of a locally stored image: its OCI coordinates and
 // the composefs image built for it.
 type ImageInfo struct {
-	// Root is the digest the image was pulled under (index or manifest).
+	// Root is the image's identity: the digest of the platform image manifest
+	// the store keys it by, whether the reference named that manifest or the
+	// index offering it.
 	Root digest.Digest
 	// Platform is the resolved platform, as declared by the image config (it
 	// may carry a variant the host request omitted, e.g. arm64/v8).
@@ -138,7 +142,8 @@ func WithBlobSource(src BlobSource) PullOption {
 // a registry tag resolution records it, so a later local lookup of the
 // reference finds the image. The digest need not be the one the reference
 // pins: a caller may pull a platform manifest out of an index-pinned
-// reference. It requires WithBlobSource.
+// reference, and doing so stores the same image, under the same identity, as
+// pulling the index would. It requires WithBlobSource.
 func WithResolvedRoot(root digest.Digest) PullOption {
 	return func(o *PullOptions) { o.ResolvedRoot = root }
 }
@@ -245,21 +250,26 @@ type Engine interface {
 	// ref may be digest-pinned (the digest is the trust anchor) or tagged, in
 	// which case the tag is resolved to the digest the registry currently
 	// serves and recorded only as a reference alias; a sideload ref must be
-	// digest-pinned.
+	// digest-pinned. A reference landing on an image index is descended, inside
+	// the index's own verified bytes, to the manifest it offers for the host
+	// platform: that manifest is the image's identity and the digest the
+	// returned Image reports, so pulling one image by its index and by its
+	// manifest stores it once.
 	Pull(ctx context.Context, ref string, opts ...PullOption) (*Image, error)
 	// Mount mounts ref at target: a single read-only composefs mount by
 	// default, a writable overlay over that composefs base when a writable
 	// With* option opts in, or the image's verified EROFS metadata alone with
 	// WithMetadataOnly. Mount operates on content already present in the
 	// store and does not fetch over the network; pull ref first. A ref that
-	// does not pin a digest resolves locally to the digest its most recent
-	// pull recorded; every verification still keys on that digest.
+	// does not pin a digest resolves locally to the identity its most recent
+	// pull recorded, and a pinned index digest resolves to the manifest it
+	// offers for the host platform; every verification keys on that identity.
 	Mount(ctx context.Context, ref, target string, opts ...MountOption) error
 	// MountChain mounts the stored image whose full layer chain has the given
 	// chain identity. Resolution reads only local state and never fetches over
 	// the network; a chain identity no stored image ends at is reported as an
 	// error satisfying errors.Is(err, ErrNotFound). Verification and mount
-	// semantics are Mount's, keyed on the digest the resolution produces.
+	// semantics are Mount's, keyed on the identity the resolution produces.
 	MountChain(ctx context.Context, chainID, target string, opts ...MountOption) error
 	// Unmount tears down the mount at target.
 	Unmount(ctx context.Context, target string) error
@@ -268,30 +278,39 @@ type Engine interface {
 	// mount (the directory is the overlay's data-only lower).
 	ObjectsDir() (string, error)
 	// Inspect reports the OCI identity and composefs binding of an image
-	// already present in the local store: root digest, resolved platform,
+	// already present in the local store: identity digest, resolved platform,
 	// ordered config diff_ids, and the composefs image descriptor with its
 	// fs-verity digest. Inspect reads only local state and never fetches over
 	// the network; a ref that does not pin a digest resolves locally to the
-	// digest its most recent pull recorded. Inspect returns an error
-	// satisfying errors.Is(err, ErrNotFound) when the image has not been
+	// identity its most recent pull recorded, and a pinned index digest to the
+	// manifest that index offers for the host platform. Inspect returns an
+	// error satisfying errors.Is(err, ErrNotFound) when the image has not been
 	// pulled (its metadata or binding is absent locally). An image whose
 	// index does not offer the host platform is a
 	// different, permanent condition and is reported as its own error.
 	Inspect(ctx context.Context, ref string) (*ImageInfo, error)
-	// List returns the images present in the local store.
+	// List returns the images present in the local store, each reporting the
+	// identity digest it is stored under.
 	List(ctx context.Context) ([]Image, error)
-	// Hold pins ref's root digest under a named holder so a Remove of that
+	// Hold pins ref's identity digest under a named holder so a Remove of that
 	// image declines while the holder is present. It reads only local state; a
-	// ref that does not pin a digest resolves through the most recent pull, and
-	// an image not present locally is reported as an error satisfying
-	// errors.Is(err, ErrNotFound). Recording an already-present holder succeeds
-	// without change.
+	// ref that does not pin a digest resolves through the most recent pull, a
+	// pinned index digest resolves to the manifest it offers for the host
+	// platform, and an image not present locally is reported as an error
+	// satisfying errors.Is(err, ErrNotFound). A digest whose stored blob does
+	// not hash to it is store corruption and is reported as an error rather
+	// than held. Recording an already-present holder succeeds without change.
 	Hold(ctx context.Context, ref, holder string) error
-	// Release drops a named holder's hold on ref's root digest. Releasing a
-	// holder that is not present succeeds.
+	// Release drops a named holder's hold on ref's identity digest. It resolves
+	// ref the way Hold does but is best-effort about store state: a digest
+	// whose blob is absent or damaged releases as given rather than erroring,
+	// so a hold can always be dropped. Releasing a holder that is not present
+	// succeeds.
 	Release(ctx context.Context, ref, holder string) error
-	// Remove forgets a local image. It declines while a hold pins the image
-	// unless WithForce is set, which clears the holds first.
+	// Remove forgets a local image: its reference record, and the image
+	// binding for its identity digest that no other reference still resolves
+	// to. It declines while a hold pins that identity unless WithForce is set,
+	// which clears the holds first.
 	Remove(ctx context.Context, ref string, opts ...RemoveOption) error
 }
 

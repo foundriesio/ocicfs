@@ -21,9 +21,9 @@ Text output prints one row per reference:
 app@sha256:<digest>	sha256:<digest>	481
 ```
 
-The columns are the exact stored reference, the resolved root digest, and the
-size of the image's composefs image object — the same size `knarr pull`
-reports.
+The columns are the exact stored reference, the image identity digest — the
+platform manifest, the same digest `knarr pull` reports — and the size of the
+image's composefs image object.
 
 Use `--format json` for machine-readable output:
 
@@ -47,17 +47,31 @@ appears in `knarr ls`, and `knarr mount "app@sha256:<digest>" <target>` fails
 until the image is pulled again.
 
 `knarr remove` deletes the reference record and deletes the image binding for
-the resolved `(root digest, platform)` only when no other reference still points
-at the same pair. It never deletes files under `objects/`.
+the recorded `(identity digest, platform)` only when no other reference still
+points at the same pair. It never deletes files under `objects/`.
 
 If the reference is unknown, the command fails with a "no such image" error.
+
+A plain `remove` declines while a hold pins the image, naming each holder and
+the identity digest the holds sit under:
+
+```text
+image is held by cfs under sha256:<identity>; release the hold or use --force
+```
+
+Holds are keyed by that identity, so a hold taken on the image under one
+reference — or by a bare digest naming its index — is seen here. Drop it with
+`knarr release`, passing the digest the message named, or override with
+`--force`, which clears every holder first.
 
 ## Notes
 
 - **Exact refs.** `remove` forgets the same string that `pull` recorded; aliases
-  for the same digest are separate reference records.
-- **Shared bindings.** Removing one alias for a digest does not delete the
-  binding if another surviving alias still needs it.
+  for the same image are separate reference records.
+- **Shared bindings.** Removing one alias for an image does not delete the
+  binding if another surviving alias still needs it — including an alias that
+  pins the index while this one pins the manifest, since both record the same
+  identity.
 - **No object reclamation.** Objects remain in the content-addressed store after
   removal.
 - **Removing a mounted image is allowed.** The kernel keeps an active composefs
@@ -69,5 +83,5 @@ If the reference is unknown, the command fails with a "no such image" error.
   and re-pulling recreates it. A valid reference whose image binding is missing
   or unreadable is still listed, with size 0 and a warning — re-pulling
   restores the binding.
-- **Force is accepted.** `--force` is currently a no-op because there is no hold
-  state to override.
+- **Force clears holds.** `--force` removes the image even while held, dropping
+  every holder of its identity digest first.

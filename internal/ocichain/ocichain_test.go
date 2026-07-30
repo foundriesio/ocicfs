@@ -234,6 +234,42 @@ func TestResolveIndexPlatformAbsent(t *testing.T) {
 	}
 }
 
+// TestSelectManifestDescRejectsMalformedEntryDigest: the selected entry's
+// digest is validated before the descriptor is returned, so a caller that only
+// selects — and never reads the blob whose read would validate it — cannot come
+// away holding an empty or malformed digest that reads as a resolved image.
+func TestSelectManifestDescRejectsMalformedEntryDigest(t *testing.T) {
+	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	tests := []struct {
+		name  string
+		entry digest.Digest
+	}{
+		{"empty", ""},
+		{"not hex", "sha256:nothex"},
+		{"wrong algorithm", digest.Digest("sha512:" + strings.Repeat("b", 128))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			desc := ocispec.Descriptor{
+				MediaType: ocispec.MediaTypeImageManifest,
+				Digest:    tt.entry,
+				Size:      12,
+				Platform:  &platform,
+			}
+			got, err := SelectManifestDesc(indexJSON([]ocispec.Descriptor{desc}), platform)
+			if err == nil {
+				t.Fatalf("SelectManifestDesc = %#v, want a rejection", got)
+			}
+			if errors.Is(err, ErrDigestMismatch) {
+				t.Fatalf("error = %v, want a malformed-index error, not blob corruption", err)
+			}
+			if got.Digest != "" {
+				t.Fatalf("descriptor = %#v, want the zero descriptor", got)
+			}
+		})
+	}
+}
+
 func TestResolveIndexEntryVsConfigPlatformDisagreementRejected(t *testing.T) {
 	f := newFixture(t)
 

@@ -30,7 +30,12 @@ func TestPutWritesRef(t *testing.T) {
 		Size:      456,
 	}
 	pulledAt := time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
-	if err := s.Put(ref, resolved, pulledAt, []string{"linux/arm64"}); err != nil {
+	identity := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    digest.SHA256.FromString("manifest"),
+		Size:      123,
+	}
+	if err := s.Put(ref, resolved, identity, pulledAt, []string{"linux/arm64"}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
@@ -54,6 +59,9 @@ func TestPutWritesRef(t *testing.T) {
 	}
 	if got.Resolved.Digest != resolved.Digest || got.Resolved.Size != resolved.Size {
 		t.Fatalf("resolved = %#v", got.Resolved)
+	}
+	if got.Identity.Digest != identity.Digest || got.Identity.Size != identity.Size {
+		t.Fatalf("identity = %#v", got.Identity)
 	}
 	if got.PulledAt != "2026-06-26T12:00:00Z" {
 		t.Fatalf("pulledAt = %q", got.PulledAt)
@@ -80,10 +88,10 @@ func TestPutReplacesAtomically(t *testing.T) {
 	ref := "app:v1"
 	first := ocispec.Descriptor{Digest: digest.SHA256.FromString("first"), Size: 1}
 	second := ocispec.Descriptor{Digest: digest.SHA256.FromString("second"), Size: 2}
-	if err := s.Put(ref, first, time.Unix(0, 0).UTC(), []string{"linux/amd64"}); err != nil {
+	if err := s.Put(ref, first, first, time.Unix(0, 0).UTC(), []string{"linux/amd64"}); err != nil {
 		t.Fatalf("Put first: %v", err)
 	}
-	if err := s.Put(ref, second, time.Unix(1, 0).UTC(), []string{"linux/arm64"}); err != nil {
+	if err := s.Put(ref, second, second, time.Unix(1, 0).UTC(), []string{"linux/arm64"}); err != nil {
 		t.Fatalf("Put second: %v", err)
 	}
 	refKey := key(ref)
@@ -112,8 +120,13 @@ func TestGetRoundTrip(t *testing.T) {
 		Digest:    digest.SHA256.FromString("root"),
 		Size:      12,
 	}
+	identity := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    digest.SHA256.FromString("manifest"),
+		Size:      9,
+	}
 	pulledAt := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
-	if err := s.Put(ref, resolved, pulledAt, []string{"linux/amd64"}); err != nil {
+	if err := s.Put(ref, resolved, identity, pulledAt, []string{"linux/amd64"}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
@@ -123,6 +136,9 @@ func TestGetRoundTrip(t *testing.T) {
 	}
 	if got.Ref != ref || got.Resolved.Digest != resolved.Digest || got.Resolved.Size != resolved.Size {
 		t.Fatalf("record = %#v", got)
+	}
+	if got.Identity.Digest != identity.Digest || got.Identity.Size != identity.Size {
+		t.Fatalf("record identity = %#v", got.Identity)
 	}
 	if !got.PulledAt.Equal(pulledAt) {
 		t.Fatalf("pulledAt = %s, want %s", got.PulledAt, pulledAt)
@@ -140,7 +156,7 @@ func TestListReturnsSortedRecords(t *testing.T) {
 	}
 	resolved := ocispec.Descriptor{Digest: digest.SHA256.FromString("root"), Size: 1}
 	for _, ref := range []string{"z@sha256:def", "a@sha256:abc"} {
-		if err := s.Put(ref, resolved, time.Unix(0, 0).UTC(), []string{"linux/amd64"}); err != nil {
+		if err := s.Put(ref, resolved, resolved, time.Unix(0, 0).UTC(), []string{"linux/amd64"}); err != nil {
 			t.Fatalf("Put %s: %v", ref, err)
 		}
 	}
@@ -178,7 +194,8 @@ func TestDeleteThenGetReturnsErrNotFound(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	ref := "app@sha256:abc"
-	if err := s.Put(ref, ocispec.Descriptor{Digest: digest.SHA256.FromString("root")}, time.Unix(0, 0).UTC(), []string{"linux/amd64"}); err != nil {
+	desc := ocispec.Descriptor{Digest: digest.SHA256.FromString("root")}
+	if err := s.Put(ref, desc, desc, time.Unix(0, 0).UTC(), []string{"linux/amd64"}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	if err := s.Delete(ref); err != nil {
@@ -198,11 +215,12 @@ func TestListSkipsMalformedRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if err := s.Put("app:v1", ocispec.Descriptor{
+	desc := ocispec.Descriptor{
 		MediaType: "application/vnd.oci.image.manifest.v1+json",
 		Digest:    digest.FromString("resolved"),
 		Size:      42,
-	}, time.Unix(1720000000, 0).UTC(), []string{"linux/amd64"}); err != nil {
+	}
+	if err := s.Put("app:v1", desc, desc, time.Unix(1720000000, 0).UTC(), []string{"linux/amd64"}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	dir := filepath.Join(root, "refs", "sha256", "aa")
@@ -230,7 +248,8 @@ func TestGetRejectsInvalidRecord(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	ref := "app@sha256:abc"
-	if err := s.Put(ref, ocispec.Descriptor{Digest: digest.SHA256.FromString("root")}, time.Unix(0, 0).UTC(), []string{"linux/amd64"}); err != nil {
+	desc := ocispec.Descriptor{Digest: digest.SHA256.FromString("root")}
+	if err := s.Put(ref, desc, desc, time.Unix(0, 0).UTC(), []string{"linux/amd64"}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	data, err := os.ReadFile(octestRefPath(root, ref))

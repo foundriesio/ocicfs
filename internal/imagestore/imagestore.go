@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package imagestore persists the prepared-image binding: a local index mapping
-// {OCI root digest, platform} to the composefs image already built for it, so a
+// {image identity, platform} to the composefs image already built for it, so a
 // mount can use that image directly instead of re-resolving the OCI chain and
-// rebuilding it. It is auxiliary, not authoritative -- the object store alone
+// rebuilding it. The identity is the digest of the platform image manifest, the
+// one key an image is stored under: a reference landing on an image index is
+// descended to that manifest before a binding is written or read, so an image
+// pulled by its index and by its manifest shares one binding. It is auxiliary,
+// not authoritative -- the object store alone
 // holds the image's verified OCI metadata and content, and a re-pull regenerates
 // a lost binding without re-storing them, so the binding is a convenience (and
 // the on-disk record of the locally-measured fs-verity digest). Being untrusted,
@@ -12,7 +16,7 @@
 // -- the composefs image is content-addressed there and its fs-verity digest is
 // enforced at mount -- so a wrong or stale binding cannot cause unverified
 // content to be mounted. Each binding is
-// a small JSON file keyed by the image's OCI root digest and its platform:
+// a small JSON file keyed by that identity digest and its platform:
 //
 //	<root>/images/sha256/<root-xx>/<root-rest>/<os>[-<arch>[-<variant>]].json
 //

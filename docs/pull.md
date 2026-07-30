@@ -47,14 +47,35 @@ knarr pull ghcr.io/example/app:1.2.3
 # ghcr.io/example/app:1.2.3	sha256:<resolved digest>
 ```
 
-A tag is a mutable alias, not a trust anchor: knarr resolves it to the manifest
-digest the registry currently serves (one extra round-trip) and from there runs
-the same digest-verified pull as a pinned reference. The resolution step trusts
-the registry, so pin digests in production — the printed digest is the one to
-pin. The tag is recorded only as a reference alias; the image is stored under
-its digest. Mount, inspect, and remove accept the same reference afterwards:
-an unpinned ref resolves locally — never over the network — to the digest its
-most recent pull recorded.
+A tag is a mutable alias, not a trust anchor: knarr resolves it to the digest
+the registry currently serves (one extra round-trip) and from there runs the
+same digest-verified pull as a pinned reference. The resolution step trusts the
+registry, so pin digests in production — the printed digest is the one to pin.
+The tag is recorded only as a reference alias; the image is stored under its
+digest. Mount, inspect, and remove accept the same reference afterwards: an
+unpinned ref resolves locally — never over the network — to the digest its most
+recent pull recorded.
+
+## The Printed Digest Is the Image Identity
+
+A tag usually resolves to an image *index*, which lists one manifest per
+platform. knarr keys an image by the manifest for the host platform, descending
+one level inside the index's own digest-verified bytes to find it, so the digest
+`pull` prints is that manifest's — the image's **identity** — and not
+necessarily the digest the reference pinned:
+
+```sh
+knarr pull ghcr.io/example/app:1.2.3
+# ghcr.io/example/app:1.2.3	sha256:<the host platform's manifest>
+```
+
+That is the digest to pin, to pass to `hold`, and to look the image up by.
+Pulling the same image by its index digest and by its platform manifest digest
+stores it once, under that one key, with one set of holds. The index digest the
+reference landed on is kept as provenance in the reference record's `resolved`
+field (see [on-disk-layout.md](on-disk-layout.md)); a later `pull`, `mount`,
+`inspect`, `hold`, or `release` given the index digest descends it again and
+lands on the same image.
 
 Registry pull uses HTTPS, with one exception: a loopback registry (localhost
 or a loopback IP) may use plain HTTP — content integrity comes from the
@@ -78,6 +99,10 @@ This yields `./layout/` containing `oci-layout`, `index.json`, and
 digest=$(jq -r '.manifests[0].digest' ./layout/index.json)
 knarr pull --from-dir ./layout "app@$digest"
 ```
+
+The layout's `index.json` may name an index rather than a manifest; pinning it
+is fine either way, since the pull descends to the host platform's manifest and
+prints that identity.
 
 ## Inspect What Landed
 

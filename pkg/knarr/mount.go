@@ -54,8 +54,11 @@ func (e *engine) mount(ctx context.Context, ref, target string, opts ...MountOpt
 		return errors.New(writableMountUnsupported)
 	}
 
-	root, err := e.resolveLocalRef(ref)
-	if err != nil {
+	// A digest whose blob cannot be descended is passed through as it stands:
+	// the binding lookup below reports the miss with the wording this verb
+	// already uses.
+	root, err := e.resolveLocalRef(ctx, ref)
+	if root == "" {
 		return err
 	}
 	if err := validateMountTarget(target); err != nil {

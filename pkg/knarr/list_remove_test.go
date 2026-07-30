@@ -65,12 +65,11 @@ func TestEngineList(t *testing.T) {
 func TestEngineRemoveDeletesRefAndBindingOnly(t *testing.T) {
 	root := t.TempDir()
 	imageRoot := digest.SHA256.FromString("root")
-	composefs := digest.SHA256.FromString("composefs")
 	ref := "registry.example.com/app@" + imageRoot.String()
 	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	composefs, objectPath := writeEngineObject(t, root, []byte("composefs"))
 	putEngineRef(t, root, ref, imageRoot, 45, platform)
 	putEngineBinding(t, root, imageRoot, platform, composefs)
-	objectPath := writeEngineObject(t, root, composefs)
 
 	eng, err := New(Config{Root: root})
 	if err != nil {
@@ -138,10 +137,8 @@ func TestEngineRemoveRejectsMalformedPlatform(t *testing.T) {
 	root := t.TempDir()
 	imageRoot := digest.SHA256.FromString("root")
 	refStore := newRefStore(t, root)
-	if err := refStore.Put("registry.example.com/app@"+imageRoot.String(), ocispec.Descriptor{
-		Digest: imageRoot,
-		Size:   45,
-	}, time.Unix(0, 0).UTC(), []string{"linux"}); err != nil {
+	desc := ocispec.Descriptor{Digest: imageRoot, Size: 45}
+	if err := refStore.Put("registry.example.com/app@"+imageRoot.String(), desc, desc, time.Unix(0, 0).UTC(), []string{"linux"}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
@@ -221,14 +218,18 @@ func TestPullListRemoveE2E(t *testing.T) {
 	assertObjectExists(t, storeRoot, binding.RootFS.Descriptor.Digest)
 }
 
+// putEngineRef records a ref for an image whose root is already its platform
+// manifest, so the record's provenance and identity descriptors are the same
+// one.
 func putEngineRef(t *testing.T, root, ref string, d digest.Digest, size int64, p ocispec.Platform) {
 	t.Helper()
 	refStore := newRefStore(t, root)
-	if err := refStore.Put(ref, ocispec.Descriptor{
+	desc := ocispec.Descriptor{
 		MediaType: ocispec.MediaTypeImageManifest,
 		Digest:    d,
 		Size:      size,
-	}, time.Unix(0, 0).UTC(), []string{ocilayout.PlatformString(&p)}); err != nil {
+	}
+	if err := refStore.Put(ref, desc, desc, time.Unix(0, 0).UTC(), []string{ocilayout.PlatformString(&p)}); err != nil {
 		t.Fatalf("Put ref: %v", err)
 	}
 }
@@ -248,16 +249,21 @@ func putEngineBinding(t *testing.T, root string, d digest.Digest, p ocispec.Plat
 	}
 }
 
-func writeEngineObject(t *testing.T, root string, d digest.Digest) string {
+// writeEngineObject stores data at the content-addressed path its own digest
+// names — the invariant every real write upholds — and returns that digest and
+// path. Fixtures go through it so a stored blob always hashes to the digest it
+// is filed under, as the verbs that read one require.
+func writeEngineObject(t *testing.T, root string, data []byte) (digest.Digest, string) {
 	t.Helper()
+	d := digest.SHA256.FromBytes(data)
 	path := octest.ObjectPath(root, d)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	if err := os.WriteFile(path, []byte("object"), 0o600); err != nil {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	return path
+	return d, path
 }
 
 func newRefStore(t *testing.T, root string) *refstore.Store {

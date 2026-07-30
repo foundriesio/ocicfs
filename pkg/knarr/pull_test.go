@@ -775,8 +775,8 @@ func TestVerifiedPulledImageRejectsTamperedSealingAnnotations(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			root := rebindManifestAnnotations(t, obj, imgStore, lay, binding, tt.manifestAnn, tt.configAnn)
-			_, ok, err := verifiedPulledImage(context.Background(), obj, imgStore, root, lay.Platform)
+			identity := rebindManifestAnnotations(t, obj, imgStore, lay, binding, tt.manifestAnn, tt.configAnn)
+			_, ok, err := verifiedPulledImage(context.Background(), obj, imgStore, identity, lay.Platform)
 			if err == nil || !strings.Contains(err.Error(), "annotation") {
 				t.Fatalf("verifiedPulledImage error = %v, want annotation failure", err)
 			}
@@ -805,9 +805,9 @@ func TestVerifiedPulledImageNonCanonicalSealingPolicy(t *testing.T) {
 		if binding.Canonical {
 			t.Fatal("divergent binding recorded canonical = true")
 		}
-		root := rebindManifestAnnotations(t, obj, imgStore, lay, binding,
+		identity := rebindManifestAnnotations(t, obj, imgStore, lay, binding,
 			map[string]string{"composefs.merged.erofs.v1.fsverity-sha512-12": strings.Repeat("a", 64)}, nil)
-		_, ok, err := verifiedPulledImage(context.Background(), obj, imgStore, root, lay.Platform)
+		_, ok, err := verifiedPulledImage(context.Background(), obj, imgStore, identity, lay.Platform)
 		if err == nil || !strings.Contains(err.Error(), "non-canonical") {
 			t.Fatalf("verifiedPulledImage error = %v, want non-canonical failure", err)
 		}
@@ -827,7 +827,8 @@ func TestVerifiedPulledImageNonCanonicalSealingPolicy(t *testing.T) {
 		if binding.Canonical {
 			t.Fatal("divergent binding recorded canonical = true")
 		}
-		_, ok, err := verifiedPulledImage(context.Background(), obj, imgStore, lay.Root, lay.Platform)
+		identity := ocispec.Descriptor{Digest: lay.Root, Size: lay.RootSize}
+		_, ok, err := verifiedPulledImage(context.Background(), obj, imgStore, identity, lay.Platform)
 		if err != nil {
 			t.Fatalf("verifiedPulledImage: %v", err)
 		}
@@ -889,8 +890,9 @@ func pullForSealingTest(t *testing.T, lay octest.Layout) (*objectstore.Store, *i
 
 // rebindManifestAnnotations rewrites lay's manifest with the given manifest and
 // config-descriptor annotations, stores it in obj under its new digest, rebinds
-// binding to that digest in imgStore, and returns the new root digest.
-func rebindManifestAnnotations(t *testing.T, obj *objectstore.Store, imgStore *imagestore.Store, lay octest.Layout, binding imagestore.Binding, manifestAnn, configAnn map[string]string) digest.Digest {
+// binding to that digest in imgStore, and returns the descriptor of the rewritten
+// manifest -- the image's new identity.
+func rebindManifestAnnotations(t *testing.T, obj *objectstore.Store, imgStore *imagestore.Store, lay octest.Layout, binding imagestore.Binding, manifestAnn, configAnn map[string]string) ocispec.Descriptor {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join(lay.Dir, "blobs", "sha256", lay.Manifest.Encoded())) // #nosec G304 -- test fixture path
 	if err != nil {
@@ -917,7 +919,7 @@ func rebindManifestAnnotations(t *testing.T, obj *objectstore.Store, imgStore *i
 	if err := imgStore.Put(root, lay.Platform, binding); err != nil {
 		t.Fatalf("imagestore.Put: %v", err)
 	}
-	return root
+	return ocispec.Descriptor{Digest: root, Size: int64(len(raw))}
 }
 
 type (

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/opencontainers/go-digest"
+	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/foundriesio/knarr/internal/devtest"
@@ -160,9 +161,7 @@ func TestRunInvalidFormatIsUsageError(t *testing.T) {
 
 func TestRunLsJSON(t *testing.T) {
 	root := t.TempDir()
-	imageRoot := digest.SHA256.FromString("root")
-	ref := "app@" + imageRoot.String()
-	writeCLIImage(t, root, ref, imageRoot, 72, ocispec.Platform{OS: "linux", Architecture: "amd64"})
+	imageRoot, ref := writeCLIImage(t, root, "app@%s", ocispec.Platform{OS: "linux", Architecture: "amd64"})
 
 	var out, errOut bytes.Buffer
 	code := run(context.Background(), []string{"--root", root, "ls", "--format", "json"}, &out, &errOut)
@@ -184,10 +183,8 @@ func TestRunLsJSON(t *testing.T) {
 
 func TestRunRemoveDispatchesToEngine(t *testing.T) {
 	root := t.TempDir()
-	imageRoot := digest.SHA256.FromString("root")
-	ref := "registry.example.com/app@" + imageRoot.String()
 	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
-	writeCLIImage(t, root, ref, imageRoot, 72, platform)
+	imageRoot, ref := writeCLIImage(t, root, "registry.example.com/app@%s", platform)
 
 	var out, errOut bytes.Buffer
 	code := run(context.Background(), []string{"--root", root, "remove", "--force", ref}, &out, &errOut)
@@ -285,36 +282,70 @@ func TestImageListJSONShape(t *testing.T) {
 	}
 }
 
-func writeCLIImage(t *testing.T, root, ref string, d digest.Digest, size int64, p ocispec.Platform) {
+// writeCLIImage seeds the state the CLI verbs treat as a pulled image for
+// platform p: a real image manifest and its config stored in the object store
+// under their own digests -- the manifest is the authoritative presence signal
+// the hold verbs read, and every stored blob hashes to the path it is filed
+// under, as a real pull guarantees -- plus a ref record and a binding. refFmt
+// is a %s template the manifest digest is substituted into; the manifest digest
+// and the resulting ref are returned.
+func writeCLIImage(t *testing.T, root, refFmt string, p ocispec.Platform) (digest.Digest, string) {
 	t.Helper()
-	// The root blob in the object store is the authoritative presence signal the
-	// hold verbs check, so a "pulled" image seeds it alongside the ref and binding.
-	objectPath := octest.ObjectPath(root, d)
-	if err := os.MkdirAll(filepath.Dir(objectPath), 0o755); err != nil {
-		t.Fatalf("MkdirAll object: %v", err)
+	configJSON, err := json.Marshal(ocispec.Image{Platform: p, RootFS: ocispec.RootFS{Type: "layers"}})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
 	}
-	if err := os.WriteFile(objectPath, []byte("root"), 0o600); err != nil {
-		t.Fatalf("WriteFile object: %v", err)
+	configDesc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageConfig,
+		Digest:    digest.SHA256.FromBytes(configJSON),
+		Size:      int64(len(configJSON)),
 	}
+	manifestJSON, err := json.Marshal(ocispec.Manifest{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: ocispec.MediaTypeImageManifest,
+		Config:    configDesc,
+		Layers:    []ocispec.Descriptor{},
+	})
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	manifestDesc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    digest.SHA256.FromBytes(manifestJSON),
+		Size:      int64(len(manifestJSON)),
+	}
+	writeCLIObject(t, root, configDesc.Digest, configJSON)
+	writeCLIObject(t, root, manifestDesc.Digest, manifestJSON)
+
+	ref := strings.Replace(refFmt, "%s", manifestDesc.Digest.String(), 1)
 	refStore, err := refstore.New(root)
 	if err != nil {
 		t.Fatalf("refstore.New: %v", err)
 	}
-	if err := refStore.Put(ref, ocispec.Descriptor{
-		MediaType: ocispec.MediaTypeImageManifest,
-		Digest:    d,
-		Size:      size,
-	}, time.Unix(0, 0).UTC(), []string{ocilayout.PlatformString(&p)}); err != nil {
+	if err := refStore.Put(ref, manifestDesc, manifestDesc, time.Unix(0, 0).UTC(), []string{ocilayout.PlatformString(&p)}); err != nil {
 		t.Fatalf("Put ref: %v", err)
 	}
 	imgStore, err := imagestore.New(root)
 	if err != nil {
 		t.Fatalf("imagestore.New: %v", err)
 	}
-	if err := imgStore.Put(d, p, imagestore.Binding{
+	if err := imgStore.Put(manifestDesc.Digest, p, imagestore.Binding{
 		Descriptor:     ocispec.Descriptor{Digest: digest.SHA256.FromString("composefs"), Size: 4096},
 		FsverityDigest: digest.SHA256.FromString("verity").String(),
 	}); err != nil {
 		t.Fatalf("Put binding: %v", err)
+	}
+	return manifestDesc.Digest, ref
+}
+
+// writeCLIObject stores data at the content-addressed path digest d names.
+func writeCLIObject(t *testing.T, root string, d digest.Digest, data []byte) {
+	t.Helper()
+	path := octest.ObjectPath(root, d)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll object: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile object: %v", err)
 	}
 }
