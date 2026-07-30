@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -263,7 +264,7 @@ func TestSelectManifestDescRejectsMalformedEntryDigest(t *testing.T) {
 			if errors.Is(err, ErrDigestMismatch) {
 				t.Fatalf("error = %v, want a malformed-index error, not blob corruption", err)
 			}
-			if got.Digest != "" {
+			if !reflect.DeepEqual(got, ocispec.Descriptor{}) {
 				t.Fatalf("descriptor = %#v, want the zero descriptor", got)
 			}
 		})

@@ -4,8 +4,10 @@
 package refstore
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -269,4 +271,160 @@ func TestGetRejectsInvalidRecord(t *testing.T) {
 func octestRefPath(root, ref string) string {
 	refKey := key(ref)
 	return filepath.Join(root, "refs", "sha256", refKey.Encoded()[:2], refKey.Encoded()[2:]+".json")
+}
+
+// TestGetRejectsMissingOrMalformedIdentity: the identity descriptor is what
+// every lookup keys on, so a record that omits it or names something that is
+// not a sha256 digest is not a usable ref and is rejected on read.
+func TestGetRejectsMissingOrMalformedIdentity(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(map[string]any)
+		wantErr string
+	}{
+		{
+			name:    "absent",
+			mutate:  func(doc map[string]any) { delete(doc, "identity") },
+			wantErr: "identity digest",
+		},
+		{
+			name: "empty digest",
+			mutate: func(doc map[string]any) {
+				doc["identity"].(map[string]any)["digest"] = ""
+			},
+			wantErr: "identity digest",
+		},
+		{
+			name: "non-sha256",
+			mutate: func(doc map[string]any) {
+				doc["identity"].(map[string]any)["digest"] = "sha512:" + strings.Repeat("a", 128)
+			},
+			wantErr: "identity digest",
+		},
+		{
+			name: "negative size",
+			mutate: func(doc map[string]any) {
+				doc["identity"].(map[string]any)["size"] = -1
+			},
+			wantErr: "identity size is negative",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			s, err := New(root)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			ref := "app@sha256:abc"
+			seedRecord(t, s, ref)
+			rewriteRecord(t, root, ref, tt.mutate)
+
+			if _, err := s.Get(ref); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Get error = %v, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestGetRejectsSupersededSchemaNamingTheRemedy: a record written by a version
+// that keyed images differently cannot be read as if it meant the same thing,
+// so Get fails closed and the error says what to do about it.
+func TestGetRejectsSupersededSchemaNamingTheRemedy(t *testing.T) {
+	root := t.TempDir()
+	s, err := New(root)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ref := "app@sha256:abc"
+	seedRecord(t, s, ref)
+	rewriteRecord(t, root, ref, func(doc map[string]any) {
+		doc["schema"] = "application/vnd.knarr.ref.v1+json"
+		delete(doc, "identity")
+	})
+
+	_, err = s.Get(ref)
+	if err == nil {
+		t.Fatal("Get: got nil, want a superseded-schema rejection")
+	}
+	for _, want := range []string{"v1+json", refSchema, "recreate the store"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Get error = %v, want it to contain %q", err, want)
+		}
+	}
+}
+
+// TestListSkipsSupersededSchemaRecord: one unreadable record must not brick the
+// listing for every other image, so List skips it and warns with the same
+// remedy Get reports.
+func TestListSkipsSupersededSchemaRecord(t *testing.T) {
+	root := t.TempDir()
+	s, err := New(root)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	seedRecord(t, s, "healthy:v1")
+	seedRecord(t, s, "stale:v1")
+	rewriteRecord(t, root, "stale:v1", func(doc map[string]any) {
+		doc["schema"] = "application/vnd.knarr.ref.v1+json"
+		delete(doc, "identity")
+	})
+
+	var logged bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	records, err := s.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(records) != 1 || records[0].Ref != "healthy:v1" {
+		t.Fatalf("records = %#v, want only the readable record", records)
+	}
+	if !strings.Contains(logged.String(), "recreate the store") {
+		t.Fatalf("warning = %q, want it to name the remedy", logged.String())
+	}
+}
+
+// seedRecord writes a valid record for ref whose two descriptors differ, so a
+// test that corrupts one can tell which was rejected.
+func seedRecord(t *testing.T, s *Store, ref string) {
+	t.Helper()
+	resolved := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageIndex,
+		Digest:    digest.SHA256.FromString("index"),
+		Size:      456,
+	}
+	identity := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    digest.SHA256.FromString("manifest"),
+		Size:      123,
+	}
+	if err := s.Put(ref, resolved, identity, time.Unix(0, 0).UTC(), []string{"linux/amd64"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+}
+
+// rewriteRecord applies mutate to the stored JSON for ref, so a test can
+// produce a record no Put would write.
+func rewriteRecord(t *testing.T, root, ref string, mutate func(map[string]any)) {
+	t.Helper()
+	path := octestRefPath(root, ref)
+	data, err := os.ReadFile(path) // #nosec G304 -- test reads a path it wrote
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	mutate(doc)
+	data, err = json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil { // #nosec G306 G703 -- test rewrites a path it wrote
+		t.Fatalf("WriteFile: %v", err)
+	}
 }

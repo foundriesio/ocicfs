@@ -939,14 +939,21 @@ type (
 		} `json:"rootfs"`
 	}
 
+	// pullRefDoc is the ref record as it is written to disk: resolved is the
+	// document the reference landed on, identity the platform manifest the
+	// image is keyed by.
 	pullRefDoc struct {
-		Ref      string `json:"ref"`
-		Resolved struct {
-			MediaType string        `json:"mediaType"`
-			Digest    digest.Digest `json:"digest"`
-			Size      int64         `json:"size"`
-		} `json:"resolved"`
-		Platforms []string `json:"platforms"`
+		Ref       string         `json:"ref"`
+		Resolved  pullRefDescDoc `json:"resolved"`
+		Identity  pullRefDescDoc `json:"identity"`
+		PulledAt  string         `json:"pulledAt"`
+		Platforms []string       `json:"platforms"`
+	}
+
+	pullRefDescDoc struct {
+		MediaType string        `json:"mediaType"`
+		Digest    digest.Digest `json:"digest"`
+		Size      int64         `json:"size"`
 	}
 )
 

@@ -5,14 +5,18 @@ package knarr
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/opencontainers/go-digest"
+	specs "github.com/opencontainers/image-spec/specs-go"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/foundriesio/knarr/internal/holdstore"
+	"github.com/foundriesio/knarr/internal/ocichain"
 	"github.com/foundriesio/knarr/internal/octest"
 )
 
@@ -297,4 +301,101 @@ func assertHolders(t *testing.T, root string, imageRoot digest.Digest, want []st
 			t.Fatalf("Holders = %v, want %v", got, want)
 		}
 	}
+}
+
+// TestEngineHoldIndexWithAbsentManifestIsNotFound: an index resolves to the
+// manifest it offers, so a hold given that index reports the manifest's absence
+// with the same not-found a never-pulled digest gets, and records nothing under
+// either digest.
+func TestEngineHoldIndexWithAbsentManifestIsNotFound(t *testing.T) {
+	root := t.TempDir()
+	platform := hostPlatform()
+	absent := digest.SHA256.FromString("never stored")
+	raw, err := json.Marshal(ocispec.Index{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: ocispec.MediaTypeImageIndex,
+		Manifests: []ocispec.Descriptor{{
+			MediaType: ocispec.MediaTypeImageManifest,
+			Digest:    absent,
+			Size:      12,
+			Platform:  &platform,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal index: %v", err)
+	}
+	indexDigest, _ := writeEngineObject(t, root, raw)
+
+	eng, err := New(Config{Root: root})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	err = eng.Hold(context.Background(), indexDigest.String(), "cfs")
+	if !errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), "knarr pull") {
+		t.Fatalf("Hold error = %v, want ErrNotFound with a pull hint", err)
+	}
+	assertHolders(t, root, absent, nil)
+	assertHolders(t, root, indexDigest, nil)
+}
+
+// TestEngineHoldDigestMismatchErrors: a stored blob that does not hash to the
+// digest naming it is store corruption. A hold refuses it rather than record a
+// holder under a digest nothing checks, while a release stays best-effort and
+// drops the holder anyway.
+func TestEngineHoldDigestMismatchErrors(t *testing.T) {
+	root := t.TempDir()
+	corrupt := digest.SHA256.FromString("claimed")
+	seedObject(t, root, corrupt, []byte("bytes that hash to something else"))
+
+	eng, err := New(Config{Root: root})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	err = eng.Hold(context.Background(), corrupt.String(), "cfs")
+	if !errors.Is(err, ocichain.ErrDigestMismatch) {
+		t.Fatalf("Hold error = %v, want an ocichain.ErrDigestMismatch match", err)
+	}
+	assertHolders(t, root, corrupt, nil)
+
+	// A holder recorded before the blob rotted must still be droppable.
+	holds, err := holdstore.New(root)
+	if err != nil {
+		t.Fatalf("holdstore.New: %v", err)
+	}
+	unlock, err := holds.Lock(corrupt)
+	if err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	if err := holds.Hold(corrupt, "cfs"); err != nil {
+		t.Fatalf("seed Hold: %v", err)
+	}
+	unlock()
+	if err := eng.Release(context.Background(), corrupt.String(), "cfs"); err != nil {
+		t.Fatalf("Release over a corrupt blob: %v", err)
+	}
+	assertHolders(t, root, corrupt, nil)
+}
+
+// TestEngineHoldOverCapObject: a content object larger than the metadata bound
+// cannot be read as an OCI document, which is not a failure for a hold — the
+// object-only semantic keys the digest as given, with presence decided by the
+// object store.
+func TestEngineHoldOverCapObject(t *testing.T) {
+	root := t.TempDir()
+	// One byte past the bound a metadata read applies, so the read stops before
+	// the blob can be parsed.
+	object, _ := writeEngineObject(t, root, make([]byte, (32<<20)+1))
+
+	eng, err := New(Config{Root: root})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := eng.Hold(context.Background(), object.String(), "cfs"); err != nil {
+		t.Fatalf("Hold of an over-cap object: %v", err)
+	}
+	assertHolders(t, root, object, []string{"cfs"})
+	if err := eng.Release(context.Background(), object.String(), "cfs"); err != nil {
+		t.Fatalf("Release of an over-cap object: %v", err)
+	}
+	assertHolders(t, root, object, nil)
 }
