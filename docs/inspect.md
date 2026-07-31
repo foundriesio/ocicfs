@@ -18,7 +18,7 @@ host platform:
 root       sha256:<digest>          # the image identity (the platform manifest)
 platform   linux/arm64/v8           # the resolved platform (config-declared)
 composefs  sha256:<digest>          # the composefs image blob in the store
-fsverity   sha256:<digest>          # the fs-verity digest a mount enforces
+fsverity   sha256:<digest>          # the binding's locally measured fs-verity digest
 rootfs     117.7 MiB                # apparent size of the merged rootfs
 ```
 
@@ -110,5 +110,6 @@ the resolved `{identity, platform}`. Otherwise it fails with an error satisfying
   not-found; the error names the platform conflict instead.
 
 `inspect` does not measure fs-verity or open the composefs object; it reports what the store
-records. Mount is the enforcement point (see [mount.md](mount.md)); the binding is auxiliary,
-verified on use.
+records. The reported fs-verity digest is the binding's local measurement from pull time; for
+a sealed image, mount enforces the identity manifest's sealing annotation instead. Mount is
+the enforcement point (see [mount.md](mount.md)); the binding is auxiliary, verified on use.

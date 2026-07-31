@@ -55,8 +55,9 @@ type ImageInfo struct {
 	// Composefs is the descriptor of the composefs image blob recorded for
 	// {Root, Platform}; its digest names the blob in the object store.
 	Composefs ocispec.Descriptor
-	// FsverityDigest is the fs-verity digest recorded for the composefs blob,
-	// which a mount enforces.
+	// FsverityDigest is the locally measured fs-verity digest recorded for
+	// the composefs blob at build time; a mount enforces it only when the
+	// identity manifest carries no sealing annotation.
 	FsverityDigest string
 	// RootfsSize is the apparent size of the merged rootfs recorded when the
 	// image was built: its regular-file content bytes, each hardlink group

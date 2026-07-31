@@ -3,8 +3,8 @@
 
 // Package imagestore persists the prepared-image binding: a local index mapping
 // {image identity, platform} to the composefs image already built for it, so a
-// mount can use that image directly instead of re-resolving the OCI chain and
-// rebuilding it. The identity is the digest of the platform image manifest, the
+// mount, after verifying the stored metadata chain, can use that image
+// directly instead of rebuilding it. The identity is the digest of the platform image manifest, the
 // one key an image is stored under: a reference landing on an image index is
 // descended to that manifest before a binding is written or read, so an image
 // pulled by its index and by its manifest shares one binding. It is auxiliary,
@@ -13,17 +13,20 @@
 // a lost binding without re-storing them, so the binding is a convenience (and
 // the on-disk record of the locally-measured fs-verity digest). Being untrusted,
 // it must be checked on use: what it names is verified against the object store
-// -- the composefs image is content-addressed there and its fs-verity digest is
-// enforced at mount -- so a wrong or stale binding cannot cause unverified
-// content to be mounted. Each binding is
+// -- the composefs image is content-addressed there, and at mount its measured
+// fs-verity digest must match the identity manifest's sealing annotation when
+// one is present, the binding's recorded digest otherwise -- so a wrong or
+// stale binding cannot cause unverified content to be mounted. Each binding is
 // a small JSON file keyed by that identity digest and its platform:
 //
 //	<root>/images/sha256/<root-xx>/<root-rest>/<os>[-<arch>[-<variant>]].json
 //
 // It records the composefs blob descriptor, the object store backing it
 // (objects/fsverity-sha256-12, the fs-verity view the image's redirects resolve
-// through), the fs-verity digest the mount enforces -- always mode "required"
-// with a "local-measurement" source -- whether the merged image was built by the
+// through), the locally measured fs-verity digest -- always mode "required"
+// with a "local-measurement" source; the digest a mount enforces for an image
+// whose identity manifest carries no sealing annotation -- whether the merged
+// image was built by the
 // upstream-reproducible construction (the canonical flag), and the merged
 // rootfs's apparent size as display metadata (optional; absent in bindings
 // written before it existed). The file is written atomically and durably.

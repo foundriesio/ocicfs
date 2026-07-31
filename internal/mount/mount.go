@@ -16,6 +16,8 @@ import (
 
 	"github.com/opencontainers/go-digest"
 	"golang.org/x/sys/unix"
+
+	"github.com/foundriesio/knarr/internal/verity"
 )
 
 // Spec describes one read-only composefs mount.
@@ -45,9 +47,13 @@ func ReadOnly(ctx context.Context, s Spec) error {
 // A caller that must fold a writable layer into a single overlay — stacking
 // an overlay on a composefs mount can exceed the kernel's filesystem
 // stacking-depth limit — mounts the metadata this way and assembles its own
-// overlay with the store's object directory as a data-only lower. Only
-// ImagePath and Target are consulted; the caller verifies the image's
-// fs-verity digest before mounting.
+// overlay with the store's object directory as a data-only lower.
+//
+// Basedir is not consulted; s.FsverityDigest is enforced here, on the very
+// file descriptor the loop device attaches, so the mounted bytes are the
+// measured bytes even if the pathname is swapped concurrently. A raw EROFS
+// mount has no in-kernel digest option, which makes this measurement the
+// enforcement point on this path.
 //
 // The image is attached to an explicitly read-only loop device rather than
 // mounted from the file or through mount(8): a file-backed EROFS counts an
@@ -62,6 +68,9 @@ func MetadataOnly(ctx context.Context, s Spec) error {
 	if s.Target == "" {
 		return errors.New("mount: empty target")
 	}
+	if s.FsverityDigest == "" {
+		return errors.New("mount: empty fs-verity digest")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -71,6 +80,14 @@ func MetadataOnly(ctx context.Context, s Spec) error {
 		return fmt.Errorf("mount: open image: %w", err)
 	}
 	defer warnClose("mount: failed to close image", img)
+
+	measured, err := verity.Measure(img)
+	if err != nil {
+		return fmt.Errorf("mount: measure image: %w", err)
+	}
+	if measured != s.FsverityDigest {
+		return fmt.Errorf("mount: image fs-verity digest mismatch: measured %s, expected %s", measured, s.FsverityDigest)
+	}
 
 	dev, err := attachLoop(img)
 	if err != nil {

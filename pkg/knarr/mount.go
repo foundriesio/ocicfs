@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/foundriesio/knarr/internal/imagestore"
 	"github.com/foundriesio/knarr/internal/mount"
+	"github.com/foundriesio/knarr/internal/ociseal"
 )
 
 const writableMountUnsupported = "writable mounts are not supported"
@@ -54,10 +56,7 @@ func (e *engine) mount(ctx context.Context, ref, target string, opts ...MountOpt
 		return errors.New(writableMountUnsupported)
 	}
 
-	// A digest whose blob cannot be descended is passed through as it stands:
-	// the binding lookup below reports the miss with the wording this verb
-	// already uses.
-	root, err := e.resolveLocalRef(ctx, ref)
+	root, _, err := e.localAnchor(ref)
 	if root == "" {
 		return err
 	}
@@ -68,13 +67,24 @@ func (e *engine) mount(ctx context.Context, ref, target string, opts ...MountOpt
 		return err
 	}
 
-	platform := hostPlatform()
-	b, err := e.img.Get(root, platform)
+	// Read and hash-verify the stored metadata chain before anything else; the
+	// binding and object lookups below key on the verified identity it yields.
+	res, err := e.resolveStoredImage(ctx, root, hostPlatform())
+	if err != nil {
+		return err
+	}
+
+	b, err := e.img.Get(res.ManifestDesc.Digest, res.Platform)
 	if errors.Is(err, imagestore.ErrNotFound) {
-		return fmt.Errorf("not pulled for this platform; run `knarr pull` first: %w", errors.Join(ErrNotFound, err))
+		return fmt.Errorf("no composefs image for this platform; run `knarr pull` first: %w", errors.Join(ErrNotFound, err))
 	}
 	if err != nil {
 		return fmt.Errorf("read image binding: %w", err)
+	}
+
+	expected, sealed, err := expectedFsverity(res.Manifest.Annotations, b.FsverityDigest)
+	if err != nil {
+		return err
 	}
 
 	measured, err := e.obj.VerityDigest(b.Descriptor.Digest)
@@ -84,8 +94,11 @@ func (e *engine) mount(ctx context.Context, ref, target string, opts ...MountOpt
 	if err != nil {
 		return fmt.Errorf("verify image object %s: %w", b.Descriptor.Digest, err)
 	}
-	if measured != b.FsverityDigest {
-		return fmt.Errorf("image object fs-verity digest mismatch: measured %s, binding records %s", measured, b.FsverityDigest)
+	if measured != expected {
+		if sealed {
+			return fmt.Errorf("image object fs-verity digest mismatch: measured %s, sealing annotation claims %s; remove the image and pull again, or re-seal it", measured, expected)
+		}
+		return fmt.Errorf("image object fs-verity digest mismatch: measured %s, binding records %s", measured, expected)
 	}
 	imagePath, err := e.obj.ObjectPath(b.Descriptor.Digest)
 	if err != nil {
@@ -96,12 +109,47 @@ func (e *engine) mount(ctx context.Context, ref, target string, opts ...MountOpt
 		ImagePath:      imagePath,
 		Basedir:        filepath.Join(e.root, b.ObjectStorePath),
 		Target:         target,
-		FsverityDigest: b.FsverityDigest,
+		FsverityDigest: expected,
 	}
 	if cfg.MetadataOnly {
 		return mount.MetadataOnly(ctx, spec)
 	}
 	return mount.ReadOnly(ctx, spec)
+}
+
+// expectedFsverity selects the fs-verity digest a mount enforces from the
+// verified identity-manifest annotations, falling back to the binding's
+// locally measured digest only when the manifest carries no merged-image
+// sealing annotation. Selection is by annotation presence alone, never by the
+// binding's canonical flag: the binding is untrusted here, and letting it
+// steer the key choice would let a tampered binding present a sealed image as
+// unsealed and re-enter binding trust. The standard key wins over the knarr
+// fallback key when both are present. A malformed value and a merged-image
+// annotation of an unrecognized digest kind both fail closed: the publisher
+// sealed the image, so falling back to the binding would silently drop the
+// seal. An unrecognized digest kind coexisting with a recognized key does
+// not fail: every annotation sits inside the hash-pinned manifest, so the
+// combination is publisher-authored — dual-sealing for a format migration —
+// not a downgrade an attacker can induce, and the recognized seal pins the
+// content at full strength on its own.
+func expectedFsverity(annotations map[string]string, bindingFsverity string) (string, bool, error) {
+	for _, key := range []string{ociseal.MergedAnnotation, ociseal.FallbackMergedAnnotation} {
+		value, ok := annotations[key]
+		if !ok {
+			continue
+		}
+		sealedDigest, err := ociseal.ParseAnnotation(value)
+		if err != nil {
+			return "", false, fmt.Errorf("sealing annotation %s: %w", key, err)
+		}
+		return sealedDigest, true, nil
+	}
+	for key := range annotations {
+		if strings.HasPrefix(key, ociseal.MergedAnnotationPrefix) {
+			return "", false, fmt.Errorf("unverifiable sealing annotation %q: unrecognized digest kind", key)
+		}
+	}
+	return bindingFsverity, false, nil
 }
 
 func validateMountTarget(target string) error {

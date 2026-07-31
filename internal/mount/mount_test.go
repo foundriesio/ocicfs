@@ -21,6 +21,7 @@ import (
 	"github.com/foundriesio/knarr/internal/devtest"
 	"github.com/foundriesio/knarr/internal/objectstore"
 	"github.com/foundriesio/knarr/internal/rootfs"
+	"github.com/foundriesio/knarr/internal/verity"
 )
 
 func TestReadOnlyRejectsInvalidSpec(t *testing.T) {
@@ -194,4 +195,69 @@ func skipMountEnvironment(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "Operation not permitted") ||
 		strings.Contains(msg, "Permission denied")
+}
+
+// TestMetadataOnlyRejectsInvalidSpec: the argument checks fire before any
+// filesystem work, so they need no verity environment.
+func TestMetadataOnlyRejectsInvalidSpec(t *testing.T) {
+	tests := []struct {
+		name string
+		spec Spec
+		want string
+	}{
+		{"empty image", Spec{Target: "/mnt", FsverityDigest: digest.SHA256.FromString("verity").String()}, "empty image path"},
+		{"empty target", Spec{ImagePath: "/image", FsverityDigest: digest.SHA256.FromString("verity").String()}, "empty target"},
+		{"empty digest", Spec{ImagePath: "/image", Target: "/mnt"}, "empty fs-verity digest"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := MetadataOnly(context.Background(), tt.spec)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("MetadataOnly = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+// TestMetadataOnlyRefusesFsverityMismatch: the digest is enforced on the very
+// descriptor the loop device would attach, so a mismatch must fail before any
+// attach -- this is the enforcement point on the metadata-only path, and a
+// caller-side pre-measure must not be what keeps it honest.
+func TestMetadataOnlyRefusesFsverityMismatch(t *testing.T) {
+	dir, cleanup, err := devtest.VerityRoot()
+	if errors.Is(err, devtest.ErrNoVerity) {
+		t.Skipf("verity-capable root unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("VerityRoot: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	path := filepath.Join(dir, "image.erofs")
+	if err := os.WriteFile(path, []byte("metadata-only mismatch fixture"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY, 0) // #nosec G304 -- test fixture path under t-managed dir
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	enableErr := verity.Enable(f)
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if devtest.IsVerityUnsupported(enableErr) {
+		t.Skipf("fs-verity unsupported on the test filesystem: %v", enableErr)
+	}
+	if enableErr != nil {
+		t.Fatalf("Enable: %v", enableErr)
+	}
+
+	err = MetadataOnly(context.Background(), Spec{
+		ImagePath:      path,
+		Target:         t.TempDir(),
+		FsverityDigest: digest.SHA256.FromString("wrong").String(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "fs-verity digest mismatch") {
+		t.Fatalf("MetadataOnly = %v, want the fd-measure mismatch", err)
+	}
 }

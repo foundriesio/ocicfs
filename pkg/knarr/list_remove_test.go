@@ -207,8 +207,8 @@ func TestPullListRemoveE2E(t *testing.T) {
 		t.Fatalf("List after remove = %#v, want empty", images)
 	}
 	err = eng.Mount(context.Background(), lay.Ref, t.TempDir())
-	if err == nil || !strings.Contains(err.Error(), "not pulled") {
-		t.Fatalf("Mount after remove error = %v, want not pulled", err)
+	if err == nil || !strings.Contains(err.Error(), "run `knarr pull` first") {
+		t.Fatalf("Mount after remove error = %v, want the re-pull remedy", err)
 	}
 
 	assertObjectExists(t, storeRoot, lay.Root)

@@ -30,10 +30,7 @@ func (e *engine) Inspect(ctx context.Context, ref string) (*ImageInfo, error) {
 }
 
 func (e *engine) inspect(ctx context.Context, ref string) (*ImageInfo, error) {
-	// A digest whose blob cannot be descended is passed through as it stands:
-	// the resolve below reads the same blob and reports the miss with the
-	// wording this verb already uses.
-	root, err := e.resolveLocalRef(ctx, ref)
+	root, _, err := e.localAnchor(ref)
 	if root == "" {
 		return nil, err
 	}
@@ -41,19 +38,12 @@ func (e *engine) inspect(ctx context.Context, ref string) (*ImageInfo, error) {
 		return nil, err
 	}
 
-	// A missing metadata blob means the image was never pulled for this host;
-	// report it as ErrNotFound while preserving the underlying cause. Any other
-	// resolve failure (platform mismatch, corrupt metadata, digest mismatch)
-	// names the real conflict and propagates unchanged.
-	res, err := ocichain.Resolve(ctx, casBlobSource{store: e.obj}, root, hostPlatform())
+	res, err := e.resolveStoredImage(ctx, root, hostPlatform())
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("not pulled for this platform; run `knarr pull` first: %w", errors.Join(ErrNotFound, err))
-		}
 		return nil, err
 	}
 
-	b, err := e.img.Get(root, res.Platform)
+	b, err := e.img.Get(res.ManifestDesc.Digest, res.Platform)
 	if err != nil {
 		if errors.Is(err, imagestore.ErrNotFound) {
 			return nil, fmt.Errorf("no composefs image for this platform; run `knarr pull` first: %w", errors.Join(ErrNotFound, err))
@@ -62,7 +52,7 @@ func (e *engine) inspect(ctx context.Context, ref string) (*ImageInfo, error) {
 	}
 
 	return &ImageInfo{
-		Root:           root,
+		Root:           res.ManifestDesc.Digest,
 		Platform:       res.Platform,
 		DiffIDs:        res.DiffIDs,
 		Composefs:      b.Descriptor,
@@ -70,6 +60,25 @@ func (e *engine) inspect(ctx context.Context, ref string) (*ImageInfo, error) {
 		RootfsSize:     b.RootfsSize,
 		Layers:         layerTable(res),
 	}, nil
+}
+
+// resolveStoredImage reads and hash-verifies the stored metadata chain that
+// root anchors -- the index when root pins one, the platform image manifest,
+// and its config -- in one resolution, the same one a pull performs. This is
+// the first thing every reading verb does: everything after it keys on the
+// verified result, never on the anchor alone. A missing blob means the image
+// was never pulled for this host and is reported as ErrNotFound with the
+// remedy; any other failure (digest mismatch, platform conflict, corrupt
+// metadata) names the real conflict and propagates unchanged.
+func (e *engine) resolveStoredImage(ctx context.Context, root digest.Digest, platform ocispec.Platform) (ocichain.Resolved, error) {
+	res, err := ocichain.Resolve(ctx, casBlobSource{store: e.obj}, root, platform)
+	if errors.Is(err, os.ErrNotExist) {
+		return ocichain.Resolved{}, fmt.Errorf("not pulled for this platform; run `knarr pull` first: %w", errors.Join(ErrNotFound, err))
+	}
+	if err != nil {
+		return ocichain.Resolved{}, err
+	}
+	return res, nil
 }
 
 // layerTable builds the per-layer view of a resolved chain: descriptor

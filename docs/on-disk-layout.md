@@ -69,8 +69,9 @@ it is the digest to pin, hold, and look the image up by. See
 ## `images/` — image bindings (auxiliary)
 
 One JSON file per (identity digest, platform). It's a convenience index that
-lets a mount go straight to the already-built composefs image without re-resolving
-or rebuilding, and records the locally measured fs-verity digest:
+lets a mount, once the stored metadata chain has verified, go straight to the
+already-built composefs image without rebuilding it, and records the locally
+measured fs-verity digest:
 
 ```json
 {
@@ -100,10 +101,18 @@ verifies the image as already present does not rewrite the binding, so the
 field appears when the image is next actually built (after the binding's last
 ref is removed, or on an image update).
 
-At mount time, knarr reads the host-platform binding for the identity digest,
-opens the referenced composefs image from `objects/sha256`, re-measures that
-image object's fs-verity digest, and requires it to match `rootfs.fsverity.digest`
-before mounting. The mount uses the binding's `objectStore.path`
+At mount time, knarr first resolves and digest-verifies the stored metadata
+chain from `objects/sha256` in a single pass — the index when the reference
+pins one, the platform manifest, and its config — then reads the host-platform
+binding for the verified identity and selects the fs-verity digest to enforce:
+the manifest's merged-image sealing annotation when one is present,
+`rootfs.fsverity.digest` otherwise. It then
+opens the referenced composefs image, re-measures its fs-verity digest, and
+requires it to match the selected value before mounting. The sealed value is
+re-derived from the verified manifest on every mount instead of being recorded
+in the binding (say, as another `fsverity.source`): the binding is untrusted
+at mount, so a recorded provenance marker would be exactly as tamperable as
+the digest it qualifies. The mount uses the binding's `objectStore.path`
 (`objects/fsverity-sha256-12`, the fs-verity view) as the composefs basedir, so
 the image's fs-verity-keyed redirects resolve to the sealed objects written by
 pull.
@@ -201,7 +210,9 @@ caller is waiting on. The lock files are empty and carry no content.
 `images/` and `refs/` are **regenerable indexes**, not trust anchors: all content
 lives in `objects/`, and re-pulling a pinned digest rebuilds both indexes without
 re-storing it. Because they are not trusted, bindings are verified on use against
-the object store — a binding's composefs image is content-addressed there and its
-fs-verity digest is enforced at mount, so a stale or tampered binding cannot
-serve unverified content. Ref records are validated when read (schema, ref key,
-and sha256 digests), but they are not content trust anchors.
+the object store — a binding's composefs image is content-addressed there, and at
+mount its measured fs-verity digest must match the enforced value (the identity
+manifest's sealing annotation for a sealed image, the binding's recorded digest
+otherwise), so a stale or tampered binding cannot serve unverified content. Ref
+records are validated when read (schema, ref key, and sha256 digests), but they
+are not content trust anchors.

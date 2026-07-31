@@ -52,10 +52,16 @@ sudo mkdir -p /mnt/app
 sudo knarr mount "app@$digest" /mnt/app
 ```
 
-Mount reads the host-platform binding from `images/`, re-measures the referenced
-composefs image object in `objects/sha256`, and passes the recorded fs-verity
-digest to `mount.composefs`. The mount fails if the image object is missing,
-unmeasurable, or measured differently from the binding.
+Before anything else, mount resolves and digest-verifies the stored metadata
+chain in `objects/sha256` in a single pass — the index when the reference pins
+one, the platform manifest, and its config. Only then does it read the
+host-platform binding from `images/` for the verified identity and pick the
+fs-verity digest to enforce: the manifest's merged-image sealing annotation
+when one is present, the digest the binding recorded at pull otherwise. It
+re-measures the referenced composefs image object against that value and
+passes it to `mount.composefs`. The mount fails if the metadata chain or the
+image object is missing, unmeasurable, or measured differently from the
+enforced digest.
 
 The mounted tree is read-only:
 
@@ -88,7 +94,10 @@ sudo mount -t overlay overlay -o \
 
 The metadata mount alone serves no file data; content is read only through the
 overlay, and `verity=require` keeps the kernel enforcing fs-verity on every
-backing object. This flat overlay is the supported writable pattern: stacking a
+backing object. A raw EROFS mount has no kernel digest option, so knarr
+enforces the expected digest itself: it measures the image on the very file
+descriptor it attaches to the loop device, making the mounted metadata the
+measured metadata. This flat overlay is the supported writable pattern: stacking a
 writable overlay directly on a composefs mount exceeds the kernel's filesystem
 stacking depth. The upper and work directories must not live on an overlayfs.
 
@@ -106,8 +115,13 @@ stacking depth. The upper and work directories must not live on an overlayfs.
   consumer over a `--metadata-only` mount instead (see above).
 - **Fail closed.** knarr requires fs-verity for the composefs image and backing
   objects. There is no unverified mount fallback.
-- **What the verity check binds.** The kernel enforces the binding's recorded
-  fs-verity digest on the composefs image and requires fs-verity on every
-  backing object, so tampered or unsealed content cannot be served. The binding
-  itself is an untrusted, regenerable index: it selects which locally verified
-  image is mounted for the requested identity digest, and is not itself sealed.
+- **What the verity check binds.** The expected fs-verity digest — the sealing
+  annotation of the digest-verified identity manifest for a sealed image, the
+  binding's locally recorded digest otherwise — is enforced on the composefs
+  image by the kernel on a composefs mount, and by measuring the image on the
+  loop-attached descriptor on a metadata-only mount; fs-verity is required on
+  every backing object either way, so tampered or unsealed content cannot be
+  served. The binding itself is an untrusted,
+  regenerable index: it selects which local image object is mounted for the
+  requested identity digest, and for a sealed image it contributes nothing to
+  the trust decision.

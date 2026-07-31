@@ -267,48 +267,57 @@ func verifiedPulledImage(ctx context.Context, obj *objectstore.Store, imgStore *
 	return cachedImage{platform: res.Platform, descriptor: b.Descriptor}, true, nil
 }
 
-// resolveLocalRef returns the identity digest ref names — the platform image
-// manifest every local lookup and verification keys on. A digest-pinned ref
-// carries a digest of its own, which is descended through the object store: a
-// pinned index yields the manifest it offers for the host platform, and a
-// pinned manifest yields itself. Any other ref string is normalized and
-// resolves through the local reference store to the identity its most recent
-// pull recorded under that normalized form, with no I/O beyond that record, so
-// a pulled tag works with the verbs that read only local state regardless of
-// which equivalent alias named it. Resolution never touches the network.
-//
-// The returned digest is empty only when the reference itself cannot be
+// localAnchor classifies ref and returns the digest it anchors on locally,
+// reading no blob: the pinned digest as typed (pinned true), or, for any other
+// ref string, the identity its most recent pull recorded under the normalized
+// form, so a pulled tag works with the verbs that read only local state
+// regardless of which equivalent alias named it. Resolution never touches the
+// network. The digest is empty only when the reference itself cannot be
 // resolved: a malformed digest pin — a ref that reads as a digest-pin attempt
 // (it contains "@" or is a bare digest) reports its parse error instead of
 // falling through, because pull can never have recorded such a string — or a
-// name no pull recorded. A reference that does name a digest always yields one,
-// and a non-nil error alongside it reports why the descent stopped there: the
-// root blob is absent, unreadable, or does not hash to its digest. Each verb
-// decides which of those reasons matters to it.
-func (e *engine) resolveLocalRef(ctx context.Context, ref string) (digest.Digest, error) {
+// name no pull recorded.
+func (e *engine) localAnchor(ref string) (root digest.Digest, pinned bool, err error) {
 	root, perr := parseDigestPinnedRef(ref)
 	if perr == nil {
-		desc, _, err := descendRoot(ctx, casBlobSource{store: e.obj}, root, hostPlatform())
-		if err != nil {
-			return root, err
-		}
-		return desc.Identity.Digest, nil
+		return root, true, nil
 	}
 	if strings.ContainsRune(ref, '@') || looksLikeBareDigest(ref) {
-		return "", perr
+		return "", false, perr
 	}
 	normalized, err := normalizeRef(ref)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	rec, err := e.refs.Get(normalized)
 	if errors.Is(err, refstore.ErrNotFound) {
-		return "", fmt.Errorf("not digest-pinned and not recorded by a pull; run `knarr pull` first or pin a digest (name@sha256:…): %w", errors.Join(ErrNotFound, err))
+		return "", false, fmt.Errorf("not digest-pinned and not recorded by a pull; run `knarr pull` first or pin a digest (name@sha256:…): %w", errors.Join(ErrNotFound, err))
 	}
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	return rec.Identity.Digest, nil
+	return rec.Identity.Digest, false, nil
+}
+
+// resolveLocalRef returns the identity digest ref names — the platform image
+// manifest every local lookup and verification keys on. A pinned digest is
+// descended through the object store: a pinned index yields the manifest it
+// offers for the host platform, and a pinned manifest yields itself; any
+// other ref resolves through the reference record with no blob read. A
+// reference that does name a digest always yields one, and a non-nil error
+// alongside it reports why the descent stopped there: the root blob is
+// absent, unreadable, or does not hash to its digest. Each verb decides which
+// of those reasons matters to it.
+func (e *engine) resolveLocalRef(ctx context.Context, ref string) (digest.Digest, error) {
+	root, pinned, err := e.localAnchor(ref)
+	if root == "" || !pinned {
+		return root, err
+	}
+	desc, _, err := descendRoot(ctx, casBlobSource{store: e.obj}, root, hostPlatform())
+	if err != nil {
+		return root, err
+	}
+	return desc.Identity.Digest, nil
 }
 
 // normalizeRef canonicalizes ref for use as the refstore lookup key, so a ref
