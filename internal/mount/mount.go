@@ -33,11 +33,22 @@ type Spec struct {
 var ErrNotMounted = errors.New("mount: target is not mounted")
 
 // ReadOnly mounts s.ImagePath at s.Target with fs-verity required.
+//
+// The in-use lock taken here covers only the mount setup: mount.composefs
+// opens the image itself (its digest check refuses a block-device source, so
+// the locked fd cannot be handed through a pre-attached loop device), and a
+// flock belongs to the open file description, so it ends with this process.
+// A long-lived composefs mount is protected by holds, not the lock.
 func ReadOnly(ctx context.Context, s Spec) error {
 	opts, err := composefsOptions(s)
 	if err != nil {
 		return err
 	}
+	img, err := lockImage(s.ImagePath)
+	if err != nil {
+		return err
+	}
+	defer warnClose("mount: failed to close image", img)
 	cmd := exec.CommandContext(ctx, "mount.composefs", "-o", opts, "--", s.ImagePath, s.Target) // #nosec G204 -- fixed binary, discrete validated args, "--" ends option parsing
 	return runMount(ctx, cmd, "mount.composefs")
 }
@@ -75,9 +86,12 @@ func MetadataOnly(ctx context.Context, s Spec) error {
 		return err
 	}
 
-	img, err := os.Open(s.ImagePath) // #nosec G304 -- store object path, verified by caller
+	// The loop device retains the locked open file description, so the shared
+	// in-use lock taken here lives exactly as long as the mount (autoclear)
+	// and keeps reading as in use after this process exits.
+	img, err := lockImage(s.ImagePath)
 	if err != nil {
-		return fmt.Errorf("mount: open image: %w", err)
+		return err
 	}
 	defer warnClose("mount: failed to close image", img)
 
@@ -99,6 +113,40 @@ func MetadataOnly(ctx context.Context, s Spec) error {
 
 	if err := unix.Mount(dev.Name(), s.Target, "erofs", unix.MS_RDONLY, ""); err != nil {
 		return fmt.Errorf("mount: erofs %s on %s: %w", dev.Name(), s.Target, err)
+	}
+	return nil
+}
+
+// lockImage opens the image and takes the store's in-use coordination on it:
+// a shared flock marking the image mounted, then a link-count check. Garbage
+// collection deletes an object only while holding the exclusive lock on it
+// and probes with LOCK_NB, so once the shared lock is held a named inode
+// cannot lose its name to collection; an inode that already has no name was
+// collected between the open and the lock, and the mount refuses it.
+func lockImage(path string) (*os.File, error) {
+	img, err := os.Open(path) // #nosec G304 -- store object path, verified by caller
+	if err != nil {
+		return nil, fmt.Errorf("mount: open image: %w", err)
+	}
+	if err := lockLinked(img); err != nil {
+		warnClose("mount: failed to close image", img)
+		return nil, err
+	}
+	return img, nil
+}
+
+// lockLinked takes the shared in-use lock on img and requires its inode to
+// still carry a name.
+func lockLinked(img *os.File) error {
+	if err := unix.Flock(int(img.Fd()), unix.LOCK_SH); err != nil { // #nosec G115 -- a file descriptor always fits in int
+		return fmt.Errorf("mount: lock image: %w", err)
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(int(img.Fd()), &st); err != nil { // #nosec G115 -- a file descriptor always fits in int
+		return fmt.Errorf("mount: stat image: %w", err)
+	}
+	if st.Nlink == 0 {
+		return errors.New("mount: image removed by gc; run `knarr pull` first")
 	}
 	return nil
 }

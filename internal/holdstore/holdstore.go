@@ -149,7 +149,8 @@ func (s *Store) Release(root digest.Digest, holder string) error {
 }
 
 // Holders returns the sorted holder names recorded for root, or an empty slice
-// when none are. Call under Lock.
+// when none are. Call under Lock; a lock-free call is permitted only for an
+// advisory read that tolerates racing with a release, in either direction.
 func (s *Store) Holders(root digest.Digest) ([]string, error) {
 	dir, err := s.holderDir(root)
 	if err != nil {

@@ -261,3 +261,67 @@ func TestMetadataOnlyRefusesFsverityMismatch(t *testing.T) {
 		t.Fatalf("MetadataOnly = %v, want the fd-measure mismatch", err)
 	}
 }
+
+// TestLockImageMarksInUse pins the in-use protocol's mount side: while the
+// image lock is held, an exclusive non-blocking probe on the same inode —
+// what gc runs before deleting — must report contention, and must succeed
+// again once the lock is gone.
+func TestLockImageMarksInUse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "image.erofs")
+	if err := os.WriteFile(path, []byte("lock fixture"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	img, err := lockImage(path)
+	if err != nil {
+		t.Fatalf("lockImage: %v", err)
+	}
+
+	probe, err := os.Open(path) // #nosec G304 -- test fixture path under t-managed dir
+	if err != nil {
+		t.Fatalf("Open probe: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := probe.Close(); err != nil {
+			t.Errorf("close probe: %v", err)
+		}
+	})
+	err = unix.Flock(int(probe.Fd()), unix.LOCK_EX|unix.LOCK_NB) // #nosec G115 -- a file descriptor always fits in int
+	if !errors.Is(err, unix.EWOULDBLOCK) {
+		t.Fatalf("probe flock = %v, want EWOULDBLOCK while the image lock is held", err)
+	}
+
+	if err := img.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := unix.Flock(int(probe.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil { // #nosec G115 -- a file descriptor always fits in int
+		t.Fatalf("probe flock after release = %v, want success", err)
+	}
+}
+
+// TestLockLinkedRefusesRemovedImage covers the unlink race with gc: an image
+// whose name vanished between the open and the lock must be refused with the
+// pull remedy rather than mounted from its nameless inode.
+func TestLockLinkedRefusesRemovedImage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "image.erofs")
+	if err := os.WriteFile(path, []byte("removed fixture"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	img, err := os.Open(path) // #nosec G304 -- test fixture path under t-managed dir
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := img.Close(); err != nil {
+			t.Errorf("close image: %v", err)
+		}
+	})
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	err = lockLinked(img)
+	if err == nil || !strings.Contains(err.Error(), "removed by gc") {
+		t.Fatalf("lockLinked = %v, want the removed-by-gc refusal", err)
+	}
+}
