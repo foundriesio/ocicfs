@@ -529,6 +529,37 @@ func (s *Store) Remove(d digest.Digest) error {
 	return nil
 }
 
+// InUse reports whether a mounter currently holds the shared in-use lock on
+// object d: it probes with a non-blocking exclusive flock and releases
+// immediately on success. An absent object is not in use.
+func (s *Store) InUse(d digest.Digest) (bool, error) {
+	path, err := s.ObjectPath(d)
+	if err != nil {
+		return false, err
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0) // #nosec G304 -- digest-derived object path
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("objectstore: open object %s: %w", d, err)
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			slog.Warn("objectstore: failed to close object", "digest", d, "err", err)
+		}
+	}()
+	err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB) // #nosec G115 -- a file descriptor always fits in int
+	if errors.Is(err, unix.EWOULDBLOCK) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("objectstore: probe object %s: %w", d, err)
+	}
+	// The close below drops the probe lock with the descriptor.
+	return false, nil
+}
+
 // SweepViewOrphans removes fs-verity view entries whose CAS partner is gone —
 // the view name is always a second hardlink to a CAS object, so a view file
 // whose inode has a single name lost its partner to external damage. An

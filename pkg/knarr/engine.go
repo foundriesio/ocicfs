@@ -7,8 +7,8 @@
 // holds no version-management, activation, or update-orchestration policy.
 //
 // The current surface covers the basic primitives — publish, pull, mount,
-// unmount, inspect, list, hold, release, remove. The remaining primitives
-// (verify, status, gc) are added as they are implemented.
+// unmount, inspect, list, hold, release, remove, gc. The remaining primitives
+// (verify, status) are added as they are implemented.
 package knarr
 
 import (
@@ -225,6 +225,39 @@ func WithMetadataOnly() MountOption {
 	return func(o *MountOptions) { o.MetadataOnly = true }
 }
 
+// GCOptions is the resolved configuration a GC acts on. Callers pass the
+// With* options to GC, which apply to a zero GCOptions.
+type GCOptions struct {
+	// DryRun reports what a collection would remove without removing it.
+	DryRun bool
+}
+
+// GCOption adjusts GCOptions.
+type GCOption func(*GCOptions)
+
+// WithDryRun makes GC report what it would remove without removing anything.
+func WithDryRun() GCOption {
+	return func(o *GCOptions) { o.DryRun = true }
+}
+
+// GCReport summarizes one garbage collection.
+type GCReport struct {
+	// ObjectsRemoved counts store objects deleted, orphan view entries
+	// included.
+	ObjectsRemoved int
+	// BytesFreed sums the deleted objects' sizes. Orphan view entries and
+	// bindings are noise-level and add nothing here.
+	BytesFreed int64
+	// BindingsRemoved counts orphan image bindings deleted.
+	BindingsRemoved int
+	// InUseSkipped counts objects kept because a mounter holds them.
+	InUseSkipped int
+	// Removed lists the deleted store objects by content digest. Orphan view
+	// entries are counted in ObjectsRemoved but not listed here, so its
+	// length can fall short of that count.
+	Removed []string
+}
+
 // RemoveOptions is the resolved configuration a Remove acts on. Callers pass
 // the With* options to Remove, which apply to a zero RemoveOptions.
 type RemoveOptions struct {
@@ -313,6 +346,18 @@ type Engine interface {
 	// to. It declines while a hold pins that identity unless WithForce is set,
 	// which clears the holds first.
 	Remove(ctx context.Context, ref string, opts ...RemoveOption) error
+	// GC deletes every store object that is neither wanted — reachable from a
+	// reference record or a hold — nor in use by a mounter, along with orphan
+	// bindings, orphan fs-verity view entries, staging leftovers, and the
+	// empty shard directories earlier deletions left behind. It
+	// holds the store lock exclusively and fails fast with an error matching
+	// ErrStoreBusy while a pull, hold, or mount is in progress; retry. A
+	// wanted image it cannot fully enumerate aborts the collection with
+	// nothing deleted, naming the broken root and the remedy. WithDryRun
+	// reports the same counts a collection would produce without removing
+	// anything, except orphan view entries, which exist only after external
+	// damage and are counted only when actually swept.
+	GC(ctx context.Context, opts ...GCOption) (*GCReport, error)
 }
 
 // Config configures a new Engine.

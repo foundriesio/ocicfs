@@ -631,3 +631,29 @@ func TestPruneEmptyDirs(t *testing.T) {
 		t.Fatalf("populated shard dir pruned: %v", err)
 	}
 }
+
+// TestWriteRepairsMissingViewLink pins the crash-recovery contract behind
+// Remove's view-name-first unlink order: an authoritative object whose view
+// link is missing — the state a crash between the two unlinks leaves — is
+// repaired by the next write of the same content.
+func TestWriteRepairsMissingViewLink(t *testing.T) {
+	s := newVerityStore(t)
+	ctx := context.Background()
+	const body = "repair my view link"
+	_, fsv, err := s.WriteObject(ctx, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("WriteObject: %v", err)
+	}
+	hex := strings.TrimPrefix(fsv, "sha256:")
+	viewPath := filepath.Join(s.ViewDir(), hex[:2], hex[2:])
+	if err := os.Remove(viewPath); err != nil {
+		t.Fatalf("remove view name: %v", err)
+	}
+
+	if _, _, err := s.WriteObject(ctx, strings.NewReader(body)); err != nil {
+		t.Fatalf("WriteObject again: %v", err)
+	}
+	if _, err := os.Lstat(viewPath); err != nil {
+		t.Fatalf("view link not repaired: %v", err)
+	}
+}
