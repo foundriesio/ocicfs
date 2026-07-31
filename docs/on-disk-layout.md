@@ -12,8 +12,14 @@ seals every content object with it and refuses a store that cannot.
 ├── images/sha256/<aa>/<rest>/<os>-<arch>[-<variant>].json   # image bindings — auxiliary
 ├── refs/sha256/<kk>/<rest>.json # reference records — auxiliary
 ├── holds/sha256/<aa>/<rest>/<holder>   # GC-protection holds — auxiliary
+├── .lock                        # store-level lock coordinating gc with pull/hold/mount
 └── tmp/                         # staging + build scratch
 ```
+
+`.lock` is created on demand and never removed: `pull`, `hold`, and `mount`
+hold it shared for their duration, `gc` exclusive (failing fast when busy),
+so a collection never interleaves with an image being staged, a hold being
+recorded, or a mount being set up. See [gc.md](gc.md).
 
 Every digest is sharded by its first byte (`<aa>` = first two hex chars, `<rest>`
 = the remaining 62) to keep directories shallow.
@@ -144,8 +150,10 @@ trust anchor:
 The two descriptors say different things. `resolved` is **provenance**: the
 document the reference itself landed on — an image index for the tag above, and
 the manifest itself for a manifest-pinned reference, in which case the two
-descriptors are the same one. It is unauthenticated local bookkeeping; nothing
-verifies against it. `identity` is the platform image manifest the reference
+descriptors are the same one. It is unauthenticated local bookkeeping; no trust
+decision takes it as an input, but `knarr gc` resolves it as a wanted root to
+keep the pulled document reachable, so a record whose resolved chain is broken
+aborts a collection. `identity` is the platform image manifest the reference
 names, the digest the bindings and holds are keyed by and the one every verb
 looks the image up under. A descriptor records a `mediaType` only when the
 document that named it declared one, so `resolved` carries an empty one (a
@@ -157,7 +165,8 @@ rather than failing the whole listing.
 `knarr ls` reads these records and reports one row per stored reference, showing
 the identity digest. `knarr remove <ref>` deletes the matching ref record and
 any unshared image binding for the recorded identity digest and platform; it
-does not delete content from `objects/`.
+does not delete content from `objects/` — `knarr gc` reclaims objects nothing
+references (see [gc.md](gc.md)).
 
 ## `holds/` — GC-protection holds (auxiliary)
 

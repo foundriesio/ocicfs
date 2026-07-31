@@ -115,6 +115,14 @@ stacking depth. The upper and work directories must not live on an overlayfs.
   consumer over a `--metadata-only` mount instead (see above).
 - **Fail closed.** knarr requires fs-verity for the composefs image and backing
   objects. There is no unverified mount fallback.
+- **Mounts mark in use for gc.** A mount holds the store lock shared during
+  setup and takes a shared flock on the image object — the in-use signal
+  `knarr gc` probes before deleting. A metadata-only mount's lock rides the
+  loop device and lives exactly as long as the mount; a composefs mount's
+  lock ends with the knarr process, so hold an image you keep mounted
+  long-term (see [gc.md](gc.md)). A mount that loses the unlink race with a
+  concurrent collection is refused with the pull remedy instead of serving a
+  deleted image.
 - **What the verity check binds.** The expected fs-verity digest — the sealing
   annotation of the digest-verified identity manifest for a sealed image, the
   binding's locally recorded digest otherwise — is enforced on the composefs

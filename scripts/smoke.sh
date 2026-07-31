@@ -63,6 +63,7 @@ REGPID=""
 REGDIR=""
 IMGDIR=""
 EXPORTDIR=""
+GCOVL=""
 
 cleanup() {
 	set +e
@@ -70,6 +71,10 @@ cleanup() {
 		bin/knarr --root "$STORE" unmount "$OVL/merged" 2>/dev/null
 		bin/knarr --root "$STORE" unmount "$OVL/meta" 2>/dev/null
 		rm -rf "$OVL"
+	fi
+	if [ -n "$GCOVL" ]; then
+		bin/knarr --root "$STORE" unmount "$GCOVL/merged" 2>/dev/null
+		rm -rf "$GCOVL"
 	fi
 	[ -n "$MNT" ] && bin/knarr --root "$STORE" unmount "$MNT" 2>/dev/null
 	[ -n "$REGPID" ] && kill "$REGPID" 2>/dev/null
@@ -422,4 +427,50 @@ echo "== remove, pull (expect a clean mount again) =="
 "${KN[@]}" remove "$sref"
 "${KN[@]}" remove "127.0.0.1:$port/custom@$csealed"
 
-echo "SMOKE OK: purpose-built image sealed, cross-checked three ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding (checks passed)"
+echo "== gc: reclaim the unwanted, keep the survivor =="
+"${KN[@]}" pull "$sref"
+"${KN[@]}" pull "127.0.0.1:$port/custom@$csealed"
+"${KN[@]}" remove "127.0.0.1:$port/custom@$csealed"
+"${KN[@]}" gc --dry-run
+out="$("${KN[@]}" gc --format json)"
+printf '%s\n' "$out"
+[ "$(printf '%s' "$out" | jq -r .objectsRemoved)" -gt 0 ] || fail "gc reclaimed nothing after remove"
+"${KN[@]}" mount "$sref" "$MNT"
+f="$(find "$MNT" -type f -size +64c -print -quit)"
+[ -n "$f" ] || fail "survivor mount has no by-digest file after gc"
+cat "$f" >/dev/null || fail "reading survivor content failed after gc"
+"${KN[@]}" unmount "$MNT"
+
+echo "== gc: in-use image survives, falls after unmount =="
+"${KN[@]}" mount --metadata-only "$sref" "$MNT"
+"${KN[@]}" remove "$sref"
+out="$("${KN[@]}" gc --format json)"
+printf '%s\n' "$out"
+[ "$(printf '%s' "$out" | jq -r .inUseSkipped)" -gt 0 ] || fail "gc did not see the mounted image as in use"
+[ -n "$(find "$STORE/objects/sha256" -type f -print -quit)" ] || fail "in-use image's objects were swept"
+[ -n "$(ls -A "$MNT")" ] || fail "metadata mount broke during gc"
+# Data objects open lazily: prove a by-digest file still opens through the
+# live data plane after the collection, not merely that files remain on disk.
+GCOVL="$(mktemp -d /var/lib/knarr/smoke-gc-ovl-XXXXXX)"
+mkdir "$GCOVL/merged" "$GCOVL/upper" "$GCOVL/work"
+mount -t overlay overlay -o \
+	"lowerdir=$MNT::$STORE/objects/fsverity-sha256-12,upperdir=$GCOVL/upper,workdir=$GCOVL/work,redirect_dir=on,metacopy=on,verity=require" \
+	"$GCOVL/merged"
+f="$(find "$GCOVL/merged" -xdev -type f -size +64c -print -quit)"
+[ -n "$f" ] || fail "post-gc merged rootfs has no by-digest file"
+cat "$f" >/dev/null || fail "reading $f through the post-gc overlay failed"
+"${KN[@]}" unmount "$GCOVL/merged"
+rm -rf "$GCOVL"
+GCOVL=""
+"${KN[@]}" unmount "$MNT"
+out="$("${KN[@]}" gc --format json)"
+printf '%s\n' "$out"
+[ "$(printf '%s' "$out" | jq -r .objectsRemoved)" -gt 0 ] || fail "gc after unmount reclaimed nothing"
+[ -z "$(find "$STORE/objects/sha256" -type f)" ] || fail "objects remain in an empty store"
+[ -z "$(find "$STORE/objects/fsverity-sha256-12" -type f)" ] || fail "view entries remain in an empty store"
+for tree in "$STORE/objects/sha256" "$STORE/objects/fsverity-sha256-12" \
+	"$STORE/images/sha256" "$STORE/refs/sha256" "$STORE/holds/sha256"; do
+	[ -z "$(find "$tree" -mindepth 1 -type d 2>/dev/null)" ] || fail "empty shard directories remain under $tree"
+done
+
+echo "SMOKE OK: purpose-built image sealed, cross-checked three ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding, and a gc round (unwanted reclaimed, in-use survives until unmount, empty store fully reclaimed down to its shard directories) (checks passed)"

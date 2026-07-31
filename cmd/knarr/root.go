@@ -82,6 +82,7 @@ func newRootCommand(stdout, stderr io.Writer) (*cobra.Command, *globalOptions) {
 		newHoldCommand(g),
 		newReleaseCommand(g),
 		newRemoveCommand(g),
+		newGCCommand(g),
 	)
 	return root, g
 }

@@ -434,3 +434,72 @@ func isUsageError(err error) bool {
 		strings.HasPrefix(msg, "unknown flag") ||
 		strings.HasPrefix(msg, "unknown shorthand")
 }
+
+// GCOutput is the JSON/text shape for `knarr gc` output. Its JSON field
+// names are a stable contract for callers that parse knarr's output.
+// RemovedObjects is present only when the caller asked for the listing.
+type GCOutput struct {
+	ObjectsRemoved  int      `json:"objectsRemoved"`
+	BytesFreed      int64    `json:"bytesFreed"`
+	BindingsRemoved int      `json:"bindingsRemoved"`
+	InUseSkipped    int      `json:"inUseSkipped"`
+	DryRun          bool     `json:"dryRun"`
+	RemovedObjects  []string `json:"removedObjects,omitempty"`
+}
+
+// GCOutputOptions adjusts how WriteGCReport renders a report.
+type GCOutputOptions struct {
+	// DryRun labels the report as a preview.
+	DryRun bool
+	// ListRemoved includes each removed object's digest: one per line in
+	// text, the removedObjects array in JSON.
+	ListRemoved bool
+	// Human renders sizes in binary units (KiB, MiB, ...) in text output.
+	// JSON always carries exact byte counts.
+	Human bool
+}
+
+// WriteGCReport renders a collection report to w in the requested format.
+func WriteGCReport(w io.Writer, format Format, r *knarr.GCReport, opts GCOutputOptions) error {
+	out := GCOutput{
+		ObjectsRemoved:  r.ObjectsRemoved,
+		BytesFreed:      r.BytesFreed,
+		BindingsRemoved: r.BindingsRemoved,
+		InUseSkipped:    r.InUseSkipped,
+		DryRun:          opts.DryRun,
+	}
+	if opts.ListRemoved {
+		out.RemovedObjects = r.Removed
+	}
+	if format == FormatJSON {
+		return emitJSON(w, out)
+	}
+	verb := "removed"
+	if opts.DryRun {
+		verb = "would remove"
+	}
+	for _, d := range out.RemovedObjects {
+		if _, err := fmt.Fprintln(w, d); err != nil {
+			return err
+		}
+	}
+	size := fmt.Sprintf("%d %s", out.BytesFreed, plural64(out.BytesFreed, "byte"))
+	if opts.Human {
+		size = humanBytes(out.BytesFreed)
+	}
+	_, err := fmt.Fprintf(w, "%s %d %s (%s) and %d %s; %d in use kept\n",
+		verb, out.ObjectsRemoved, plural(out.ObjectsRemoved, "object"), size,
+		out.BindingsRemoved, plural(out.BindingsRemoved, "binding"), out.InUseSkipped)
+	return err
+}
+
+func plural(n int, noun string) string {
+	return plural64(int64(n), noun)
+}
+
+func plural64(n int64, noun string) string {
+	if n == 1 {
+		return noun
+	}
+	return noun + "s"
+}

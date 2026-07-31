@@ -73,11 +73,16 @@ reference — or by a bare digest naming its index — is seen here. Drop it wit
   pins the index while this one pins the manifest, since both record the same
   identity.
 - **No object reclamation.** Objects remain in the content-addressed store after
-  removal.
-- **Removing a mounted image is allowed.** The kernel keeps an active composefs
-  mount alive; `remove` only forgets the index entries, so the mount keeps
-  serving until unmounted — but a new `knarr mount` of that reference fails
-  until the image is pulled again.
+  removal; `knarr gc` is what reclaims content nothing wants (see
+  [gc.md](gc.md)).
+- **Removing a mounted image is allowed.** Like unlinking an open file:
+  `remove` only forgets the index entries — the name is gone, the content
+  stays — so the mount keeps serving until unmounted, but a new `knarr mount`
+  of that reference fails until the image is pulled again. A later `knarr gc`
+  keeps a mounted metadata-only image's content through its in-use lock and
+  reclaims it after unmount; a plain composefs mount is not lock-covered past
+  setup, so hold an image you keep mounted while removing its reference (see
+  [gc.md](gc.md)).
 - **Invalid reference records are skipped.** `ls` warns about and skips a
   corrupt record instead of failing; a skipped record is not a usable reference
   and re-pulling recreates it. A valid reference whose image binding is missing
