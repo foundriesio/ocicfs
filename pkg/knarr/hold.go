@@ -31,6 +31,17 @@ func (e *engine) Release(ctx context.Context, ref, holder string) error {
 }
 
 func (e *engine) hold(ctx context.Context, ref, holder string) error {
+	// The store lock is held shared across the whole hold: presence is checked
+	// before the marker is written, and a concurrent sweep between the two
+	// would strand the holder on absent content. It nests outside the
+	// per-digest lock below; gc takes only the store lock, so the order cannot
+	// deadlock.
+	unlockStore, err := e.lockStoreShared()
+	if err != nil {
+		return err
+	}
+	defer unlockStore()
+
 	root, err := e.resolveLocalRef(ctx, ref)
 	if root == "" {
 		return err

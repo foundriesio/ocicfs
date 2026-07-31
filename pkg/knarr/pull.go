@@ -42,6 +42,19 @@ func (e *engine) pull(ctx context.Context, ref string, opts ...PullOption) (*Ima
 		opt(&cfg)
 	}
 
+	// The store lock is held shared across the whole pull: objects are written
+	// before the ref record that makes them wanted, and a concurrent sweep in
+	// that window would eat the staged image. The wait is not interruptible;
+	// the ctx gate right after is the single pre-mutation cancellation check.
+	unlock, err := e.lockStoreShared()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	src, root, err := pullSource(ctx, ref, cfg)
 	if err != nil {
 		return nil, err
