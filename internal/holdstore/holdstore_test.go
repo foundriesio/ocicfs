@@ -4,6 +4,7 @@
 package holdstore
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -266,4 +267,62 @@ func withLock(t *testing.T, s *Store, root digest.Digest, fn func()) {
 	}
 	defer unlock()
 	fn()
+}
+
+func TestListReturnsHeldDigests(t *testing.T) {
+	s := newStore(t)
+	first := digest.SHA256.FromString("list first")
+	second := digest.SHA256.FromString("list second")
+	withLock(t, s, first, func() {
+		if err := s.Hold(first, "cli"); err != nil {
+			t.Fatalf("Hold: %v", err)
+		}
+	})
+	withLock(t, s, second, func() {
+		if err := s.Hold(second, "agent"); err != nil {
+			t.Fatalf("Hold: %v", err)
+		}
+	})
+	// An empty holder directory — a crash between a last release's unlink and
+	// its rmdir — has no holders and must not be listed.
+	emptyDir, err := s.holderDir(digest.SHA256.FromString("list empty"))
+	if err != nil {
+		t.Fatalf("holderDir: %v", err)
+	}
+	if err := os.MkdirAll(emptyDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	got, err := s.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	want := []digest.Digest{first, second}
+	if want[0] > want[1] {
+		want[0], want[1] = want[1], want[0]
+	}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("List = %v, want %v", got, want)
+	}
+}
+
+// TestListRejectsForeignEntry pins the census's strictness: gc marks wanted
+// content from List, so an unparseable entry must fail the listing instead of
+// silently unprotecting whatever its holders pinned.
+func TestListRejectsForeignEntry(t *testing.T) {
+	s := newStore(t)
+	root := digest.SHA256.FromString("list strict")
+	withLock(t, s, root, func() {
+		if err := s.Hold(root, "cli"); err != nil {
+			t.Fatalf("Hold: %v", err)
+		}
+	})
+	foreign := filepath.Join(s.root, "holds", "sha256", "zz", "not-a-digest")
+	if err := os.MkdirAll(foreign, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	if _, err := s.List(context.Background()); err == nil || !strings.Contains(err.Error(), "foreign entry") {
+		t.Fatalf("List = %v, want a foreign-entry error", err)
+	}
 }

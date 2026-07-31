@@ -28,6 +28,7 @@
 package holdstore
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -196,6 +197,68 @@ func (s *Store) Clear(root digest.Digest) error {
 	// directory.
 	if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) && !isNotEmpty(err) {
 		slog.Warn("holdstore: failed to remove empty holder dir", "path", dir, "err", err)
+	}
+	return nil
+}
+
+// List returns every digest that has at least one holder, sorted. It is
+// strict where the per-digest readers are lenient: gc marks wanted content
+// from this census, so an entry under holds/sha256 that does not reconstruct
+// into a valid digest is an error rather than a skip — skipped, it would
+// silently unprotect whatever its holders pinned. An empty holder directory
+// (a crash between a last release's unlink and its rmdir) has no holders and
+// is not listed. No per-digest locks are taken: gc reads the census under the
+// store's exclusive lock, which excludes every mutating verb.
+func (s *Store) List(ctx context.Context) ([]digest.Digest, error) {
+	base := filepath.Join(s.root, "holds", "sha256")
+	shards, err := os.ReadDir(base)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("holdstore: read holds: %w", err)
+	}
+	var out []digest.Digest
+	for _, shard := range shards {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !shard.IsDir() || len(shard.Name()) != 2 {
+			return nil, fmt.Errorf("holdstore: foreign entry %q under holds", shard.Name())
+		}
+		rests, err := os.ReadDir(filepath.Join(base, shard.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("holdstore: read holds shard %s: %w", shard.Name(), err)
+		}
+		for _, rest := range rests {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			d := digest.NewDigestFromEncoded(digest.SHA256, shard.Name()+rest.Name())
+			if !rest.IsDir() || digestutil.ValidateSHA256(d) != nil {
+				return nil, fmt.Errorf("holdstore: foreign entry %q under holds shard %s", rest.Name(), shard.Name())
+			}
+			holders, err := os.ReadDir(filepath.Join(base, shard.Name(), rest.Name()))
+			if err != nil {
+				return nil, fmt.Errorf("holdstore: read holders of %s: %w", d, err)
+			}
+			if len(holders) > 0 {
+				out = append(out, d)
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
+// PruneEmptyDirs removes the empty directories the hold tree accumulates: a
+// crash-stranded holder directory and the shard level above it. The .locks
+// tree is left alone — removing a lock file whose flock a process still rides
+// would split the lock's identity. Call it only under the store-exclusive gc
+// lock.
+func (s *Store) PruneEmptyDirs() error {
+	if err := durable.PruneEmptyDirs(filepath.Join(s.root, "holds", "sha256"), 2); err != nil {
+		return fmt.Errorf("holdstore: %w", err)
 	}
 	return nil
 }

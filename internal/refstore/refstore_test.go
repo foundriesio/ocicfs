@@ -5,6 +5,7 @@ package refstore
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -426,5 +427,42 @@ func rewriteRecord(t *testing.T, root, ref string, mutate func(map[string]any)) 
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil { // #nosec G306 G703 -- test rewrites a path it wrote
 		t.Fatalf("WriteFile: %v", err)
+	}
+}
+
+// TestListStrictErrorsOnMalformedRecord pins the gc census's strictness: a
+// record List would skip with a warning must fail ListStrict, because a
+// skipped record silently unprotects its image from the sweep.
+func TestListStrictErrorsOnMalformedRecord(t *testing.T) {
+	root := t.TempDir()
+	s, err := New(root)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	desc := ocispec.Descriptor{
+		MediaType: "application/vnd.oci.image.manifest.v1+json",
+		Digest:    digest.FromString("resolved"),
+		Size:      42,
+	}
+	if err := s.Put("app:v1", desc, desc, time.Unix(1720000000, 0).UTC(), []string{"linux/amd64"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	records, err := s.ListStrict(context.Background())
+	if err != nil || len(records) != 1 || records[0].Ref != "app:v1" {
+		t.Fatalf("ListStrict on healthy store = %v, %v, want the one record", records, err)
+	}
+
+	dir := filepath.Join(root, "refs", "sha256", "aa")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	path := filepath.Join(dir, strings.Repeat("b", 62)+".json")
+	if err := os.WriteFile(path, []byte(`{"schema":"wrong"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := s.ListStrict(context.Background()); err == nil || !strings.Contains(err.Error(), "invalid ref record") {
+		t.Fatalf("ListStrict = %v, want the invalid-record error", err)
 	}
 }

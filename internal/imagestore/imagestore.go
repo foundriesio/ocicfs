@@ -42,9 +42,12 @@
 package imagestore
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -186,6 +189,115 @@ func (s *Store) Delete(root digest.Digest, p ocispec.Platform) error {
 		return fmt.Errorf("imagestore: delete binding: %w", err)
 	}
 	return nil
+}
+
+// PruneEmptyDirs removes the empty directories binding removal leaves behind:
+// each image's own directory and the shard level above it. Call it only under
+// the store-exclusive gc lock.
+func (s *Store) PruneEmptyDirs() error {
+	if err := durable.PruneEmptyDirs(filepath.Join(s.root, "images", "sha256"), 2); err != nil {
+		return fmt.Errorf("imagestore: %w", err)
+	}
+	return nil
+}
+
+// Platforms returns the platforms that have a binding on disk for root, each
+// read from the binding document itself and required to agree with its
+// filename. It is strict: gc marks an image's wanted objects through every
+// binding this returns, so a binding file that does not decode, or whose
+// recorded platform does not name the file it sits in, is an error rather
+// than a skip — skipped, its composefs image and objects would be swept while
+// the identity is still wanted. A root with no binding directory has no
+// platforms and returns nil.
+func (s *Store) Platforms(ctx context.Context, root digest.Digest) ([]ocispec.Platform, error) {
+	if err := digestutil.ValidateSHA256(root); err != nil {
+		return nil, fmt.Errorf("imagestore: root digest: %w", err)
+	}
+	dir := filepath.Join(s.root, "images", "sha256", root.Hex()[:2], root.Hex()[2:])
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("imagestore: read bindings of %s: %w", root, err)
+	}
+	platforms := make([]ocispec.Platform, 0, len(entries))
+	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		p, err := bindingPlatform(filepath.Join(dir, e.Name()), e.Name())
+		if err != nil {
+			return nil, fmt.Errorf("imagestore: binding of %s: %w", root, err)
+		}
+		platforms = append(platforms, p)
+	}
+	return platforms, nil
+}
+
+// Walk calls fn for every binding on disk as its (root, platform) key. Unlike
+// Platforms it is lenient: the walk feeds the orphan-binding sweep, where a
+// malformed entry that cannot be keyed simply is not deleted, so it is
+// skipped with a warning rather than failing the whole walk.
+func (s *Store) Walk(ctx context.Context, fn func(root digest.Digest, p ocispec.Platform) error) error {
+	base := filepath.Join(s.root, "images", "sha256")
+	err := filepath.WalkDir(base, func(path string, de fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return fmt.Errorf("imagestore: walk bindings: %w", walkErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if de.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(base, path)
+		if err != nil {
+			return fmt.Errorf("imagestore: walk bindings: %w", err)
+		}
+		parts := strings.Split(rel, string(filepath.Separator))
+		if len(parts) != 3 || len(parts[0]) != 2 {
+			slog.Warn("imagestore: skipping foreign entry under images", "path", path)
+			return nil
+		}
+		root := digest.NewDigestFromEncoded(digest.SHA256, parts[0]+parts[1])
+		if digestutil.ValidateSHA256(root) != nil {
+			slog.Warn("imagestore: skipping foreign entry under images", "path", path)
+			return nil
+		}
+		p, err := bindingPlatform(path, parts[2])
+		if err != nil {
+			slog.Warn("imagestore: skipping unreadable binding", "path", path, "err", err)
+			return nil
+		}
+		return fn(root, p)
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+// bindingPlatform reads the platform a binding file records and requires it
+// to name the file it sits in.
+func bindingPlatform(path, name string) (ocispec.Platform, error) {
+	data, err := os.ReadFile(path) // #nosec G304 -- store-owned binding path
+	if err != nil {
+		return ocispec.Platform{}, fmt.Errorf("read %s: %w", name, err)
+	}
+	var doc bindingDoc
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return ocispec.Platform{}, fmt.Errorf("decode %s: %w", name, err)
+	}
+	p := ocispec.Platform{OS: doc.Platform.OS, Architecture: doc.Platform.Architecture, Variant: doc.Platform.Variant}
+	_, filename, err := platformPath(p)
+	if err != nil {
+		return ocispec.Platform{}, fmt.Errorf("platform of %s: %w", name, err)
+	}
+	if filename+".json" != name {
+		return ocispec.Platform{}, fmt.Errorf("binding %s records platform %q, which names %s.json", name, doc.Platform, filename)
+	}
+	return p, nil
 }
 
 const (

@@ -33,12 +33,15 @@
 // document the reference itself landed on, an image index for a tag or an
 // index-pinned ref and an image manifest otherwise. It is unauthenticated local
 // bookkeeping -- an operator reads it to see what a pull anchored on, and no
-// verification takes it as an input. "identity" is the platform image manifest
+// trust decision takes it as an input; gc, though, resolves it as a wanted
+// root to keep the pulled document reachable, so a record whose resolved
+// chain is broken aborts a collection. "identity" is the platform image manifest
 // the reference names, the one digest the object store, the image bindings, and
 // the holds are all keyed by; every lookup a verb makes goes through it.
 package refstore
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -123,11 +126,27 @@ func (s *Store) Put(ref string, resolved, identity ocispec.Descriptor, pulledAt 
 // failing the whole listing, so one corrupt file cannot brick every other
 // image's ls and remove.
 func (s *Store) List() ([]Record, error) {
+	return s.list(context.Background(), false)
+}
+
+// ListStrict returns all reference records sorted by exact ref string,
+// failing on a record that does not decode and validate. It is the census gc
+// marks wanted content from: where List's lenient skip suits verbs that only
+// report, a record skipped here would silently unprotect its image from the
+// sweep, so a corrupt record is an error naming the file to repair or remove.
+func (s *Store) ListStrict(ctx context.Context) ([]Record, error) {
+	return s.list(ctx, true)
+}
+
+func (s *Store) list(ctx context.Context, strict bool) ([]Record, error) {
 	base := filepath.Join(s.root, "refs", "sha256")
 	var records []Record
 	err := filepath.WalkDir(base, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return fmt.Errorf("refstore: access %s: %w", path, walkErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		if d.IsDir() || filepath.Ext(path) != ".json" {
 			return nil
@@ -138,6 +157,9 @@ func (s *Store) List() ([]Record, error) {
 			return nil
 		}
 		if err != nil {
+			if strict {
+				return fmt.Errorf("refstore: invalid ref record %s: %w", path, err)
+			}
 			slog.Warn("refstore: skipping invalid ref record", "path", path, "err", err)
 			return nil
 		}
@@ -177,6 +199,15 @@ func (s *Store) Delete(ref string) error {
 			return nil
 		}
 		return fmt.Errorf("refstore: delete ref: %w", err)
+	}
+	return nil
+}
+
+// PruneEmptyDirs removes the empty shard directories record removal leaves
+// behind. Call it only under the store-exclusive gc lock.
+func (s *Store) PruneEmptyDirs() error {
+	if err := durable.PruneEmptyDirs(filepath.Join(s.root, "refs", "sha256"), 1); err != nil {
+		return fmt.Errorf("refstore: %w", err)
 	}
 	return nil
 }

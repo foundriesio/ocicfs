@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/opencontainers/go-digest"
+	"golang.org/x/sys/unix"
 
 	"github.com/foundriesio/knarr/internal/devtest"
 	"github.com/foundriesio/knarr/internal/verity"
@@ -445,5 +446,188 @@ func TestOpenRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(got, content) {
 		t.Fatalf("read back %q, want %q", got, content)
+	}
+}
+
+func TestWalkListsObjects(t *testing.T) {
+	s := newVerityStore(t)
+	ctx := context.Background()
+	first, _, err := s.WriteObject(ctx, strings.NewReader("walk one"))
+	if err != nil {
+		t.Fatalf("WriteObject: %v", err)
+	}
+	second, _, err := s.WriteObject(ctx, strings.NewReader("walk two!"))
+	if err != nil {
+		t.Fatalf("WriteObject: %v", err)
+	}
+	// A foreign entry without the shard shape is skipped, not fatal: it is not
+	// a stored object, and skipping only retains it.
+	if err := os.WriteFile(filepath.Join(s.ObjectsDir(), "stray"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	got := map[digest.Digest]int64{}
+	if err := s.Walk(ctx, func(d digest.Digest, size int64) error {
+		got[d] = size
+		return nil
+	}); err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if len(got) != 2 || got[first] != int64(len("walk one")) || got[second] != int64(len("walk two!")) {
+		t.Fatalf("Walk = %v, want the two written objects with their sizes", got)
+	}
+}
+
+func TestRemoveDeletesBothNames(t *testing.T) {
+	s := newVerityStore(t)
+	ctx := context.Background()
+	d, fsv, err := s.WriteObject(ctx, strings.NewReader("remove me"))
+	if err != nil {
+		t.Fatalf("WriteObject: %v", err)
+	}
+	objPath, err := s.ObjectPath(d)
+	if err != nil {
+		t.Fatalf("ObjectPath: %v", err)
+	}
+	hex := strings.TrimPrefix(fsv, "sha256:")
+	viewPath := filepath.Join(s.ViewDir(), hex[:2], hex[2:])
+	if _, err := os.Lstat(viewPath); err != nil {
+		t.Fatalf("view name missing before remove: %v", err)
+	}
+
+	if err := s.Remove(d); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if _, err := os.Lstat(objPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("object still present: %v", err)
+	}
+	if _, err := os.Lstat(viewPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("view name still present: %v", err)
+	}
+	// Removing an absent object is a no-op success.
+	if err := s.Remove(d); err != nil {
+		t.Fatalf("Remove absent: %v", err)
+	}
+}
+
+// TestRemoveRefusesInUseObject pins the sweep side of the in-use protocol: an
+// object whose inode carries a shared lock — a mounter — must survive Remove
+// with ErrInUse, and fall once the lock is gone.
+func TestRemoveRefusesInUseObject(t *testing.T) {
+	s := newVerityStore(t)
+	ctx := context.Background()
+	d, _, err := s.WriteObject(ctx, strings.NewReader("in use"))
+	if err != nil {
+		t.Fatalf("WriteObject: %v", err)
+	}
+	path, err := s.ObjectPath(d)
+	if err != nil {
+		t.Fatalf("ObjectPath: %v", err)
+	}
+	mounter, err := os.Open(path) // #nosec G304 -- store path derived in test
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := mounter.Close(); err != nil {
+			t.Errorf("close mounter: %v", err)
+		}
+	})
+	if err := unix.Flock(int(mounter.Fd()), unix.LOCK_SH); err != nil { // #nosec G115 -- a file descriptor always fits in int
+		t.Fatalf("Flock: %v", err)
+	}
+
+	if err := s.Remove(d); !errors.Is(err, ErrInUse) {
+		t.Fatalf("Remove = %v, want ErrInUse", err)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("in-use object was deleted: %v", err)
+	}
+
+	if err := unix.Flock(int(mounter.Fd()), unix.LOCK_UN); err != nil { // #nosec G115 -- a file descriptor always fits in int
+		t.Fatalf("Funlock: %v", err)
+	}
+	if err := s.Remove(d); err != nil {
+		t.Fatalf("Remove after unlock: %v", err)
+	}
+}
+
+func TestSweepViewOrphans(t *testing.T) {
+	s := newVerityStore(t)
+	ctx := context.Background()
+	orphan, orphanFsv, err := s.WriteObject(ctx, strings.NewReader("orphan"))
+	if err != nil {
+		t.Fatalf("WriteObject: %v", err)
+	}
+	_, keptFsv, err := s.WriteObject(ctx, strings.NewReader("kept"))
+	if err != nil {
+		t.Fatalf("WriteObject: %v", err)
+	}
+	objPath, err := s.ObjectPath(orphan)
+	if err != nil {
+		t.Fatalf("ObjectPath: %v", err)
+	}
+	if err := os.Remove(objPath); err != nil {
+		t.Fatalf("Remove object name: %v", err)
+	}
+
+	orphanHex := strings.TrimPrefix(orphanFsv, "sha256:")
+	orphanName := orphanHex[:2] + "/" + orphanHex[2:]
+
+	// A keep predicate claiming the orphan preserves it: the view name is the
+	// copy mounts serve, so a claimed orphan is wanted content, not garbage.
+	n, err := s.SweepViewOrphans(ctx, func(name string) bool { return name == orphanName })
+	if err != nil {
+		t.Fatalf("SweepViewOrphans with keep: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("SweepViewOrphans with keep = %d, want 0", n)
+	}
+	if _, err := os.Lstat(filepath.Join(s.ViewDir(), orphanHex[:2], orphanHex[2:])); err != nil {
+		t.Fatalf("kept view entry swept: %v", err)
+	}
+
+	n, err = s.SweepViewOrphans(ctx, nil)
+	if err != nil {
+		t.Fatalf("SweepViewOrphans: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("SweepViewOrphans = %d, want 1", n)
+	}
+	if _, err := os.Lstat(filepath.Join(s.ViewDir(), orphanHex[:2], orphanHex[2:])); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan view entry survived: %v", err)
+	}
+	keptHex := strings.TrimPrefix(keptFsv, "sha256:")
+	if _, err := os.Lstat(filepath.Join(s.ViewDir(), keptHex[:2], keptHex[2:])); err != nil {
+		t.Fatalf("healthy view entry swept: %v", err)
+	}
+}
+
+func TestPruneEmptyDirs(t *testing.T) {
+	s := newTestStore(t)
+	empties := []string{
+		filepath.Join(s.ObjectsDir(), "aa"),
+		filepath.Join(s.ViewDir(), "bb"),
+	}
+	populated := filepath.Join(s.ObjectsDir(), "cc")
+	for _, dir := range append(empties, populated) {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatalf("Mkdir: %v", err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(populated, "object"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if err := s.PruneEmptyDirs(); err != nil {
+		t.Fatalf("PruneEmptyDirs: %v", err)
+	}
+	for _, dir := range empties {
+		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("empty shard dir %s survived: %v", dir, err)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(populated, "object")); err != nil {
+		t.Fatalf("populated shard dir pruned: %v", err)
 	}
 }

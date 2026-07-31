@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -33,6 +34,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/foundriesio/knarr/internal/digestutil"
+	"github.com/foundriesio/knarr/internal/durable"
 	"github.com/foundriesio/knarr/internal/verity"
 )
 
@@ -442,6 +444,167 @@ func (s *Store) Sync() error {
 // TempDir returns the store-owned temp directory used for staging and builds.
 func (s *Store) TempDir() string {
 	return filepath.Join(s.root, "tmp")
+}
+
+// ErrInUse reports that an object cannot be removed because a mounter holds
+// the shared in-use lock on it.
+var ErrInUse = errors.New("objectstore: object in use")
+
+// Walk calls fn for every stored object with its digest and size. An entry
+// that does not have the store's two-level sha256 shard shape, or is not a
+// regular file, is skipped with a warning rather than failing the walk: a
+// foreign entry is not a stored object, and skipping it only retains it.
+func (s *Store) Walk(ctx context.Context, fn func(d digest.Digest, size int64) error) error {
+	base := s.objectPath("")
+	return filepath.WalkDir(base, func(path string, de fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return fmt.Errorf("objectstore: walk objects: %w", walkErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if de.IsDir() {
+			return nil
+		}
+		d, ok := shardedDigest(base, path)
+		if !ok || !de.Type().IsRegular() {
+			slog.Warn("objectstore: skipping foreign entry in object store", "path", path)
+			return nil
+		}
+		fi, err := de.Info()
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("objectstore: stat object %s: %w", d, err)
+		}
+		return fn(d, fi.Size())
+	})
+}
+
+// Remove unlinks the stored object d, both its CAS name and its fs-verity
+// view name, unless a mounter holds the shared in-use lock on it, in which
+// case it returns an error matching ErrInUse. The unlinks happen while the
+// exclusive lock is held, pairing with the mount side, which takes the shared
+// lock and then refuses an inode whose name count dropped to zero. The view
+// name goes first: a crash between the unlinks then leaves the authoritative
+// CAS object with a missing view link, which the next deduplicating write
+// repairs, where the reverse order would leave an orphan view inode that
+// fails that write's same-inode check. An absent object removes nothing and
+// succeeds.
+func (s *Store) Remove(d digest.Digest) error {
+	path, err := s.ObjectPath(d)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0) // #nosec G304 -- digest-derived object path
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("objectstore: open object %s: %w", d, err)
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			slog.Warn("objectstore: failed to close object", "digest", d, "err", err)
+		}
+	}()
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil { // #nosec G115 -- a file descriptor always fits in int
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return fmt.Errorf("objectstore: object %s: %w", d, ErrInUse)
+		}
+		return fmt.Errorf("objectstore: lock object %s: %w", d, err)
+	}
+	fsv, err := verity.Measure(f)
+	if err != nil {
+		return fmt.Errorf("objectstore: measure object %s: %w", d, err)
+	}
+	viewPath := s.viewPath(strings.TrimPrefix(fsv, "sha256:"))
+	if err := os.Remove(viewPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("objectstore: remove view name %s: %w", viewPath, err)
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("objectstore: remove object %s: %w", d, err)
+	}
+	return nil
+}
+
+// SweepViewOrphans removes fs-verity view entries whose CAS partner is gone —
+// the view name is always a second hardlink to a CAS object, so a view file
+// whose inode has a single name lost its partner to external damage. An
+// orphan whose view-relative name the keep predicate claims is preserved
+// with a warning instead of deleted: the view name is the copy mounts
+// actually serve, so a claimed orphan is the last copy of wanted content,
+// not garbage. A nil predicate keeps nothing. It returns the number of
+// entries removed.
+func (s *Store) SweepViewOrphans(ctx context.Context, keep func(name string) bool) (int, error) {
+	base := s.viewPath("")
+	removed := 0
+	err := filepath.WalkDir(base, func(path string, de fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return fmt.Errorf("objectstore: walk view: %w", walkErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if de.IsDir() || !de.Type().IsRegular() {
+			return nil
+		}
+		var st unix.Stat_t
+		if err := unix.Lstat(path, &st); err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				return nil
+			}
+			return fmt.Errorf("objectstore: stat view entry %s: %w", path, err)
+		}
+		if st.Nlink != 1 {
+			return nil
+		}
+		if keep != nil {
+			if rel, err := filepath.Rel(base, path); err == nil && keep(filepath.ToSlash(rel)) {
+				slog.Warn("objectstore: keeping wanted view entry whose CAS name is missing", "path", path)
+				return nil
+			}
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) { // #nosec G122 -- knarr-private store tree, path from the walk itself
+			return fmt.Errorf("objectstore: remove view orphan %s: %w", path, err)
+		}
+		removed++
+		return nil
+	})
+	return removed, err
+}
+
+// PruneEmptyDirs removes the empty shard directories object removal leaves
+// behind, in both the CAS tree and the fs-verity view. Call it only under the
+// store-exclusive gc lock, which excludes every writer that could be
+// re-creating a shard.
+func (s *Store) PruneEmptyDirs() error {
+	for _, dir := range []string{s.objectPath(""), s.viewPath("")} {
+		if err := durable.PruneEmptyDirs(dir, 1); err != nil {
+			return fmt.Errorf("objectstore: %w", err)
+		}
+	}
+	return nil
+}
+
+// shardedDigest reconstructs the sha256 digest a store path names, reporting
+// false for a path that does not have the <aa>/<rest> shard shape of a valid
+// digest.
+func shardedDigest(base, path string) (digest.Digest, bool) {
+	rel, err := filepath.Rel(base, path)
+	if err != nil {
+		return "", false
+	}
+	shard, rest, found := strings.Cut(rel, string(filepath.Separator))
+	if !found || len(shard) != 2 || strings.ContainsRune(rest, filepath.Separator) {
+		return "", false
+	}
+	d := digest.NewDigestFromEncoded(digest.SHA256, shard+rest)
+	if err := digestutil.ValidateSHA256(d); err != nil {
+		return "", false
+	}
+	return d, true
 }
 
 // objectPath returns the on-disk path for a given digest hex string.

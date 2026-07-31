@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 // WriteFile atomically and durably writes data to path using a temp file in the
@@ -102,6 +103,38 @@ func Remove(path string) error {
 	}
 	if err := syncDir(filepath.Dir(path)); err != nil {
 		return fmt.Errorf("durable: fsync parent: %w", err)
+	}
+	return nil
+}
+
+// PruneEmptyDirs removes the empty subdirectories that file removal leaves
+// behind in a store's hash-fan-out tree, walking depth levels below root,
+// deepest first. root itself is never removed and an absent root is a no-op;
+// a directory that is not empty simply stays. Call it only under the store's
+// exclusive gc lock: the lock is what keeps a writer from re-creating a
+// directory between this rmdir and the writer's file creation.
+func PruneEmptyDirs(root string, depth int) error {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("durable: prune %s: %w", root, err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		path := filepath.Join(root, e.Name())
+		if depth > 1 {
+			if err := PruneEmptyDirs(path, depth-1); err != nil {
+				return err
+			}
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) &&
+			!errors.Is(err, syscall.ENOTEMPTY) && !errors.Is(err, syscall.EEXIST) {
+			return fmt.Errorf("durable: prune %s: %w", path, err)
+		}
 	}
 	return nil
 }

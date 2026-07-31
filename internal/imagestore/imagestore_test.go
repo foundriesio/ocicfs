@@ -4,6 +4,7 @@
 package imagestore
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -337,5 +338,120 @@ func TestPutSerializesCanonicalFalse(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"canonical":false`) {
 		t.Fatalf("binding JSON must carry an explicit canonical:false, got:\n%s", data)
+	}
+}
+
+func validTestBinding(cfs, fsv digest.Digest) Binding {
+	return Binding{
+		Descriptor: ocispec.Descriptor{
+			MediaType: "application/vnd.knarr.composefs.image.v1+erofs",
+			Digest:    cfs,
+			Size:      123,
+		},
+		FsverityDigest: fsv.String(),
+	}
+}
+
+func TestPlatformsListsBindings(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	root := digest.SHA256.FromString("platforms root")
+	b := validTestBinding(digest.SHA256.FromString("cfs"), digest.SHA256.FromString("fsv"))
+	if err := s.Put(root, ocispec.Platform{OS: "linux", Architecture: "amd64"}, b); err != nil {
+		t.Fatalf("Put amd64: %v", err)
+	}
+	// The default variant canonicalizes away, in the filename and the document.
+	if err := s.Put(root, ocispec.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"}, b); err != nil {
+		t.Fatalf("Put arm64/v8: %v", err)
+	}
+
+	got, err := s.Platforms(context.Background(), root)
+	if err != nil {
+		t.Fatalf("Platforms: %v", err)
+	}
+	want := map[string]bool{"linux/amd64": true, "linux/arm64": true}
+	names := make([]string, len(got))
+	for i, p := range got {
+		names[i] = p.OS + "/" + p.Architecture
+		if p.Variant != "" {
+			names[i] += "/" + p.Variant
+		}
+	}
+	if len(names) != 2 || !want[names[0]] || !want[names[1]] || names[0] == names[1] {
+		t.Fatalf("Platforms = %v, want linux/amd64 and linux/arm64", names)
+	}
+
+	none, err := s.Platforms(context.Background(), digest.SHA256.FromString("no bindings"))
+	if err != nil || len(none) != 0 {
+		t.Fatalf("Platforms of absent root = %v, %v, want none", none, err)
+	}
+}
+
+// TestPlatformsRejectsCorruptBinding pins the strictness gc's mark phase
+// relies on: a binding that cannot be decoded must fail the listing, not
+// vanish from it, because a vanished binding would sweep a wanted image.
+func TestPlatformsRejectsCorruptBinding(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	root := digest.SHA256.FromString("corrupt root")
+	b := validTestBinding(digest.SHA256.FromString("cfs"), digest.SHA256.FromString("fsv"))
+	if err := s.Put(root, ocispec.Platform{OS: "linux", Architecture: "amd64"}, b); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	dir := filepath.Join(s.root, "images", "sha256", root.Hex()[:2], root.Hex()[2:])
+	if err := os.WriteFile(filepath.Join(dir, "linux-arm64.json"), []byte("not json"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := s.Platforms(context.Background(), root); err == nil || !strings.Contains(err.Error(), "decode") {
+		t.Fatalf("Platforms = %v, want a decode error", err)
+	}
+
+	// A binding whose recorded platform does not name its file is a mismatch,
+	// not a listing entry.
+	if err := os.WriteFile(filepath.Join(dir, "linux-arm64.json"), []byte(`{"schema":"application/vnd.knarr.cfs-binding.v1+json","platform":{"os":"linux","architecture":"riscv64"}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := s.Platforms(context.Background(), root); err == nil || !strings.Contains(err.Error(), "names linux-riscv64.json") {
+		t.Fatalf("Platforms = %v, want a filename-mismatch error", err)
+	}
+}
+
+func TestWalkListsBindingsAndSkipsForeign(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	b := validTestBinding(digest.SHA256.FromString("cfs"), digest.SHA256.FromString("fsv"))
+	first := digest.SHA256.FromString("walk first")
+	second := digest.SHA256.FromString("walk second")
+	if err := s.Put(first, ocispec.Platform{OS: "linux", Architecture: "amd64"}, b); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := s.Put(second, ocispec.Platform{OS: "linux", Architecture: "arm64"}, b); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	// Foreign entries are skipped, not fatal: the walk feeds deletion, and a
+	// file it cannot key simply is not deleted.
+	if err := os.WriteFile(filepath.Join(s.root, "images", "sha256", "stray.json"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	got := map[string]bool{}
+	err = s.Walk(context.Background(), func(root digest.Digest, p ocispec.Platform) error {
+		got[root.String()+" "+p.OS+"/"+p.Architecture] = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if len(got) != 2 ||
+		!got[first.String()+" linux/amd64"] ||
+		!got[second.String()+" linux/arm64"] {
+		t.Fatalf("Walk = %#v, want both bindings", got)
 	}
 }
