@@ -360,4 +360,66 @@ echo "==== lifecycle 4: the sealed image (pull re-verifies the seal) ===="
 # seal produced an index, and the sealed manifest itself otherwise.
 run_lifecycle "127.0.0.1:$port/smoke@$sealed" "$child" "$sealed" pull "127.0.0.1:$port/smoke@$sealed"
 
-echo "SMOKE OK: purpose-built image sealed, cross-checked three ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export and a seal round against the registry (checks passed)"
+echo "==== seal enforcement: mount trusts the annotation over the binding ===="
+# The lifecycle legs removed their images, so re-pull the two sealed ones:
+# the multi-arch smoke image is the mount under test, and the purpose-built
+# image supplies a different, internally consistent object for the
+# repointing check. Last leg by design -- it leaves knowingly wrong bindings
+# behind between assertions.
+sref="127.0.0.1:$port/smoke@$sealed"
+"${KN[@]}" pull "$sref"
+"${KN[@]}" pull "127.0.0.1:$port/custom@$csealed"
+# Each identity was pulled for exactly one platform, so its binding is the
+# single JSON file in the identity's directory. Globbing sidesteps the
+# binding filename's platform normalization (a default variant like
+# arm64/v8 is canonicalized away).
+shex="${child#sha256:}"
+sbind=$(echo "$STORE/images/sha256/${shex:0:2}/${shex:2}/"*.json)
+chex="${csealed#sha256:}"
+cbind=$(echo "$STORE/images/sha256/${chex:0:2}/${chex:2}/"*.json)
+[ -f "$sbind" ] || fail "no sealed-image binding at $sbind"
+[ -f "$cbind" ] || fail "no purpose-built binding at $cbind"
+recorded="$(jq -r .rootfs.fsverity.digest "$sbind")"
+
+echo "== tampered binding digest (expect the mount to trust the seal) =="
+tmp="$(mktemp)"
+jq '.rootfs.fsverity.digest = "sha256:'"$(printf '0%.0s' {1..64})"'"' "$sbind" >"$tmp" && mv "$tmp" "$sbind"
+"${KN[@]}" mount "$sref" "$MNT" || fail "mount did not trust the sealing annotation over the tampered binding"
+[ -n "$(ls -A "$MNT")" ] || fail "sealed mount is empty"
+"${KN[@]}" unmount "$MNT"
+
+echo "== re-pull (expect the tampered binding healed) =="
+"${KN[@]}" pull "$sref"
+[ "$(jq -r .rootfs.fsverity.digest "$sbind")" = "$recorded" ] || fail "re-pull did not restore the binding digest"
+
+echo "== repointed binding (expect the mount to fail on the seal) =="
+tmp="$(mktemp)"
+jq --slurpfile o "$cbind" \
+	'.rootfs.descriptor = $o[0].rootfs.descriptor | .rootfs.fsverity.digest = $o[0].rootfs.fsverity.digest' \
+	"$sbind" >"$tmp" && mv "$tmp" "$sbind"
+if out="$("${KN[@]}" mount "$sref" "$MNT" 2>&1)"; then
+	fail "mount succeeded on a binding repointed at another object"
+fi
+printf '%s\n' "$out"
+printf '%s\n' "$out" | grep -qF "sealing annotation claims" || fail "repointed-binding mount did not name the sealing annotation"
+
+echo "== plain re-pull (expect it to fail closed on the disagreement) =="
+# A repointed binding is an integrity disagreement, not staleness, so a plain
+# re-pull must refuse rather than paper over it; remove-then-pull is the
+# remedy.
+if out="$("${KN[@]}" pull "$sref" 2>&1)"; then
+	fail "plain pull succeeded over a repointed binding"
+fi
+printf '%s\n' "$out"
+printf '%s\n' "$out" | grep -qF "annotation" || fail "repointed-binding pull did not name the sealing annotation"
+
+echo "== remove, pull (expect a clean mount again) =="
+"${KN[@]}" remove "$sref"
+"${KN[@]}" pull "$sref"
+"${KN[@]}" mount "$sref" "$MNT"
+[ -n "$(ls -A "$MNT")" ] || fail "re-pulled sealed mount is empty"
+"${KN[@]}" unmount "$MNT"
+"${KN[@]}" remove "$sref"
+"${KN[@]}" remove "127.0.0.1:$port/custom@$csealed"
+
+echo "SMOKE OK: purpose-built image sealed, cross-checked three ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding (checks passed)"
