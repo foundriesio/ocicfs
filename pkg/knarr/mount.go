@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -126,18 +125,7 @@ func (e *engine) mount(ctx context.Context, ref, target string, opts ...MountOpt
 	if cfg.MetadataOnly {
 		return mount.MetadataOnly(ctx, spec)
 	}
-	if err := mount.ReadOnly(ctx, spec); err != nil {
-		return err
-	}
-	// A composefs mount's in-use lock covers only setup, so gc can reclaim
-	// the image's objects out from under the live mount once nothing wants
-	// the image anymore. A hold is that want; warn only when none protects
-	// it. The holder read is advisory — a racing release just changes which
-	// side of the warning the mounter sees.
-	if holders, err := e.holds.Holders(res.ManifestDesc.Digest); err != nil || len(holders) == 0 {
-		slog.Warn("mount: a composefs mount is not gc-protected past setup; `knarr hold` the image to keep it mounted long-term")
-	}
-	return nil
+	return mount.ReadOnly(ctx, spec)
 }
 
 // expectedFsverity selects the fs-verity digest a mount enforces from the

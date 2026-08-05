@@ -11,12 +11,11 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"strings"
 
-	"github.com/opencontainers/go-digest"
 	"golang.org/x/sys/unix"
 
+	"github.com/foundriesio/knarr/internal/digestutil"
 	"github.com/foundriesio/knarr/internal/verity"
 )
 
@@ -32,25 +31,91 @@ type Spec struct {
 // callers with idempotent teardown paths can match it with errors.Is.
 var ErrNotMounted = errors.New("mount: target is not mounted")
 
-// ReadOnly mounts s.ImagePath at s.Target with fs-verity required.
+// runDir hosts the transient per-mount scratch directories. It is on tmpfs, so
+// any residue a hard crash leaves behind clears at reboot, and knarr controls
+// every byte of the path, which keeps the overlay option string free of the
+// delimiter bytes an environment-chosen directory could carry.
+const runDir = "/run/knarr"
+
+// overlaySource is the filesystem source name the composefs overlay mounts are
+// registered under, so /proc/mounts identifies them.
+const overlaySource = "composefs"
+
+// ReadOnly mounts s.ImagePath at s.Target as a read-only composefs tree: the
+// image's EROFS metadata served through a single overlay whose data-only lower
+// layer is s.Basedir, with fs-verity required on every backing object.
 //
-// The in-use lock taken here covers only the mount setup: mount.composefs
-// opens the image itself (its digest check refuses a block-device source, so
-// the locked fd cannot be handed through a pre-attached loop device), and a
-// flock belongs to the open file description, so it ends with this process.
-// A long-lived composefs mount is protected by holds, not the lock.
+// The image is verified and attached exactly as on the metadata-only path, so
+// the shared in-use lock rides the loop device and lives as long as the mount.
+// The EROFS is mounted on a private scratch directory only long enough for the
+// overlay mount to take its own references to it; the scratch mountpoint is
+// then lazily detached and removed, leaving the overlay at s.Target as the one
+// visible mount, torn down by a single Unmount(s.Target).
 func ReadOnly(ctx context.Context, s Spec) error {
-	opts, err := composefsOptions(s)
+	if err := validateSpec(s); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	dev, err := attachVerified(s.ImagePath, s.FsverityDigest)
 	if err != nil {
 		return err
 	}
-	img, err := lockImage(s.ImagePath)
+	defer warnClose("mount: failed to close loop device", dev)
+
+	scratch, err := scratchDir()
 	if err != nil {
 		return err
 	}
-	defer warnClose("mount: failed to close image", img)
-	cmd := exec.CommandContext(ctx, "mount.composefs", "-o", opts, "--", s.ImagePath, s.Target) // #nosec G204 -- fixed binary, discrete validated args, "--" ends option parsing
-	return runMount(ctx, cmd, "mount.composefs")
+	// noacl: the image carries no POSIX ACL xattrs, so disable ACL lookups on
+	// the metadata tree rather than paying for misses on every access.
+	if err := unix.Mount(dev.Name(), scratch, "erofs", unix.MS_RDONLY, "noacl"); err != nil {
+		removeDir(scratch)
+		return fmt.Errorf("mount: erofs %s on %s: %w", dev.Name(), scratch, err)
+	}
+
+	// MS_RDONLY is explicit: an overlay without an upper layer is read-only
+	// only as a side effect, and this mount's contract is read-only.
+	mountErr := unix.Mount(overlaySource, s.Target, "overlay", unix.MS_RDONLY, overlayOptions(scratch, s.Basedir))
+	if mountErr != nil {
+		mountErr = fmt.Errorf("mount: overlay on %s: %w", s.Target, mountErr)
+	}
+
+	// Whether or not the overlay mount succeeded, lazily detach the scratch
+	// mountpoint and remove its directory. On success the overlay holds its
+	// own references to the EROFS, keeping it — and with it the loop device
+	// and the in-use lock — alive until the overlay is unmounted, when the
+	// loop autoclear fires; on failure the detach releases them all. A hard
+	// kill between the scratch mount above and this detach leaves the scratch
+	// mount, its loop device, and the lock behind until reboot: tmpfs-bounded
+	// residue that over-retains store objects for one boot, never data loss.
+	var detachErr error
+	if err := unix.Unmount(scratch, unix.MNT_DETACH); err != nil {
+		detachErr = fmt.Errorf("mount: detach scratch mount %s: %w", scratch, err)
+	} else {
+		removeDir(scratch)
+	}
+
+	if mountErr != nil {
+		return errors.Join(mountErr, detachErr)
+	}
+	if detachErr != nil {
+		// A successful mount leaves no scratch residue: a surviving scratch
+		// mount would keep the EROFS, the loop device, and the in-use lock
+		// alive past the target's unmount, until reboot. Unwind the overlay
+		// and report the detach failure instead. The unwind detaches lazily,
+		// so a racing opener of the just-visible mount cannot keep the failed
+		// mount in the namespace; if even that fails, the failure is joined
+		// into the returned error rather than leaving a mount the caller was
+		// told does not exist.
+		if err := unix.Unmount(s.Target, unix.MNT_DETACH); err != nil {
+			return errors.Join(detachErr, fmt.Errorf("mount: unwind overlay on %s: %w", s.Target, err))
+		}
+		return detachErr
+	}
+	return nil
 }
 
 // MetadataOnly mounts s.ImagePath at s.Target as the raw read-only EROFS
@@ -60,18 +125,11 @@ func ReadOnly(ctx context.Context, s Spec) error {
 // stacking-depth limit — mounts the metadata this way and assembles its own
 // overlay with the store's object directory as a data-only lower.
 //
-// Basedir is not consulted; s.FsverityDigest is enforced here, on the very
-// file descriptor the loop device attaches, so the mounted bytes are the
-// measured bytes even if the pathname is swapped concurrently. A raw EROFS
-// mount has no in-kernel digest option, which makes this measurement the
-// enforcement point on this path.
-//
-// The image is attached to an explicitly read-only loop device rather than
-// mounted from the file or through mount(8): a file-backed EROFS counts an
-// extra filesystem stacking level, which would push the caller's overlay
-// past the kernel's depth limit, and mount(8)'s loop handling opens the
-// backing file for writing on some util-linux versions, which an fs-verity
-// sealed image refuses.
+// Basedir is not consulted; s.FsverityDigest is enforced on the very file
+// descriptor the loop device attaches, so the mounted bytes are the measured
+// bytes even if the pathname is swapped concurrently. A raw EROFS mount has
+// no in-kernel digest option, which makes this measurement the enforcement
+// point on this path.
 func MetadataOnly(ctx context.Context, s Spec) error {
 	if s.ImagePath == "" {
 		return errors.New("mount: empty image path")
@@ -86,24 +144,7 @@ func MetadataOnly(ctx context.Context, s Spec) error {
 		return err
 	}
 
-	// The loop device retains the locked open file description, so the shared
-	// in-use lock taken here lives exactly as long as the mount (autoclear)
-	// and keeps reading as in use after this process exits.
-	img, err := lockImage(s.ImagePath)
-	if err != nil {
-		return err
-	}
-	defer warnClose("mount: failed to close image", img)
-
-	measured, err := verity.Measure(img)
-	if err != nil {
-		return fmt.Errorf("mount: measure image: %w", err)
-	}
-	if measured != s.FsverityDigest {
-		return fmt.Errorf("mount: image fs-verity digest mismatch: measured %s, expected %s", measured, s.FsverityDigest)
-	}
-
-	dev, err := attachLoop(img)
+	dev, err := attachVerified(s.ImagePath, s.FsverityDigest)
 	if err != nil {
 		return err
 	}
@@ -115,6 +156,46 @@ func MetadataOnly(ctx context.Context, s Spec) error {
 		return fmt.Errorf("mount: erofs %s on %s: %w", dev.Name(), s.Target, err)
 	}
 	return nil
+}
+
+// Unmount tears down the mount at target. A target with no mount returns an
+// error matching ErrNotMounted.
+func Unmount(target string) error {
+	if target == "" {
+		return errors.New("mount: empty target")
+	}
+	if err := unix.Unmount(target, 0); err != nil {
+		if errors.Is(err, unix.EINVAL) {
+			return fmt.Errorf("mount: %s: %w", target, errors.Join(ErrNotMounted, err))
+		}
+		return fmt.Errorf("mount: unmount %s: %w", target, err)
+	}
+	return nil
+}
+
+// attachVerified opens and locks the image at path, requires its measured
+// fs-verity digest to equal want, and attaches it to a read-only autoclear
+// loop device, which it returns. The loop device retains the locked open file
+// description: the shared in-use lock lives exactly as long as the loop
+// device — and, with autoclear, as long as the mount built on it — surviving
+// this process, and the digest is enforced on the very descriptor the device
+// serves, so the mounted bytes are the measured bytes even if the pathname is
+// swapped concurrently.
+func attachVerified(path, want string) (*os.File, error) {
+	img, err := lockImage(path)
+	if err != nil {
+		return nil, err
+	}
+	defer warnClose("mount: failed to close image", img)
+
+	measured, err := verity.Measure(img)
+	if err != nil {
+		return nil, fmt.Errorf("mount: measure image: %w", err)
+	}
+	if measured != want {
+		return nil, fmt.Errorf("mount: image fs-verity digest mismatch: measured %s, expected %s", measured, want)
+	}
+	return attachLoop(img)
 }
 
 // lockImage opens the image and takes the store's in-use coordination on it:
@@ -198,65 +279,34 @@ func attachLoop(img *os.File) (*os.File, error) {
 	return nil, errors.New("mount: no free loop device after retries")
 }
 
-// warnClose closes c, logging a failure rather than dropping it.
-func warnClose(msg string, c io.Closer) {
-	if err := c.Close(); err != nil && !errors.Is(err, os.ErrNotExist) {
-		slog.Warn(msg, "err", err)
+// scratchDir creates a fresh private mountpoint under runDir, creating runDir
+// itself on first use.
+func scratchDir() (string, error) {
+	// Owner-only: the scratch mountpoints are touched exclusively by the
+	// privileged knarr process that assembles the mount.
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		return "", fmt.Errorf("mount: create %s: %w", runDir, err)
 	}
-}
-
-// runMount runs a prepared mount command, folding its stderr and any context
-// cancellation into the returned error.
-func runMount(ctx context.Context, cmd *exec.Cmd, tool string) error {
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return commandError(tool, ctxErr, stderr.String())
-		}
-		return commandError(tool, err, stderr.String())
-	}
-	return nil
-}
-
-// Unmount tears down the mount at target. A target with no mount returns an
-// error matching ErrNotMounted.
-func Unmount(target string) error {
-	if target == "" {
-		return errors.New("mount: empty target")
-	}
-	if err := unix.Unmount(target, 0); err != nil {
-		if errors.Is(err, unix.EINVAL) {
-			return fmt.Errorf("mount: %s: %w", target, errors.Join(ErrNotMounted, err))
-		}
-		return fmt.Errorf("mount: unmount %s: %w", target, err)
-	}
-	return nil
-}
-
-// composefsOptions validates s and builds the -o string that carries the trust
-// posture: the image's expected fs-verity digest, fs-verity required on every
-// redirected object, and a read-only mount.
-func composefsOptions(s Spec) (string, error) {
-	if err := validateSpec(s); err != nil {
-		return "", err
-	}
-	digestHex, err := fsverityDigestHex(s.FsverityDigest)
+	dir, err := os.MkdirTemp(runDir, "mount-*")
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("mount: create scratch dir: %w", err)
 	}
-	basedir, err := optionValue("basedir", s.Basedir)
-	if err != nil {
-		return "", err
-	}
-	return strings.Join([]string{
-		"basedir=" + basedir,
-		"digest=" + digestHex,
-		"verity",
-		"ro",
-	}, ","), nil
+	return dir, nil
 }
 
+// overlayOptions builds the overlay option string that carries the trust
+// posture: the EROFS metadata as the top lower layer, basedir as the data-only
+// lower ("::") its redirects resolve through, and fs-verity required on every
+// redirected object.
+func overlayOptions(scratch, basedir string) string {
+	return "lowerdir=" + scratch + "::" + basedir + ",redirect_dir=on,metacopy=on,verity=require"
+}
+
+// validateSpec checks a composefs mount spec before any I/O: no empty fields,
+// a well-formed sha256 fs-verity digest, and a basedir free of the delimiter
+// bytes that would split the overlay option string (',' separates options and
+// ':' separates lower layers; the scratch path is knarr-generated under
+// runDir, so a violation there would be a bug, not an input).
 func validateSpec(s Spec) error {
 	switch {
 	case s.ImagePath == "":
@@ -268,37 +318,25 @@ func validateSpec(s Spec) error {
 	case s.FsverityDigest == "":
 		return errors.New("mount: empty fs-verity digest")
 	}
+	if _, err := digestutil.ParseSHA256(s.FsverityDigest); err != nil {
+		return fmt.Errorf("mount: fs-verity digest: %w", err)
+	}
+	if strings.ContainsAny(s.Basedir, ":,") {
+		return errors.New("mount: basedir cannot contain ':' or ','")
+	}
 	return nil
 }
 
-func fsverityDigestHex(raw string) (string, error) {
-	d, err := digest.Parse(raw)
-	if err != nil {
-		return "", fmt.Errorf("mount: fs-verity digest: %w", err)
+// warnClose closes c, logging a failure rather than dropping it.
+func warnClose(msg string, c io.Closer) {
+	if err := c.Close(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Warn(msg, "err", err)
 	}
-	if d.Algorithm() != digest.SHA256 {
-		return "", fmt.Errorf("mount: fs-verity digest: non-sha256 digest algorithm %s", d.Algorithm())
-	}
-	if err := d.Validate(); err != nil {
-		return "", fmt.Errorf("mount: fs-verity digest: %w", err)
-	}
-	return d.Hex(), nil
 }
 
-// optionValue returns value for use in a mount.composefs -o option, rejecting
-// the delimiter bytes that would split it: ',' separates options and ':'
-// separates multiple basedirs.
-func optionValue(name, value string) (string, error) {
-	if strings.ContainsAny(value, ":,") {
-		return "", fmt.Errorf("mount: %s cannot contain ':' or ','", name)
+// removeDir removes dir, logging a failure rather than dropping it.
+func removeDir(dir string) {
+	if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Warn("mount: failed to remove scratch dir", "dir", dir, "err", err)
 	}
-	return value, nil
-}
-
-func commandError(tool string, err error, stderr string) error {
-	stderr = strings.TrimSpace(stderr)
-	if stderr != "" {
-		return fmt.Errorf("mount: %s: %w: %s", tool, err, stderr)
-	}
-	return fmt.Errorf("mount: %s: %w", tool, err)
 }

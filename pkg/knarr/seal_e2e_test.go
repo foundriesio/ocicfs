@@ -88,9 +88,6 @@ func TestSealPullMountE2E(t *testing.T) {
 		}
 	})
 
-	if _, err := exec.LookPath("mount.composefs"); err != nil {
-		t.Skip("mount.composefs not found in PATH")
-	}
 	target := filepath.Join(storeRoot, "sealed-mnt")
 	if err := os.Mkdir(target, 0o755); err != nil {
 		t.Fatalf("Mkdir: %v", err)

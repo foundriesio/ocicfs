@@ -36,9 +36,6 @@ func TestMountFromPulledImageE2E(t *testing.T) {
 	if _, err := exec.LookPath("mkcomposefs"); err != nil {
 		t.Skip("mkcomposefs not found in PATH")
 	}
-	if _, err := exec.LookPath("mount.composefs"); err != nil {
-		t.Skip("mount.composefs not found in PATH")
-	}
 
 	lay, err := octest.BuildSingleLayerGzip(t.TempDir(), hostPlatform(),
 		octest.File{Name: "etc/config.txt", Mode: 0o644, Body: "hello from knarr\n"},
@@ -622,9 +619,6 @@ func TestMountSealedIgnoresTamperedBinding(t *testing.T) {
 	}
 	tamperBindingDigest(t, octest.BindingPath(storeRoot, sealed.Sealed, hostPlatform()), digest.SHA256.FromString("wrong").String())
 
-	if _, err := exec.LookPath("mount.composefs"); err != nil {
-		t.Skip("mount.composefs not found in PATH")
-	}
 	target := filepath.Join(storeRoot, "sealed-mnt")
 	if err := os.Mkdir(target, 0o755); err != nil {
 		t.Fatalf("Mkdir: %v", err)
@@ -756,9 +750,6 @@ func TestMountSealedFallbackIgnoresTamperedBinding(t *testing.T) {
 	}
 	tamperBindingDigest(t, octest.BindingPath(storeRoot, sealed.Sealed, hostPlatform()), digest.SHA256.FromString("wrong").String())
 
-	if _, err := exec.LookPath("mount.composefs"); err != nil {
-		t.Skip("mount.composefs not found in PATH")
-	}
 	target := filepath.Join(storeRoot, "fallback-mnt")
 	if err := os.Mkdir(target, 0o755); err != nil {
 		t.Fatalf("Mkdir: %v", err)

@@ -52,9 +52,6 @@ func TestMountMatchesFlattenedImageE2E(t *testing.T) {
 	if _, err := exec.LookPath("mkcomposefs"); err != nil {
 		t.Skip("mkcomposefs not found in PATH")
 	}
-	if _, err := exec.LookPath("mount.composefs"); err != nil {
-		t.Skip("mount.composefs not found in PATH")
-	}
 
 	layer1 := diffTar(t,
 		diffEnt{name: "./", typ: tar.TypeDir, mode: 0o755},

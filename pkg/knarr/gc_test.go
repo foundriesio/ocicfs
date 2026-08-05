@@ -4,14 +4,12 @@
 package knarr
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io/fs"
-	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -170,9 +168,6 @@ func TestGCReclaimsUnwantedKeepsShared(t *testing.T) {
 	assertObjectExists(t, storeRoot, gcUniqueDigest("keep"))
 	assertNoEmptyDirs(t, storeRoot)
 
-	if _, err := exec.LookPath("mount.composefs"); err != nil {
-		t.Skip("mount.composefs not found in PATH")
-	}
 	target := t.TempDir()
 	if err := eng.Mount(ctx, layA.Ref, target); err != nil {
 		t.Fatalf("Mount survivor: %v", err)
@@ -244,47 +239,6 @@ func TestGCInUseTransitiveProtection(t *testing.T) {
 	assertObjectAbsent(t, storeRoot, digest.SHA256.FromString(gcSharedBody))
 	assertObjectAbsent(t, storeRoot, gcUniqueDigest("inuse"))
 	assertNoEmptyDirs(t, storeRoot)
-}
-
-// TestMountWarnSuppressedByHold pins the composefs mount's advisory: an
-// unheld image's mount warns that the setup-only lock coverage leaves it
-// reclaimable once unwanted, and a hold — the remedy the warning names —
-// silences it.
-func TestMountWarnSuppressedByHold(t *testing.T) {
-	eng, _, lay := gcEngine(t, "warn")
-	ctx := context.Background()
-	if _, err := exec.LookPath("mount.composefs"); err != nil {
-		t.Skip("mount.composefs not found in PATH")
-	}
-
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-
-	target := t.TempDir()
-	mountOnce := func() string {
-		t.Helper()
-		buf.Reset()
-		if err := eng.Mount(ctx, lay.Ref, target); err != nil {
-			t.Fatalf("Mount: %v", err)
-		}
-		out := buf.String()
-		if err := eng.Unmount(ctx, target); err != nil {
-			t.Fatalf("Unmount: %v", err)
-		}
-		return out
-	}
-
-	if out := mountOnce(); !strings.Contains(out, "not gc-protected") {
-		t.Fatalf("unheld mount logged %q, want the gc-protection warning", out)
-	}
-	if err := eng.Hold(ctx, lay.Ref, "tester"); err != nil {
-		t.Fatalf("Hold: %v", err)
-	}
-	if out := mountOnce(); strings.Contains(out, "not gc-protected") {
-		t.Fatalf("held mount logged %q, want no gc-protection warning", out)
-	}
 }
 
 // TestGCHoldProtectsWithoutRef pins hold as a first-class wanted root: an

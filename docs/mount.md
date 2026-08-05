@@ -12,9 +12,14 @@ platform. Every verification keys on that identity digest.
 ## Prerequisites
 
 - A store on an **fs-verity-capable filesystem** containing the pulled image.
-- `mount.composefs` on `PATH`.
 - A target directory that already exists.
-- Kernel support for composefs, overlayfs verity enforcement, and fs-verity.
+- Kernel support for EROFS, fs-verity, and overlayfs with data-only lower
+  layers (mainline commit 37ebf056d6cf, Linux 6.5) and fs-verity validation
+  of lower data for `verity=require` (the Linux 6.6 series through mainline
+  commit 184996e92e86, "ovl: Validate verity xattr when resolving lowerdata",
+  the last patch this read-only path requires) — so Linux 6.6, or a vendor
+  kernel carrying all of the above. Below that floor the mount fails with the
+  overlay mount's error; there is no fallback.
 
 ### No fs-verity filesystem? Create one on a loop device
 
@@ -58,10 +63,16 @@ one, the platform manifest, and its config. Only then does it read the
 host-platform binding from `images/` for the verified identity and pick the
 fs-verity digest to enforce: the manifest's merged-image sealing annotation
 when one is present, the digest the binding recorded at pull otherwise. It
-re-measures the referenced composefs image object against that value and
-passes it to `mount.composefs`. The mount fails if the metadata chain or the
-image object is missing, unmeasurable, or measured differently from the
-enforced digest.
+re-measures the referenced composefs image object against that value on the
+very file descriptor it attaches to a read-only loop device, mounts the
+image's EROFS metadata on a private scratch directory under `/run/knarr`, and
+assembles the mount at the target as a single read-only overlay with the
+store's object directory as a data-only lower layer and fs-verity required on
+every backing object. The scratch mountpoint is lazily detached before the
+mount returns — the overlay keeps the metadata, the loop device, and the
+image's in-use lock alive until the target is unmounted. The mount fails if
+the metadata chain or the image object is missing, unmeasurable, or measured
+differently from the enforced digest.
 
 The mounted tree is read-only:
 
@@ -117,19 +128,23 @@ stacking depth. The upper and work directories must not live on an overlayfs.
   objects. There is no unverified mount fallback.
 - **Mounts mark in use for gc.** A mount holds the store lock shared during
   setup and takes a shared flock on the image object — the in-use signal
-  `knarr gc` probes before deleting. A metadata-only mount's lock rides the
-  loop device and lives exactly as long as the mount; a composefs mount's
-  lock ends with the knarr process, so hold an image you keep mounted
-  long-term (see [gc.md](gc.md)). A mount that loses the unlink race with a
-  concurrent collection is refused with the pull remedy instead of serving a
-  deleted image.
+  `knarr gc` probes before deleting. On both mount paths the lock rides the
+  loop device, so it lives exactly as long as the mount and survives the
+  knarr process; it still ends at unmount or reboot, so hold an image that
+  must stay protected beyond that (see [gc.md](gc.md)). A mount that loses
+  the unlink race with a concurrent collection is refused with the pull
+  remedy instead of serving a deleted image.
+- **Crash residue.** A hard kill in the narrow window between the scratch
+  EROFS mount and its lazy detach leaves that scratch mount, its loop device,
+  and the image's in-use lock behind until reboot. The residue lives on tmpfs
+  (`/run/knarr`) and only over-retains store objects for one boot; it never
+  loses data.
 - **What the verity check binds.** The expected fs-verity digest — the sealing
   annotation of the digest-verified identity manifest for a sealed image, the
-  binding's locally recorded digest otherwise — is enforced on the composefs
-  image by the kernel on a composefs mount, and by measuring the image on the
-  loop-attached descriptor on a metadata-only mount; fs-verity is required on
-  every backing object either way, so tampered or unsealed content cannot be
-  served. The binding itself is an untrusted,
+  binding's locally recorded digest otherwise — is enforced by measuring the
+  image on the very descriptor the loop device attaches, on both mount paths;
+  fs-verity is required on every backing object either way, so tampered or
+  unsealed content cannot be served. The binding itself is an untrusted,
   regenerable index: it selects which local image object is mounted for the
   requested identity digest, and for a sealed image it contributes nothing to
   the trust decision.

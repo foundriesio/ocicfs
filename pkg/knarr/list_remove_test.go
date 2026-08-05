@@ -164,9 +164,6 @@ func TestPullListRemoveE2E(t *testing.T) {
 	if _, err := exec.LookPath("mkcomposefs"); err != nil {
 		t.Skip("mkcomposefs not found in PATH")
 	}
-	if _, err := exec.LookPath("mount.composefs"); err != nil {
-		t.Skip("mount.composefs not found in PATH")
-	}
 
 	lay, err := octest.BuildSingleLayerGzip(t.TempDir(), hostPlatform(),
 		// Over the inline threshold, so it is stored as a CAS object (FileDigest).
