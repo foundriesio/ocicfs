@@ -217,8 +217,9 @@ inputs give a byte-identical EROFS, hence an identical fs-verity digest.
 
 ## Mounting (not covered here)
 
-This walkthrough stops at building and verifying. Mounting an image
-(`mount.composefs publisher.cfs --basedir objects/fsverity-sha256-12 /mnt`) needs root
-privilege and composefs kernel support. The `mount.composefs` helper is in the
-dev image, but mounting is knarr's `mount` verb — see [mount.md](mount.md) —
-and is exercised there rather than in this substrate walkthrough.
+This walkthrough stops at building and verifying. Mounting an image — the
+EROFS metadata over a loop device plus an overlay with
+`objects/fsverity-sha256-12` as its data-only lower — needs root privilege
+and kernel support (EROFS, fs-verity, overlayfs). Mounting is knarr's `mount`
+verb — see [mount.md](mount.md) — and is exercised there rather than in this
+substrate walkthrough.

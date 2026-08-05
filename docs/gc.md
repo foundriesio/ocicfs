@@ -86,17 +86,27 @@ removed; nothing is deleted either way, and a retry succeeds.
 
 ## In-use coverage
 
-The mount lock's lifetime depends on the mount path:
+The in-use layer exists because wanted is intent, and intent can be stale
+at the moment gc runs. The everyday case: an update agent pulls v2 of an
+app, releases and removes v1, and runs gc — while the v1 container is
+still draining requests, because stopping it timed out, or the agent
+crashed between steps and a scheduled collection ran first, or the
+container belongs to docker and its teardown is not the agent's to
+sequence. Nothing wants v1 anymore, and a live mount does not hold its
+data files open — the overlay reads store objects lazily, on first
+access — so collecting them would hand the still-running container an
+I/O error on the next file it touches. The shared lock turns that from a
+sequencing obligation on every caller into a property of the store: gc
+sees the v1 image locked, keeps it and everything it references, and
+reclaims it all on the first collection after the unmount.
 
-- `mount --metadata-only` (the path the cfs-snapshotter uses): the locked
-  file description is the one the loop device attaches, so the lock lives
-  exactly as long as the mount, surviving the mounting process. These mounts
-  are fully covered.
-- plain `mount` (composefs): `mount.composefs` opens the image itself, so
-  the lock covers only the mount setup and ends with the knarr process.
-  **Hold any image you keep mounted long-term** — holds, not the in-use
-  probe, are the durable protection there, and the lock is advisory
-  everywhere: it is accounting, not integrity (fs-verity is integrity).
+All knarr mounts are covered for their lifetime: on both mount paths the
+locked file description is the one the loop device attaches, so the lock
+lives exactly as long as the mount, surviving the mounting process. In-use
+protection still ends at unmount — and at reboot, which ends every mount and
+its lock. **Hold any image that must stay protected beyond that** — holds,
+not the in-use probe, are the durable protection, and the lock is advisory
+everywhere: it is accounting, not integrity (fs-verity is integrity).
 
 `mount` deliberately does not take that hold itself. A hold is durable caller
 intent and a mount is ephemeral kernel state, and pairing them leaks: holds

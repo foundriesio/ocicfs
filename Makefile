@@ -76,7 +76,7 @@ fmt:
 # smoke runs the pull --from-dir -> ls -> inspect -> mount -> unmount -> remove
 # lifecycle against a real image, for a quick check of the implemented
 # functionality. Run it inside the privileged dev container (fs-verity +
-# mkcomposefs + mount.composefs), e.g.:
+# mkcomposefs), e.g.:
 #   ./devshell.sh                                              # then: make smoke
 #   docker run --rm --privileged -v "$PWD":/work knarr-dev make smoke
 .PHONY: smoke

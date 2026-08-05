@@ -34,8 +34,8 @@
 # device-side. The registry legs run against a local zot
 # instance -- a real OCI registry that enforces the distribution spec on
 # manifest PUTs, unlike an in-process test registry. It needs a privileged,
-# fs-verity-capable environment with mkcomposefs and mount.composefs on PATH
-# -- i.e. the dev container. Either open the dev container and run the target
+# fs-verity-capable environment with mkcomposefs on PATH -- i.e. the dev
+# container. Either open the dev container and run the target
 # inside it:
 #
 #   ./devshell.sh                # opens a shell in the dev container; then: make smoke
@@ -473,4 +473,31 @@ for tree in "$STORE/objects/sha256" "$STORE/objects/fsverity-sha256-12" \
 	[ -z "$(find "$tree" -mindepth 1 -type d 2>/dev/null)" ] || fail "empty shard directories remain under $tree"
 done
 
-echo "SMOKE OK: purpose-built image sealed, cross-checked three ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding, and a gc round (unwanted reclaimed, in-use survives until unmount, empty store fully reclaimed down to its shard directories) (checks passed)"
+echo "== gc: plain mount marks in use, falls after unmount =="
+"${KN[@]}" pull "$sref"
+"${KN[@]}" mount "$sref" "$MNT"
+"${KN[@]}" remove "$sref"
+out="$("${KN[@]}" gc --format json)"
+printf '%s\n' "$out"
+[ "$(printf '%s' "$out" | jq -r .inUseSkipped)" -gt 0 ] || fail "gc did not see the plain-mounted image as in use"
+# Data objects open lazily through the mount's data plane: prove a by-digest
+# file still opens through the live mount after the collection.
+f="$(find "$MNT" -xdev -type f -size +64c -print -quit)"
+[ -n "$f" ] || fail "post-gc plain mount has no by-digest file"
+cat "$f" >/dev/null || fail "reading $f through the plain mount after gc failed"
+"${KN[@]}" unmount "$MNT"
+# The mount's loop device detaches via autoclear, which is deferred kernel
+# work after the unmount, so poll briefly before asserting cleanliness.
+for _ in $(seq 100); do
+	losetup -ln -O BACK-FILE 2>/dev/null | grep -qF "$STORE" || break
+	sleep 0.1
+done
+if losetup -ln -O BACK-FILE 2>/dev/null | grep -qF "$STORE"; then
+	fail "a loop device still backs the store after unmount"
+fi
+out="$("${KN[@]}" gc --format json)"
+printf '%s\n' "$out"
+[ "$(printf '%s' "$out" | jq -r .objectsRemoved)" -gt 0 ] || fail "gc after plain unmount reclaimed nothing"
+[ -z "$(find "$STORE/objects/sha256" -type f)" ] || fail "objects remain in an empty store"
+
+echo "SMOKE OK: purpose-built image sealed, cross-checked three ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding, and a gc round (unwanted reclaimed, in-use survives until unmount on both mount paths, empty store fully reclaimed down to its shard directories) (checks passed)"

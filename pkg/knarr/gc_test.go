@@ -16,8 +16,10 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/opencontainers/go-digest"
+	"golang.org/x/sys/unix"
 
 	"github.com/foundriesio/knarr/internal/devtest"
 	"github.com/foundriesio/knarr/internal/octest"
@@ -239,6 +241,97 @@ func TestGCInUseTransitiveProtection(t *testing.T) {
 	assertObjectAbsent(t, storeRoot, digest.SHA256.FromString(gcSharedBody))
 	assertObjectAbsent(t, storeRoot, gcUniqueDigest("inuse"))
 	assertNoEmptyDirs(t, storeRoot)
+}
+
+// TestGCInUsePlainMountProtection covers the plain composefs mount with the
+// same in-use contract as the metadata-only path: the mount's loop-held lock
+// marks the image in use for exactly the mount's lifetime, so an unwanted
+// mounted image and the objects it references survive a collection — and the
+// live mount keeps serving their content — and everything falls on the first
+// gc after unmount.
+func TestGCInUsePlainMountProtection(t *testing.T) {
+	eng, storeRoot, lay := gcEngine(t, "plaininuse")
+	ctx := context.Background()
+	image := readPullBinding(t, storeRoot, lay.Root, lay.Platform).RootFS.Descriptor.Digest
+
+	target := filepath.Join(t.TempDir(), "mnt")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	if err := eng.Mount(ctx, lay.Ref, target); err != nil {
+		t.Fatalf("Mount: %v", err)
+	}
+	mounted := true
+	t.Cleanup(func() {
+		if !mounted {
+			return
+		}
+		if err := eng.Unmount(context.Background(), target); err != nil {
+			t.Errorf("Unmount: %v", err)
+		}
+	})
+	if err := eng.Remove(ctx, lay.Ref); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	report, err := eng.GC(ctx)
+	if err != nil {
+		t.Fatalf("GC while mounted: %v", err)
+	}
+	if report.InUseSkipped == 0 {
+		t.Fatalf("GC = %+v, want the mounted image skipped as in use", report)
+	}
+	assertObjectExists(t, storeRoot, image)
+	assertObjectExists(t, storeRoot, digest.SHA256.FromString(gcSharedBody))
+	assertObjectExists(t, storeRoot, gcUniqueDigest("plaininuse"))
+	data, err := os.ReadFile(filepath.Join(target, "etc", "shared.txt")) // #nosec G304 -- mount target under t-managed dir
+	if err != nil || string(data) != gcSharedBody {
+		t.Fatalf("read through the live mount after gc = %q, %v", data, err)
+	}
+
+	if err := eng.Unmount(ctx, target); err != nil {
+		t.Fatalf("Unmount: %v", err)
+	}
+	mounted = false
+	waitImageLockFree(t, storeRoot, image)
+
+	report, err = eng.GC(ctx)
+	if err != nil {
+		t.Fatalf("GC after unmount: %v", err)
+	}
+	if report.InUseSkipped != 0 || report.ObjectsRemoved == 0 {
+		t.Fatalf("GC after unmount = %+v, want the image and its objects reclaimed", report)
+	}
+	assertObjectAbsent(t, storeRoot, image)
+	assertObjectAbsent(t, storeRoot, digest.SHA256.FromString(gcSharedBody))
+	assertObjectAbsent(t, storeRoot, gcUniqueDigest("plaininuse"))
+	assertNoEmptyDirs(t, storeRoot)
+}
+
+// waitImageLockFree polls the image object's flock until an exclusive
+// non-blocking probe succeeds: the unmount's loop teardown is deferred kernel
+// work, so the in-use lock can read busy for a moment after Unmount returns.
+func waitImageLockFree(t *testing.T, storeRoot string, image digest.Digest) {
+	t.Helper()
+	f, err := os.Open(octest.ObjectPath(storeRoot, image)) // #nosec G304 -- store object path under the test root
+	if err != nil {
+		t.Fatalf("open image object: %v", err)
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close image object: %v", err)
+		}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB) != nil { // #nosec G115 -- a file descriptor always fits in int
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the image lock to release after unmount")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_UN); err != nil { // #nosec G115 -- a file descriptor always fits in int
+		t.Fatalf("unlock image object: %v", err)
+	}
 }
 
 // TestGCHoldProtectsWithoutRef pins hold as a first-class wanted root: an

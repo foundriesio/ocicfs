@@ -129,6 +129,8 @@ RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/ins
 # smoke tests confirm the binaries are on PATH and link against it. composefs-info
 # inspects and measures a built image; the EROFS round-trip test uses its dump and
 # measure-file modes to assert WriteImage reproduces the upstream tool's output.
+# mount.composefs ships with the tools but is no longer used: knarr assembles
+# its mounts natively.
 COPY --from=composefs-builder /out/usr/bin/mkcomposefs /usr/bin/mkcomposefs
 COPY --from=composefs-builder /out/usr/sbin/mount.composefs /usr/bin/mount.composefs
 COPY --from=composefs-builder /out/usr/bin/composefs-info /usr/bin/composefs-info

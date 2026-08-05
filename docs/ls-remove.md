@@ -79,10 +79,8 @@ reference — or by a bare digest naming its index — is seen here. Drop it wit
   `remove` only forgets the index entries — the name is gone, the content
   stays — so the mount keeps serving until unmounted, but a new `knarr mount`
   of that reference fails until the image is pulled again. A later `knarr gc`
-  keeps a mounted metadata-only image's content through its in-use lock and
-  reclaims it after unmount; a plain composefs mount is not lock-covered past
-  setup, so hold an image you keep mounted while removing its reference (see
-  [gc.md](gc.md)).
+  keeps a mounted image's content through its in-use lock and reclaims it
+  after unmount (see [gc.md](gc.md)).
 - **Invalid reference records are skipped.** `ls` warns about and skips a
   corrupt record instead of failing; a skipped record is not a usable reference
   and re-pulling recreates it. A valid reference whose image binding is missing
