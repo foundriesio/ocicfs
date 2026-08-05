@@ -77,6 +77,13 @@ func TestMountFromPulledImageE2E(t *testing.T) {
 	}
 	mounted = true
 
+	// A second mount on the same target must refuse instead of stacking a
+	// shadowing mount; the reads below double as proof the probe left the
+	// existing mount untouched.
+	if err := eng.Mount(context.Background(), lay.Ref, target); !errors.Is(err, ErrAlreadyMounted) {
+		t.Fatalf("second mount = %v, want ErrAlreadyMounted", err)
+	}
+
 	data, err := os.ReadFile(filepath.Join(target, "etc", "config.txt")) // #nosec G304 -- test mount path
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)

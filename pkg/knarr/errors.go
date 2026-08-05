@@ -16,6 +16,10 @@ var ErrNotFound = errors.New("image not found in local store")
 // ErrNotMounted reports that an unmount target had no mount to tear down.
 var ErrNotMounted = errors.New("target is not mounted")
 
+// ErrAlreadyMounted reports that a mount target already carries a mount;
+// mounts never stack, so the existing one must be unmounted first.
+var ErrAlreadyMounted = errors.New("target is already mounted")
+
 // ErrStoreBusy reports that gc could not take the exclusive store lock
 // because a pull, hold, or mount is in progress; the caller retries.
 var ErrStoreBusy = errors.New("store busy")

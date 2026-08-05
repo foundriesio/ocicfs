@@ -7,9 +7,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/foundriesio/knarr/internal/imagestore"
 	"github.com/foundriesio/knarr/internal/mount"
@@ -174,5 +177,59 @@ func validateMountTarget(target string) error {
 	if !fi.IsDir() {
 		return fmt.Errorf("target %s is not a directory", target)
 	}
+	mounted, err := isMountpoint(target)
+	if err != nil {
+		return fmt.Errorf("probe target %s for an existing mount: %w", target, err)
+	}
+	if mounted {
+		return fmt.Errorf("target %s already carries a mount; unmount it first: %w", target, ErrAlreadyMounted)
+	}
 	return nil
+}
+
+// isMountpoint reports whether dir is the root of a mount. Mounting on such a
+// target would not replace the existing mount but silently stack over it,
+// shadowing a mount that stays alive — and in-use — underneath, so the caller
+// refuses instead. The probe opens the directory's final path component with
+// mount-boundary crossing forbidden: only that last step is restricted, so
+// mounts legitimately traversed by the leading path do not trigger it. The
+// path is symlink-resolved first, otherwise a link whose expansion traverses
+// an unrelated mount would read as mounted. The check is advisory ordering,
+// not a lock: a mount racing in after the probe still stacks.
+func isMountpoint(dir string) (bool, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return false, err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return false, err
+	}
+	if resolved == "/" {
+		return true, nil
+	}
+	parent, err := unix.Open(filepath.Dir(resolved), unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return false, &os.PathError{Op: "open", Path: filepath.Dir(resolved), Err: err}
+	}
+	defer warnCloseFd("mount: failed to close target parent fd", parent)
+	fd, err := unix.Openat2(parent, filepath.Base(resolved), &unix.OpenHow{
+		Flags:   unix.O_PATH | unix.O_CLOEXEC,
+		Resolve: unix.RESOLVE_NO_XDEV,
+	})
+	if errors.Is(err, unix.EXDEV) {
+		return true, nil
+	}
+	if err != nil {
+		return false, &os.PathError{Op: "openat2", Path: resolved, Err: err}
+	}
+	warnCloseFd("mount: failed to close target probe fd", fd)
+	return false, nil
+}
+
+// warnCloseFd closes fd, logging a failure rather than dropping it.
+func warnCloseFd(msg string, fd int) {
+	if err := unix.Close(fd); err != nil {
+		slog.Warn(msg, "err", err)
+	}
 }

@@ -12,7 +12,9 @@ platform. Every verification keys on that identity digest.
 ## Prerequisites
 
 - A store on an **fs-verity-capable filesystem** containing the pulled image.
-- A target directory that already exists.
+- A target directory that already exists and carries no mount of its own:
+  mounts never stack, so a target that is already a mountpoint is refused
+  until it is unmounted.
 - Kernel support for EROFS, fs-verity, and overlayfs with data-only lower
   layers (mainline commit 37ebf056d6cf, Linux 6.5) and fs-verity validation
   of lower data for `verity=require` (the Linux 6.6 series through mainline
