@@ -37,12 +37,15 @@ jobs:
           key: smoke-layout-${{ matrix.arch }}-fd8d9aa63ba2
       # Run the make targets inside the same dev container developers use
       # (.devcontainer), so the toolchain is identical locally and in CI.
+      # The trailing install keeps INSTALL.md's from-source path honest; it
+      # reuses the just-built binary, so it costs nothing.
       - uses: devcontainers/ci@v0.3
         with:
           runCmd: >-
             SMOKE_IMAGE=docker.io/library/busybox@sha256:fd8d9aa63ba2f0982b5304e1ee8d3b90a210bc1ffb5314d980eb6962f1a9715d
             SMOKE_LAYOUT="$PWD/.smoke-layout"
-            make build test smoke
+            make build test smoke install DESTDIR=/tmp/install-check
+            && test -x /tmp/install-check/usr/local/bin/knarr
           push: never
 
   lint:
