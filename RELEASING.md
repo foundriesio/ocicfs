@@ -1,0 +1,89 @@
+# Releasing knarr
+
+Maintainer-facing policy and procedure. The release pipeline is automated:
+pushing a version tag builds, validates, and publishes the release; the
+maintainer's job is choosing the version, writing the summary, and tagging.
+
+## Versioning
+
+- Releases are semver tags: `vX.Y.Z`. Pre-1.0, the compatibility surface —
+  CLI commands and flags, JSON output, the on-disk store layout, image
+  annotations — may still change in minor releases; every such change must
+  be called out in the release notes.
+- Release candidates are `vX.Y.Z-rc.N` and publish GitHub **pre-releases**
+  (Debian version `X.Y.Z~rc.N`, sorting before the final). The first
+  release of a series should go through at least one rc: the rc run
+  exercises the entire pipeline end to end without claiming "latest".
+
+## Required checks
+
+- Tag only commits on `main` whose CI run is green.
+- The release workflow independently rebuilds and gates the tagged revision
+  per architecture: `make build test smoke size`, the release validation
+  script (ELF architecture, static linkage, stamped version and revision,
+  archive layout), and the deb suite (`deb`, lintian, install/upgrade/
+  remove/purge tests). A release is created only from green builds.
+
+## Cutting a release
+
+1. Write the release summary (template below).
+2. Create an **annotated** tag whose message is that summary, and push it.
+   Signing the tag is recommended:
+
+   ```sh
+   git tag -a vX.Y.Z        # or: git tag -s vX.Y.Z
+   git push origin vX.Y.Z
+   ```
+
+3. The workflow builds both architectures, validates everything, uploads
+   all artifacts to a **draft** release, and finalizes it as the last step.
+   `-rc.N` tags are marked pre-release.
+4. Verify the release page: two `.tar.gz` archives, two `.deb` packages,
+   `checksums.txt` listing every artifact including the SBOMs, the source
+   archives, and notes consisting of your tag message (plus the generated
+   pull-request list when a previous stable release exists).
+
+## Tag message template
+
+```
+Highlights
+
+- <the two or three changes a user cares about>
+
+Breaking changes
+
+- <changed CLI flags / JSON output / store layout, or "None">
+
+Upgrade notes
+
+- <store migrations, changed defaults, required re-pulls, or "None">
+
+Compatibility
+
+- Kernel: Linux 6.6+ (EROFS, fs-verity, overlayfs data-only lowers)
+- mkcomposefs required for pull and seal (composefs >= <version>)
+- Store layout: compatible with <previous release> / migration notes
+- Tested on: <distros / devices>
+
+Known issues
+
+- <or "None">
+```
+
+The very first release (`v0.1.0`) is introduction-style: what knarr is, the
+verb set, the format stack, the compatibility floor, known limitations —
+no change list, since there is nothing to diff against.
+
+## After publication
+
+- **Never move or delete a release tag; never replace a published
+  artifact.** Published bytes are immutable.
+- If a job fails before the draft is finalized, re-run the failed jobs.
+  **Never re-run the whole workflow for an already-published release** — a
+  rebuild produces different bytes than the published checksums attest.
+- A defective release gets a **patch release** with the fix; optionally
+  edit the defective release's notes to add a Known-issues warning. It
+  stays published: users depend on old releases for reproducible installs
+  and rollback.
+- All releases are retained. Deprecating a release line is announced in
+  the notes of the release that supersedes it.
