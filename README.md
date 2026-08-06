@@ -13,12 +13,14 @@ knarr provides **primitives, not lifecycle policy**: `pull`, `verify`, `mount`,
 activation, rollback, or update-orchestration logic — those belong to the
 upper-layer agent that drives knarr.
 
-> **Status: early development.** The device-side verbs are wired end to end:
-> `pull` from an OCI registry (digest-pinned or tagged) or a local OCI layout,
-> read-only and metadata-only `mount`, `unmount`, `inspect`, `ls`, and `remove`.
-> Pull fetches whole layers today — per-file delta fetch from the zstd:chunked
-> TOC is not implemented yet — and `publish`, `verify`, `hold`/`release`, and
-> `gc` are still to come.
+> **Status: early development.** The device-side verbs are wired end to
+> end: `pull` from an OCI registry (digest-pinned or tagged) or a local OCI
+> layout, with fail-closed verification of sealed images; read-only,
+> writable (`--rw`), and metadata-only `mount`; `unmount`, `ls`, `inspect`,
+> `hold`/`release`, `remove`, and `gc`; plus the publisher-side `seal`.
+> Pull fetches whole layers today — per-file delta fetch from the
+> zstd:chunked TOC is not implemented yet — and the publisher-side
+> `publish` is still to come.
 
 ## Project docs
 
