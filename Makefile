@@ -29,10 +29,12 @@ LDFLAGS := -s -w -X $(PKG)/pkg/version.Version=$(VERSION) -X $(PKG)/pkg/version.
 .PHONY: all
 all: lint vet test build
 
-# build compiles the knarr CLI into bin/ as a stripped, trimmed binary.
+# build compiles the knarr CLI into bin/ as a stripped, trimmed binary. Cgo is
+# disabled so the binary is fully static: nothing in knarr needs it, and the
+# release artifacts must not pick up a libc dependency from the build host.
 .PHONY: build
 build:
-	$(GO) build $(GOFLAGS) -trimpath -ldflags "$(LDFLAGS)" -o $(BIN)/$(CMD) ./cmd/$(CMD)
+	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -trimpath -ldflags "$(LDFLAGS)" -o $(BIN)/$(CMD) ./cmd/$(CMD)
 
 # size builds the stripped binary and checks it against the device budget so the
 # footprint is tracked with data rather than estimates.
