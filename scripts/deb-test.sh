@@ -1,4 +1,6 @@
 #!/bin/sh
+#
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Install-test the built .deb on clean Debian and Ubuntu containers

@@ -1,3 +1,4 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Packaging image for the knarr .deb (Makefile deb-image/deb targets).

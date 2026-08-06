@@ -1,4 +1,6 @@
 #!/bin/sh
+#
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Build the knarr .deb inside the knarr-debuild container (Makefile deb
