@@ -85,6 +85,54 @@ fmt:
 smoke: build
 	./scripts/smoke.sh
 
+# --- Debian packaging ---------------------------------------------------
+#
+# The .deb is built by debuild inside a local container image (debian/
+# Dockerfile) so no Debian toolchain is needed on the host. The Debian
+# version comes from the release tag (v0.1.0 -> 0.1.0, v0.1.0-rc.1 ->
+# 0.1.0~rc.1 so finals sort after candidates); an untagged checkout gets a
+# never-releasable snapshot version instead.
+
+DEB_IMAGE ?= knarr-debuild:trixie
+DEB_OUT ?= $(BIN)/deb
+
+RELEASE_TAG := $(shell git describe --tags --exact-match --match 'v*' 2>/dev/null)
+ifeq ($(RELEASE_TAG),)
+DEB_VERSION ?= 0.0.0~snap.g$(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+else
+DEB_VERSION ?= $(subst -rc.,~rc.,$(patsubst v%,%,$(RELEASE_TAG)))
+endif
+
+# deb-image builds the packaging container image.
+.PHONY: deb-image
+deb-image:
+	docker build -t $(DEB_IMAGE) debian
+
+# deb builds the .deb (plus .changes/.buildinfo) into $(DEB_OUT). VERSION,
+# REVISION and DEB_VERSION are passed in explicitly: inside the container the
+# git-derived defaults would silently fall back to "dev".
+.PHONY: deb
+deb: deb-image
+	mkdir -p $(DEB_OUT)
+	docker run --rm \
+		-v "$(CURDIR)":/src:ro \
+		-v "$(CURDIR)/$(DEB_OUT)":/out \
+		-e VERSION=$(VERSION) -e REVISION=$(REVISION) -e DEB_VERSION=$(DEB_VERSION) \
+		$(DEB_IMAGE) /src/debian/build-in-docker.sh
+
+# deb-lint runs lintian over the built package.
+.PHONY: deb-lint
+deb-lint:
+	docker run --rm -u "$$(id -u):$$(id -g)" \
+		-v "$(CURDIR)/$(DEB_OUT)":/out:ro $(DEB_IMAGE) \
+		sh -c 'lintian -I /out/*.changes'
+
+# deb-test install-tests the .deb on clean Debian and Ubuntu containers:
+# control fields, install, stamped version, reinstall, remove, purge.
+.PHONY: deb-test
+deb-test:
+	DEB_VERSION=$(DEB_VERSION) VERSION=$(VERSION) ./scripts/deb-test.sh $(DEB_OUT)
+
 # clean removes build artifacts.
 .PHONY: clean
 clean:
