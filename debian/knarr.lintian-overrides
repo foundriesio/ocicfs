@@ -1,0 +1,5 @@
+# The binary is deliberately fully static (cgo disabled): release artifacts
+# must run on any Linux of the right architecture, without a libc dependency.
+knarr: statically-linked-binary [usr/bin/knarr]
+# No manual page yet; cobra-generated pages may be added later.
+knarr: no-manual-page [usr/bin/knarr]
