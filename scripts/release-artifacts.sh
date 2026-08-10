@@ -48,6 +48,15 @@ checksums() {
     out="knarr_${ver}_checksums.txt"
     cd dist
     rm -f "$out"
+    # GitHub replaces "~" in release asset names, so an rc .deb
+    # (0.1.0~rc.1) would be served under a name the checksums file does
+    # not list. Apply the same substitution before checksumming; dpkg
+    # reads the version from the package metadata, not the filename.
+    for f in knarr_*~*; do
+        if [ -e "$f" ]; then
+            mv "$f" "$(printf '%s' "$f" | tr '~' '.')"
+        fi
+    done
     sha256sum knarr_* > "$out"
     echo "dist/$out"
 }

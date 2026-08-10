@@ -14,6 +14,9 @@ maintainer's job is choosing the version, writing the summary, and tagging.
   (Debian version `X.Y.Z~rc.N`, sorting before the final). The first
   release of a series should go through at least one rc: the rc run
   exercises the entire pipeline end to end without claiming "latest".
+  Because GitHub strips `~` from asset filenames, rc `.deb` assets are
+  published — and checksummed — with `~` replaced by `.`; the version
+  inside the package keeps the `~`.
 
 ## Required checks
 
