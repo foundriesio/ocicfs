@@ -16,6 +16,7 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"github.com/foundriesio/knarr/internal/composefs"
 	"github.com/foundriesio/knarr/internal/digestutil"
 	"github.com/foundriesio/knarr/internal/imagestore"
 	"github.com/foundriesio/knarr/internal/materialize"
@@ -96,6 +97,14 @@ func (e *engine) pull(ctx context.Context, ref string, opts ...PullOption) (*Ima
 			Digest: desc.Identity.Digest.String(),
 			Size:   cached.descriptor.Size,
 		}, nil
+	}
+
+	// Materialize only reaches mkcomposefs after every layer is downloaded and
+	// unpacked; check it here so a missing binary fails in seconds, not after
+	// the whole download. The cached path above never builds an image and
+	// deliberately stays usable without mkcomposefs.
+	if err := composefs.Preflight(); err != nil {
+		return nil, err
 	}
 
 	built, err := materialize.Materialize(ctx, e.obj, e.img, src, root, platform)

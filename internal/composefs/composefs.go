@@ -68,6 +68,16 @@ type Entry struct {
 	MtimeNsec int64             // MTIME (nanoseconds): sub-second part, in [0, 1e9)
 }
 
+// Preflight reports whether the mkcomposefs binary is available. Callers that
+// will eventually reach WriteImage check this up front, so a missing binary
+// fails immediately instead of after the expensive work leading up to it.
+func Preflight() error {
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		return fmt.Errorf("composefs: mkcomposefs not found in PATH (install composefs >= 1.0.8): %w", err)
+	}
+	return nil
+}
+
 // WriteImage streams a composefs dump for entries to a temp file beside out and
 // runs mkcomposefs to produce the EROFS image at out. The dump is written
 // straight to the temp file rather than buffered whole in memory.

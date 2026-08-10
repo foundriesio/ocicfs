@@ -262,3 +262,21 @@ func TestWriteImage(t *testing.T) {
 		t.Fatal("composefs image is empty")
 	}
 }
+
+func TestPreflight(t *testing.T) {
+	empty := t.TempDir()
+	t.Setenv("PATH", empty)
+	if err := Preflight(); err == nil {
+		t.Fatal("Preflight() = nil with empty PATH, want error")
+	} else if !strings.Contains(err.Error(), "mkcomposefs") {
+		t.Fatalf("Preflight() error %q does not name mkcomposefs", err)
+	}
+
+	fake := filepath.Join(empty, "mkcomposefs")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := Preflight(); err != nil {
+		t.Fatalf("Preflight() = %v with mkcomposefs on PATH, want nil", err)
+	}
+}

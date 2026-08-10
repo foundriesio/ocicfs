@@ -105,6 +105,12 @@ type PlatformResult struct {
 // or the Options.Platform child of the index ref names — and pushes the
 // changed manifests in the same repository unless DryRun is set.
 func Seal(ctx context.Context, ref string, opts Options) (Result, error) {
+	// Sealing builds the merged EROFS with mkcomposefs after reading every
+	// layer; check the binary up front so a missing one fails immediately.
+	if err := composefs.Preflight(); err != nil {
+		return Result{}, err
+	}
+
 	input, err := name.NewDigest(ref)
 	if err != nil {
 		return Result{}, fmt.Errorf("ociseal: parse reference: %w", err)
