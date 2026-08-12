@@ -358,6 +358,12 @@ type Engine interface {
 	// anything, except orphan view entries, which exist only after external
 	// damage and are counted only when actually swept.
 	GC(ctx context.Context, opts ...GCOption) (*GCReport, error)
+	// Preflight verifies the prerequisites for building images into the
+	// store: mkcomposefs is on PATH and the store's filesystem can enable
+	// fs-verity. Pull runs the same checks on its own before it needs them;
+	// Preflight lets a caller that will feed builds into the store fail fast
+	// at startup, with the same errors, instead of at its first image.
+	Preflight() error
 }
 
 // Config configures a new Engine.
