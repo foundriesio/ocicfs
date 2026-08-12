@@ -7,9 +7,10 @@ import (
 	"github.com/foundriesio/knarr/internal/composefs"
 )
 
-func (e *engine) Preflight() error {
-	if err := composefs.Preflight(); err != nil {
-		return err
-	}
+func (e *engine) PreflightTools() error {
+	return composefs.Preflight()
+}
+
+func (e *engine) PreflightStore() error {
 	return e.obj.CheckVerity()
 }
