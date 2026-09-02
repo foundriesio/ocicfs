@@ -29,6 +29,7 @@ import (
 
 	"github.com/foundriesio/knarr/internal/composefs"
 	"github.com/foundriesio/knarr/internal/digestutil"
+	"github.com/foundriesio/knarr/internal/objectstore"
 	"github.com/foundriesio/knarr/internal/ocichain"
 	"github.com/foundriesio/knarr/internal/ocilayout"
 	"github.com/foundriesio/knarr/internal/ociremote"
@@ -208,13 +209,13 @@ func (m rawManifest) MediaType() (types.MediaType, error) {
 	return m.mediaType, nil
 }
 
-func (hashSink) WriteObject(ctx context.Context, r io.Reader) (digest.Digest, string, error) {
+func (hashSink) WriteObject(ctx context.Context, r io.Reader) (digest.Digest, objectstore.Sealed, error) {
 	h := sha256.New()
 	fsv, err := verity.Digest(ctx, io.TeeReader(r, h))
 	if err != nil {
-		return "", "", fmt.Errorf("ociseal: hash object: %w", err)
+		return "", nil, fmt.Errorf("ociseal: hash object: %w", err)
 	}
-	return digest.NewDigest(digest.SHA256, h), fsv, nil
+	return digest.NewDigest(digest.SHA256, h), objectstore.Resolved(fsv), nil
 }
 
 func seal(ctx context.Context, src ocichain.BlobSource, repo name.Repository, root digest.Digest, want *ocispec.Platform, tag *name.Tag, dryRun, allowFallback bool) (Result, error) {

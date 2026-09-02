@@ -44,9 +44,9 @@ type Image struct {
 }
 
 // ObjectSink records a regular file's content and returns its content digest
-// and fs-verity digest formatted as "sha256:<hex>".
+// and a Sealed resolving to its fs-verity digest, which may still be pending.
 type ObjectSink interface {
-	WriteObject(ctx context.Context, r io.Reader) (digest.Digest, string, error)
+	WriteObject(ctx context.Context, r io.Reader) (digest.Digest, objectstore.Sealed, error)
 }
 
 // Assemble merges decompressed layer tar streams, writes regular files larger
@@ -58,12 +58,35 @@ type ObjectSink interface {
 // [0, len(diffIDs)). It is called once per layer, in order, and at most one
 // returned reader is open at a time: each is read to EOF and closed before the
 // next is opened.
-func Assemble(ctx context.Context, store *objectstore.Store, openLayer func(int) (io.ReadCloser, error), diffIDs []digest.Digest) (Image, error) {
+func Assemble(ctx context.Context, store *objectstore.Store, openLayer func(int) (io.ReadCloser, error), diffIDs []digest.Digest) (img Image, err error) {
 	if store == nil {
 		return Image{}, errors.New("rootfs: nil CAS store")
 	}
-	entries, canonical, err := BuildEntries(ctx, store, openLayer, diffIDs)
+	// Objects are sealed on the writer's background worker while the layer walk
+	// goes on producing them. Defers run last-in first-out: on an error return
+	// the cancel runs before the deferred Close, so the queue drains by
+	// discarding its temps instead of sealing objects for a pull that has
+	// already failed. The success path closes explicitly first, so every
+	// object — including ones a later layer removed from the tree — is sealed
+	// before the image is written. A worker failure the walk did not observe
+	// is reported alongside the walk's own error rather than dropped; a
+	// context error is not, being either the cancellation this error path
+	// itself induces or the caller's own, which the walk already reported.
+	wctx, cancel := context.WithCancel(ctx)
+	w := store.NewWriter(wctx)
+	defer func() {
+		cerr := w.Close()
+		if cerr == nil || errors.Is(err, cerr) || errors.Is(cerr, context.Canceled) || errors.Is(cerr, context.DeadlineExceeded) {
+			return
+		}
+		err = errors.Join(err, cerr)
+	}()
+	defer cancel()
+	entries, canonical, err := BuildEntries(wctx, w, openLayer, diffIDs)
 	if err != nil {
+		return Image{}, err
+	}
+	if err := w.Close(); err != nil {
 		return Image{}, err
 	}
 
@@ -88,10 +111,14 @@ func Assemble(ctx context.Context, store *objectstore.Store, openLayer func(int)
 	if err != nil {
 		return Image{}, fmt.Errorf("rootfs: open composefs image: %w", err)
 	}
-	d, fsv, err := store.WriteObject(ctx, f)
+	d, sealed, err := store.WriteObject(ctx, f)
 	if closeErr := f.Close(); closeErr != nil && err == nil {
 		err = closeErr
 	}
+	if err != nil {
+		return Image{}, fmt.Errorf("rootfs: store composefs image: %w", err)
+	}
+	fsv, err := sealed()
 	if err != nil {
 		return Image{}, fmt.Errorf("rootfs: store composefs image: %w", err)
 	}
@@ -141,8 +168,9 @@ func tempOutput(dir string) (string, error) {
 }
 
 // node is one name in the merged tree while layers are applied: its metadata,
-// the content bytes (for a small inlined regular file) or the content and
-// fs-verity digests (for a stored one), and the index of the
+// the content bytes (for a small inlined regular file) or the content digest
+// and the pending fs-verity digest (for a stored one — sealed resolves it, and
+// verity holds it once resolved), and the index of the
 // layer that last wrote it (so an opaque marker removes only lower-layer names).
 // A hardlink name carries only link and layer: link points at the node holding
 // the shared inode's metadata and content, so every name of one inode reads the
@@ -157,6 +185,7 @@ type node struct {
 	linkname  string
 	content   []byte
 	digest    digest.Digest
+	sealed    objectstore.Sealed
 	verity    digest.Digest
 	size      int64
 	mtimeSec  int64
@@ -195,6 +224,9 @@ func BuildEntries(ctx context.Context, sink ObjectSink, openLayer func(int) (io.
 			return nil, false, errors.Join(applyErr, closeErr)
 		}
 		diverged = diverged || layerDiverged
+	}
+	if err := resolveSealed(tree); err != nil {
+		return nil, false, err
 	}
 	synthesized, err := ensureParents(tree)
 	if err != nil {
@@ -326,13 +358,9 @@ func applyHeader(ctx context.Context, sink ObjectSink, tree map[string]*node, tr
 		if sink == nil {
 			return errors.New("regular file requires object sink")
 		}
-		d, fsv, err := sink.WriteObject(ctx, tr)
+		d, sealed, err := sink.WriteObject(ctx, tr)
 		if err != nil {
 			return fmt.Errorf("write object for %s: %w", name, err)
-		}
-		verity, err := digestutil.ParseSHA256(fsv)
-		if err != nil {
-			return fmt.Errorf("parse fs-verity digest for %s: %w", name, err)
 		}
 		tree[name] = &node{
 			mode:      modeFromHeader(hdr, 0),
@@ -340,7 +368,7 @@ func applyHeader(ctx context.Context, sink ObjectSink, tree map[string]*node, tr
 			gid:       hdr.Gid,
 			xattrs:    xattrsFromHeader(hdr),
 			digest:    d,
-			verity:    verity,
+			sealed:    sealed,
 			size:      hdr.Size,
 			mtimeSec:  sec,
 			mtimeNsec: nsec,
@@ -461,6 +489,32 @@ func normalizeName(name string) (string, error) {
 func splitPath(name string) (string, string) {
 	dir, base := path.Split(name)
 	return strings.TrimSuffix(dir, "/"), base
+}
+
+// resolveSealed fills in the fs-verity digest of every stored payload node once
+// its object is sealed, waiting as needed. Payloads are reached through
+// hardlink wrappers as well as by name: a payload whose own name was whited
+// out survives only via link. Each payload is resolved once.
+func resolveSealed(tree map[string]*node) error {
+	for name, n := range tree {
+		if n.link != nil {
+			n = n.link
+		}
+		if n.sealed == nil {
+			continue
+		}
+		fsv, err := n.sealed()
+		if err != nil {
+			return fmt.Errorf("rootfs: seal object for %s: %w", name, err)
+		}
+		verity, err := digestutil.ParseSHA256(fsv)
+		if err != nil {
+			return fmt.Errorf("rootfs: parse fs-verity digest for %s: %w", name, err)
+		}
+		n.verity = verity
+		n.sealed = nil
+	}
+	return nil
 }
 
 // removeSubtree deletes target and everything beneath it, implementing a whiteout.

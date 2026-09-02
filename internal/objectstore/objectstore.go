@@ -366,13 +366,18 @@ func (cr *ctxReader) Read(p []byte) (int, error) {
 }
 
 // WriteObject streams r into the store, seals it with fs-verity, and commits it
-// at the content-addressed path. It returns the computed content digest and the
-// measured fs-verity digest. The object's digest is not known in advance: it is
-// whatever the bytes hash to. On a collision it confirms the existing object's
-// measured fs-verity digest matches the staged one rather than overwriting it,
-// and returns that object's measured fs-verity digest.
-func (s *Store) WriteObject(ctx context.Context, r io.Reader) (digest.Digest, string, error) {
-	return s.writeSealed(ctx, ".object-*", "", r)
+// at the content-addressed path. It returns the computed content digest and an
+// already-resolved Sealed carrying the measured fs-verity digest. The object's
+// digest is not known in advance: it is whatever the bytes hash to. On a
+// collision it confirms the existing object's measured fs-verity digest matches
+// the staged one rather than overwriting it, and reports that object's
+// measured fs-verity digest.
+func (s *Store) WriteObject(ctx context.Context, r io.Reader) (digest.Digest, Sealed, error) {
+	d, fsv, err := s.writeSealed(ctx, ".object-*", "", r)
+	if err != nil {
+		return "", nil, err
+	}
+	return d, Resolved(fsv), nil
 }
 
 // verifyCollision confirms the object already at path is the one we just staged

@@ -31,6 +31,11 @@ const (
 // than once; every call returns the same result.
 type Sealed func() (string, error)
 
+// Resolved returns a Sealed that already holds fsv, for objects sealed inline.
+func Resolved(fsv string) Sealed {
+	return func() (string, error) { return fsv, nil }
+}
+
 // Writer stores objects with the fs-verity enable, measure and commit steps
 // running on a background worker, so the goroutine producing the objects is
 // not held up by each one's sealing. WriteObject stages the bytes on the

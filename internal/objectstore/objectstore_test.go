@@ -52,6 +52,18 @@ func newVerityStore(t *testing.T) *Store {
 	return s
 }
 
+// writeObject writes r through the synchronous path and returns its content
+// and fs-verity digests, resolving the already-sealed result.
+func writeObject(t *testing.T, s *Store, ctx context.Context, r io.Reader) (digest.Digest, string, error) {
+	t.Helper()
+	d, sealed, err := s.WriteObject(ctx, r)
+	if err != nil {
+		return "", "", err
+	}
+	fsv, err := sealed()
+	return d, fsv, err
+}
+
 // skipIfNoVerity skips the test when err reports that the test filesystem does
 // not support fs-verity, so the verity-dependent paths stay meaningful only where
 // fs-verity is actually available.
@@ -66,7 +78,7 @@ func TestWriteObjectRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	content := []byte("hello knarr object")
 
-	d, fsv, err := s.WriteObject(ctx, bytes.NewReader(content))
+	d, fsv, err := writeObject(t, s, ctx, bytes.NewReader(content))
 	skipIfNoVerity(t, err)
 	if err != nil {
 		t.Fatalf("WriteObject: %v", err)
@@ -86,7 +98,7 @@ func TestWriteObjectRoundTrip(t *testing.T) {
 
 	// Re-writing identical content dedups via the collision path and still
 	// reports the existing object's fs-verity digest.
-	d2, fsv2, err := s.WriteObject(ctx, bytes.NewReader(content))
+	d2, fsv2, err := writeObject(t, s, ctx, bytes.NewReader(content))
 	if err != nil {
 		t.Fatalf("WriteObject dedup: %v", err)
 	}
@@ -120,7 +132,7 @@ func TestWriteObjectLinksView(t *testing.T) {
 	s := newVerityStore(t)
 	content := []byte("view-linked object")
 
-	d, fsv, err := s.WriteObject(context.Background(), bytes.NewReader(content))
+	d, fsv, err := writeObject(t, s, context.Background(), bytes.NewReader(content))
 	skipIfNoVerity(t, err)
 	if err != nil {
 		t.Fatalf("WriteObject: %v", err)
@@ -154,7 +166,7 @@ func TestWriteObjectRepairsView(t *testing.T) {
 	ctx := context.Background()
 	content := []byte("repair my view link")
 
-	d, fsv, err := s.WriteObject(ctx, bytes.NewReader(content))
+	d, fsv, err := writeObject(t, s, ctx, bytes.NewReader(content))
 	skipIfNoVerity(t, err)
 	if err != nil {
 		t.Fatalf("WriteObject: %v", err)
@@ -178,7 +190,7 @@ func TestWriteObjectViewMismatch(t *testing.T) {
 	ctx := context.Background()
 	content := []byte("mismatch content")
 
-	d, fsv, err := s.WriteObject(ctx, bytes.NewReader(content))
+	d, fsv, err := writeObject(t, s, ctx, bytes.NewReader(content))
 	skipIfNoVerity(t, err)
 	if err != nil {
 		t.Fatalf("WriteObject: %v", err)
@@ -224,7 +236,7 @@ func TestWriteObjectConcurrentView(t *testing.T) {
 	for i := range writers {
 		go func(i int) {
 			defer wg.Done()
-			_, fsvs[i], errs[i] = s.WriteObject(context.Background(), bytes.NewReader(content))
+			_, fsvs[i], errs[i] = writeObject(t, s, context.Background(), bytes.NewReader(content))
 		}(i)
 	}
 	wg.Wait()
@@ -245,7 +257,7 @@ func TestWriteObjectCollisionForeignView(t *testing.T) {
 	ctx := context.Background()
 	content := []byte("collision foreign view")
 
-	_, fsv, err := s.WriteObject(ctx, bytes.NewReader(content))
+	_, fsv, err := writeObject(t, s, ctx, bytes.NewReader(content))
 	skipIfNoVerity(t, err)
 	if err != nil {
 		t.Fatalf("WriteObject: %v", err)
@@ -481,7 +493,7 @@ func TestWalkListsObjects(t *testing.T) {
 func TestRemoveDeletesBothNames(t *testing.T) {
 	s := newVerityStore(t)
 	ctx := context.Background()
-	d, fsv, err := s.WriteObject(ctx, strings.NewReader("remove me"))
+	d, fsv, err := writeObject(t, s, ctx, strings.NewReader("remove me"))
 	if err != nil {
 		t.Fatalf("WriteObject: %v", err)
 	}
@@ -555,11 +567,11 @@ func TestRemoveRefusesInUseObject(t *testing.T) {
 func TestSweepViewOrphans(t *testing.T) {
 	s := newVerityStore(t)
 	ctx := context.Background()
-	orphan, orphanFsv, err := s.WriteObject(ctx, strings.NewReader("orphan"))
+	orphan, orphanFsv, err := writeObject(t, s, ctx, strings.NewReader("orphan"))
 	if err != nil {
 		t.Fatalf("WriteObject: %v", err)
 	}
-	_, keptFsv, err := s.WriteObject(ctx, strings.NewReader("kept"))
+	_, keptFsv, err := writeObject(t, s, ctx, strings.NewReader("kept"))
 	if err != nil {
 		t.Fatalf("WriteObject: %v", err)
 	}
@@ -640,7 +652,7 @@ func TestWriteRepairsMissingViewLink(t *testing.T) {
 	s := newVerityStore(t)
 	ctx := context.Background()
 	const body = "repair my view link"
-	_, fsv, err := s.WriteObject(ctx, strings.NewReader(body))
+	_, fsv, err := writeObject(t, s, ctx, strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("WriteObject: %v", err)
 	}

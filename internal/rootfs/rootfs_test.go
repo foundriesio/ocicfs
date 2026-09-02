@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/foundriesio/knarr/internal/devtest"
 	"github.com/foundriesio/knarr/internal/digestutil"
 	"github.com/foundriesio/knarr/internal/objectstore"
+	"github.com/foundriesio/knarr/internal/verity"
 )
 
 func TestNormalizeName(t *testing.T) {
@@ -1192,5 +1194,255 @@ func TestTransformNonDirectoryParentDiverges(t *testing.T) {
 	_, canonical := buildInline(t, layer)
 	if canonical {
 		t.Fatal("non-directory parent at insert time reported canonical")
+	}
+}
+
+// writerFixture is a multi-layer image exercising every way the merge can drop
+// a node whose object is still queued for sealing — a whiteout, an opaque
+// directory, a last-writer replacement — plus a hardlink whose target name is
+// whited out, so its payload survives only through the link.
+func writerFixture(t *testing.T) ([][]byte, []digest.Digest) {
+	t.Helper()
+	layer1 := tarBytes(t,
+		tarEntry{name: "bin", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "bin/app", typ: tar.TypeReg, mode: 0o755, body: large("app")},
+		tarEntry{name: "bin/alias", typ: tar.TypeLink, link: "bin/app"},
+		tarEntry{name: "bin/gone", typ: tar.TypeReg, mode: 0o644, body: large("gone")},
+		tarEntry{name: "bin/replaced", typ: tar.TypeReg, mode: 0o644, body: large("old")},
+		tarEntry{name: "cache", typ: tar.TypeDir, mode: 0o755},
+		tarEntry{name: "cache/a", typ: tar.TypeReg, mode: 0o644, body: large("cache a")},
+		tarEntry{name: "cache/b", typ: tar.TypeReg, mode: 0o644, body: large("cache b")},
+	)
+	layer2 := tarBytes(t,
+		tarEntry{name: "bin/.wh.app", typ: tar.TypeReg, mode: 0o000},
+		tarEntry{name: "bin/.wh.gone", typ: tar.TypeReg, mode: 0o000},
+		tarEntry{name: "bin/replaced", typ: tar.TypeReg, mode: 0o644, body: large("new")},
+		tarEntry{name: "cache/.wh..wh..opq", typ: tar.TypeReg, mode: 0o000},
+		tarEntry{name: "cache/c", typ: tar.TypeReg, mode: 0o644, body: large("cache c")},
+	)
+	return [][]byte{layer1, layer2}, []digest.Digest{digest.FromBytes(layer1), digest.FromBytes(layer2)}
+}
+
+// TestBuildEntriesWriterMatchesSynchronousBuild asserts that building through
+// a Writer yields exactly the entries the synchronous store path yields — the
+// fs-verity digest of a payload reachable only through a hardlink included —
+// and that the objects the merge dropped are still sealed and no temp is left.
+func TestBuildEntriesWriterMatchesSynchronousBuild(t *testing.T) {
+	store := newVerityStore(t)
+	layers, diffIDs := writerFixture(t)
+
+	want, _, err := BuildEntries(context.Background(), store, openTestLayers(t, layers...), diffIDs)
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("synchronous BuildEntries: %v", err)
+	}
+
+	w := store.NewWriter(context.Background())
+	got, _, err := BuildEntries(context.Background(), w, openTestLayers(t, layers...), diffIDs)
+	if err != nil {
+		t.Fatalf("Writer BuildEntries: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Writer entries differ from synchronous entries:\n got %#v\nwant %#v", got, want)
+	}
+	byPath := entriesByPath(got)
+	if _, ok := byPath["/bin/app"]; ok {
+		t.Fatal("whiteout did not remove /bin/app")
+	}
+	alias := byPath["/bin/alias"]
+	if alias.Hardlink != "" || alias.Digest != digest.FromBytes([]byte(large("app"))) || alias.Verity == "" {
+		t.Fatalf("/bin/alias = %#v, want the surviving payload with its fs-verity digest", alias)
+	}
+	if got := byPath["/bin/replaced"]; got.Digest != digest.FromBytes([]byte(large("new"))) || got.Verity == "" {
+		t.Fatalf("/bin/replaced = %#v, want the layer-2 payload with its fs-verity digest", got)
+	}
+	// Dropped nodes' objects were still sealed and committed, not leaked.
+	for _, body := range []string{large("gone"), large("old"), large("cache a"), large("cache b")} {
+		if ok, err := store.Has(digest.FromBytes([]byte(body))); err != nil || !ok {
+			t.Fatalf("dropped object %q: Has = %v, %v; want committed", body, ok, err)
+		}
+	}
+	temps, err := os.ReadDir(store.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("temps left after Close: %d", len(temps))
+	}
+}
+
+// TestAssembleWriterErrorSurfacesByName asserts a failure on the sealing
+// worker — a tampered object already at the CAS path of a file the layer
+// stores — fails Assemble with that error, not with the cancellation it
+// triggered, and leaves no temp behind. The poisoned file is the only stored
+// object and is whited out by the next layer, so no surviving node carries a
+// Sealed and no later WriteObject observes the failure: the error can reach
+// Assemble only through the writer's Close on the success path.
+func TestAssembleWriterErrorSurfacesByName(t *testing.T) {
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+	store := newVerityStore(t)
+	content := []byte(large("authentic"))
+	seedTamperedObject(t, store, content)
+
+	layer1 := tarBytes(t,
+		tarEntry{name: "a", typ: tar.TypeReg, mode: 0o644, body: string(content)},
+	)
+	layer2 := tarBytes(t,
+		tarEntry{name: ".wh.a", typ: tar.TypeReg, mode: 0o000},
+	)
+	_, err := Assemble(context.Background(), store, openTestLayers(t, layer1, layer2), []digest.Digest{
+		digest.FromBytes(layer1),
+		digest.FromBytes(layer2),
+	})
+	if err == nil {
+		t.Fatal("Assemble succeeded over a tampered object")
+	}
+	if errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "fs-verity digest mismatch") {
+		t.Fatalf("Assemble error = %v, want the collision mismatch by name", err)
+	}
+	temps, err := os.ReadDir(store.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("temps left after failed Assemble: %d", len(temps))
+	}
+}
+
+// seedTamperedObject pre-seeds a wrong-bytes, verity-enabled object at the
+// CAS path content would commit to, so storing content later collides with
+// it and the sealing worker fails on the mismatch.
+func seedTamperedObject(t *testing.T, store *objectstore.Store, content []byte) {
+	t.Helper()
+	finalPath, err := store.ObjectPath(digest.FromBytes(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(finalPath, []byte("tampered"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(finalPath) // #nosec G304 -- store-owned test path
+	if err != nil {
+		t.Fatal(err)
+	}
+	verr := verity.Enable(f)
+	_ = f.Close()
+	skipIfNoVerity(t, verr)
+	if verr != nil {
+		t.Fatalf("seed verity: %v", verr)
+	}
+}
+
+// holdEOFUntilSealed serves r and delays its EOF until the store's temp dir is
+// empty, i.e. until the worker has finished with every object queued so far,
+// so the walk's own end-of-stream failure is guaranteed to land after the
+// worker's.
+type holdEOFUntilSealed struct {
+	r        io.Reader
+	store    *objectstore.Store
+	deadline time.Time
+}
+
+func (h *holdEOFUntilSealed) Read(p []byte) (int, error) {
+	n, err := h.r.Read(p)
+	if !errors.Is(err, io.EOF) {
+		return n, err
+	}
+	for {
+		temps, derr := os.ReadDir(h.store.TempDir())
+		if derr != nil {
+			return n, derr
+		}
+		if len(temps) == 0 {
+			return n, io.EOF
+		}
+		if time.Now().After(h.deadline) {
+			return n, errors.New("holdEOFUntilSealed: temps still present at deadline")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestAssembleReportsWorkerErrorWithLayerError asserts that when the walk
+// fails on its own — here a diff_id mismatch at end of stream — after the
+// worker has already failed on a tampered collision the walk never observed,
+// Assemble reports both errors rather than dropping the worker's.
+func TestAssembleReportsWorkerErrorWithLayerError(t *testing.T) {
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+	store := newVerityStore(t)
+	content := []byte(large("authentic"))
+	seedTamperedObject(t, store, content)
+
+	layer := tarBytes(t,
+		tarEntry{name: "a", typ: tar.TypeReg, mode: 0o644, body: string(content)},
+	)
+	openLayer := func(int) (io.ReadCloser, error) {
+		return io.NopCloser(&holdEOFUntilSealed{r: bytes.NewReader(layer), store: store, deadline: time.Now().Add(10 * time.Second)}), nil
+	}
+	wrong := digest.FromBytes([]byte("not this layer"))
+	_, err := Assemble(context.Background(), store, openLayer, []digest.Digest{wrong})
+	if err == nil {
+		t.Fatal("Assemble succeeded")
+	}
+	for _, want := range []string{"diff_id mismatch", "fs-verity digest mismatch"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Assemble error = %v, want it to report %q", err, want)
+		}
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("Assemble error reports the induced cancellation: %v", err)
+	}
+	temps, err := os.ReadDir(store.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("temps left after failed Assemble: %d", len(temps))
+	}
+}
+
+// TestAssembleLayerErrorDiscardsQueue asserts that a layer failing after its
+// objects were queued — here a diff_id mismatch — returns with no temp left
+// behind, whichever side of the queue owned each temp at the moment of the
+// failure. (That queued jobs are discarded rather than sealed is pinned
+// deterministically by objectstore's TestWriterCancelDiscardsQueue.)
+func TestAssembleLayerErrorDiscardsQueue(t *testing.T) {
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+	store := newVerityStore(t)
+	if _, sealed, err := store.WriteObject(context.Background(), strings.NewReader("probe")); err != nil {
+		skipIfNoVerity(t, err)
+		t.Fatalf("WriteObject probe: %v", err)
+	} else if _, err := sealed(); err != nil {
+		t.Fatal(err)
+	}
+
+	var entries []tarEntry
+	for i := range 16 {
+		entries = append(entries, tarEntry{name: fmt.Sprintf("f%d", i), typ: tar.TypeReg, mode: 0o644, body: large(fmt.Sprintf("file %d", i))})
+	}
+	layer := tarBytes(t, entries...)
+	wrong := digest.FromBytes([]byte("not this layer"))
+	_, err := Assemble(context.Background(), store, openTestLayers(t, layer), []digest.Digest{wrong})
+	if err == nil || !strings.Contains(err.Error(), "diff_id mismatch") {
+		t.Fatalf("Assemble error = %v, want diff_id mismatch", err)
+	}
+	temps, err := os.ReadDir(store.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("temps left after failed Assemble: %d", len(temps))
 	}
 }
