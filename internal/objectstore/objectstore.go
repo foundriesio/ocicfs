@@ -192,6 +192,22 @@ func (s *Store) CheckVerity() error {
 // digest matches the staged one rather than overwriting an immutable object, and
 // returns that object's measured fs-verity digest.
 func (s *Store) writeSealed(ctx context.Context, tempPrefix string, expect digest.Digest, r io.Reader) (digest.Digest, string, error) {
+	tempPath, d, err := s.stage(ctx, tempPrefix, expect, r)
+	if err != nil {
+		return "", "", err
+	}
+	fsv, err := s.seal(ctx, tempPath, d)
+	if err != nil {
+		return "", "", err
+	}
+	return d, fsv, nil
+}
+
+// stage streams r into a unique store temp while hashing and returns the temp
+// path and the computed content digest. When expect is non-empty the bytes must
+// hash to it. The temp is closed and owned by the caller on success; on any
+// error stage removes it and returns nothing.
+func (s *Store) stage(ctx context.Context, tempPrefix string, expect digest.Digest, r io.Reader) (string, digest.Digest, error) {
 	if err := ctx.Err(); err != nil {
 		return "", "", fmt.Errorf("objectstore: %w", err)
 	}
@@ -200,68 +216,81 @@ func (s *Store) writeSealed(ctx context.Context, tempPrefix string, expect diges
 		return "", "", fmt.Errorf("objectstore: create object temp: %w", err)
 	}
 	tempPath := f.Name()
-	defer func() {
-		if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			slog.Warn("objectstore: failed to remove temp file", "path", tempPath, "err", err)
-		}
-	}()
+	fail := func(err error) (string, digest.Digest, error) {
+		_ = f.Close()
+		removeTemp(tempPath)
+		return "", "", err
+	}
 
 	h := sha256.New()
 	if _, err := io.Copy(io.MultiWriter(f, h), &ctxReader{ctx: ctx, r: r}); err != nil {
-		_ = f.Close()
-		return "", "", fmt.Errorf("objectstore: write %s: %w", tempPath, err)
+		return fail(fmt.Errorf("objectstore: write %s: %w", tempPath, err))
 	}
 	d := digest.NewDigest(digest.SHA256, h)
 
-	// Reject mismatched content before sealing or committing, so a bad input
-	// leaves no object behind (the temp is removed by the deferred cleanup).
+	// Reject mismatched content before it can be sealed or committed, so a bad
+	// input leaves no object behind.
 	if expect != "" && d != expect {
-		_ = f.Close()
-		return "", "", fmt.Errorf("objectstore: blob digest mismatch: expected %s, got %s", expect, d)
+		return fail(fmt.Errorf("objectstore: blob digest mismatch: expected %s, got %s", expect, d))
 	}
 
-	// Stop before sealing and committing if the pull was canceled while the copy
-	// completed, so an abandoned object is not made permanent (its temp is removed
-	// by the deferred cleanup).
-	if err := ctx.Err(); err != nil {
-		_ = f.Close()
-		return "", "", fmt.Errorf("objectstore: %w", err)
-	}
-
-	// fs-verity cannot be enabled while a writable descriptor is open, so close
-	// the writable handle, then reopen read-only to enable and measure verity.
-	// The window between close and enable is not a tampering vector: the temp was
-	// created 0600 in the store's private temp dir, owned by the single privileged
-	// knarr process, so no other principal can open it for writing (one that already
-	// holds that privilege is outside the threat model). Once enabled, fs-verity
-	// makes the bytes immutable and kernel-verified on every read for the life of the
-	// object.
-	// No fsync is taken per object: a pull makes all of its writes durable with a
-	// single store-wide Sync before it writes the binding that references them.
+	// fs-verity cannot be enabled while a writable descriptor is open, so the
+	// writable handle is closed here and seal reopens the temp read-only. The
+	// window in between is not a tampering vector: the temp was created 0600 in
+	// the store's private temp dir, owned by the single privileged knarr process,
+	// so no other principal can open it for writing (one that already holds that
+	// privilege is outside the threat model).
 	if err := f.Close(); err != nil {
+		removeTemp(tempPath)
 		return "", "", fmt.Errorf("objectstore: close temp: %w", err)
 	}
+	return tempPath, d, nil
+}
 
+// seal enables fs-verity on the staged temp whose content digest is d, measures
+// it, and commits it at the content-addressed path with no-replace semantics,
+// returning the measured fs-verity digest. On a collision it confirms the
+// existing object's measured fs-verity digest matches the staged one rather
+// than overwriting an immutable object, and returns that object's digest. The
+// temp is consumed on every path: renamed into place on success, removed
+// otherwise. Once enabled, fs-verity makes the bytes immutable and
+// kernel-verified on every read for the life of the object. No fsync is taken
+// per object: a pull makes all of its writes durable with a single store-wide
+// Sync before it writes the binding that references them.
+func (s *Store) seal(ctx context.Context, tempPath string, d digest.Digest) (string, error) {
+	defer removeTemp(tempPath)
+
+	// Stop before sealing if the pull was canceled while the temp was staged,
+	// so an abandoned object is not made permanent.
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("objectstore: %w", err)
+	}
 	rf, err := os.Open(tempPath) // #nosec G304 -- store-owned temp path
 	if err != nil {
-		return "", "", fmt.Errorf("objectstore: reopen temp: %w", err)
+		return "", fmt.Errorf("objectstore: reopen temp: %w", err)
 	}
 	if err := verity.Enable(rf); err != nil {
 		_ = rf.Close()
-		return "", "", fmt.Errorf("objectstore: enable verity on temp: %w", err)
+		return "", fmt.Errorf("objectstore: enable verity on temp: %w", err)
+	}
+	// The enable ioctl cannot be interrupted, so check again before the object
+	// is committed: a pull canceled during the ioctl must not publish it.
+	if err := ctx.Err(); err != nil {
+		_ = rf.Close()
+		return "", fmt.Errorf("objectstore: %w", err)
 	}
 	fsv, err := verity.Measure(rf)
 	if err != nil {
 		_ = rf.Close()
-		return "", "", fmt.Errorf("objectstore: measure verity: %w", err)
+		return "", fmt.Errorf("objectstore: measure verity: %w", err)
 	}
 	if err := rf.Close(); err != nil {
-		return "", "", fmt.Errorf("objectstore: close verity temp: %w", err)
+		return "", fmt.Errorf("objectstore: close verity temp: %w", err)
 	}
 
 	finalPath := s.objectPath(d.Hex())
 	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil { // #nosec G301 -- knarr-owned object-store shard dir
-		return "", "", fmt.Errorf("objectstore: create shard dir: %w", err)
+		return "", fmt.Errorf("objectstore: create shard dir: %w", err)
 	}
 	// Commit with no-replace semantics. On collision compare the staged object
 	// against the existing one rather than overwriting an immutable object.
@@ -269,21 +298,21 @@ func (s *Store) writeSealed(ctx context.Context, tempPrefix string, expect diges
 		if errors.Is(err, os.ErrExist) {
 			existingFsv, vErr := s.verifyCollision(finalPath, fsv)
 			if vErr != nil {
-				return "", "", vErr
+				return "", vErr
 			}
 			// The object was already present; repair the view link in case a
 			// prior write committed the object but not its view name.
 			if err := s.linkView(finalPath, existingFsv); err != nil {
-				return "", "", err
+				return "", err
 			}
-			return d, existingFsv, nil
+			return existingFsv, nil
 		}
-		return "", "", fmt.Errorf("objectstore: commit to %s: %w", finalPath, err)
+		return "", fmt.Errorf("objectstore: commit to %s: %w", finalPath, err)
 	}
 	if err := s.linkView(finalPath, fsv); err != nil {
-		return "", "", err
+		return "", err
 	}
-	return d, fsv, nil
+	return fsv, nil
 }
 
 // linkView hardlinks the committed object at objectPath into the fs-verity view
@@ -617,6 +646,14 @@ func (s *Store) PruneEmptyDirs() error {
 		}
 	}
 	return nil
+}
+
+// removeTemp removes a staging temp, logging any failure other than the temp
+// already being gone (renamed into place, or removed on an earlier error path).
+func removeTemp(tempPath string) {
+	if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Warn("objectstore: failed to remove temp file", "path", tempPath, "err", err)
+	}
 }
 
 // shardedDigest reconstructs the sha256 digest a store path names, reporting
