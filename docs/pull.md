@@ -142,6 +142,58 @@ meaning are defined by the
 [composefs OCI sealing specification](https://github.com/composefs/composefs-rs/blob/main/crates/composefs-oci/src/sealing_spec.rs),
 which knarr follows verbatim.
 
+## Embedding: Feeding Layers as They Arrive
+
+`Pull` converts the whole image in one call. An embedder that receives an
+image's layers one at a time — a container runtime unpacking a pull hands its
+snapshotter each layer as it lands — can instead have knarr materialize each
+layer as it arrives, so the last step does only the last layer plus the image
+write rather than the whole conversion. The engine's `NewBuild` starts such a
+pull and returns a `Build`:
+
+```go
+b, err := eng.NewBuild(ctx, ref, knarr.WithBlobSource(src), knarr.WithResolvedRoot(root))
+if err != nil {
+	return err
+}
+defer b.Close()
+for i := range layers {
+	// ... once layer i is in src ...
+	if err := b.Ingest(ctx, i); err != nil {
+		return err
+	}
+}
+img, err := b.Finish(ctx)
+```
+
+`NewBuild` takes the same reference and options as `Pull`, resolves the
+reference, verifies the metadata chain, and decides whether the store already
+holds the image. `Ingest(i)` materializes every layer up to and including `i`
+that has not been materialized yet, in manifest order — a jump forward applies
+every layer in between, an index at or below one already ingested does nothing,
+and on an image the store already held it does nothing at all. `Finish`
+ingests whatever is left, builds and records the image, and returns it exactly
+as `Pull` would; `Pull` itself is `NewBuild` followed by `Finish`, so the two
+paths store the same objects, bindings and reference records, differing only
+in the timestamp a reference record carries.
+
+Rules the build enforces:
+
+- **Each call runs under its own context.** The build keeps no context and
+  starts nothing that outlives a call, so it can span request handlers whose
+  contexts end on return. Each `Ingest` seals that layer's objects before it
+  returns.
+- **One call at a time.** `Ingest`, `Finish`, and `Close` are serialized;
+  `Close` waits for a call in progress to return rather than interrupting it.
+- **Fail closed, and stay failed.** A layer that fails verification fails the
+  build: every later call returns the same error, and nothing is recorded.
+  Calls after `Finish` or `Close` return an error too.
+- **The store is held against `gc` for the build's lifetime.** `gc` reports
+  `ErrStoreBusy` from `NewBuild` until `Finish` or `Close`, downloads
+  included, rather than for the conversion alone. Always `Close` a build that
+  will not `Finish`; objects it already sealed stay as unreferenced content
+  for `gc` to reclaim.
+
 ## Notes
 
 - **Reference forms.** Registry pull accepts `name@sha256:<hex>` and `name:tag`

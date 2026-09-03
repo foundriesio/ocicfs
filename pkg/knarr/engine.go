@@ -101,6 +101,33 @@ type BlobSource interface {
 	Open(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error)
 }
 
+// Build is an image pull whose layers the caller feeds one at a time, for an
+// embedder that receives an image's layers incrementally — a container runtime
+// unpacking a pull — and wants each one materialized as it lands rather than
+// all of them at the end. Each call runs entirely under its own context;
+// nothing a call starts outlives it, so a build may span request handlers.
+// Calls are serialized: one runs at a time, and a call on a build that has
+// finished, been closed, or failed returns an error — after a failure, the
+// same error every time.
+type Build interface {
+	// Ingest materializes every layer up to and including index i that has
+	// not been materialized yet, reading them from the pull's blob source.
+	// Layers are applied in manifest order: a jump forward applies every
+	// layer in between, and an index at or below one already ingested does
+	// nothing. On a build whose image the store already held at NewBuild it
+	// does nothing at all. It is an error after Finish or Close.
+	Ingest(ctx context.Context, i int) error
+	// Finish ingests any remaining layers, builds and records the image, and
+	// returns it; for an image the store already held it records the
+	// reference alone, as Pull does. The build is spent afterwards, whether
+	// or not it succeeded.
+	Finish(ctx context.Context) (*Image, error)
+	// Close abandons an unfinished build and releases the store; objects
+	// already sealed stay in the store as unreferenced content for gc. A
+	// no-op after Finish. It waits for a call in progress to return.
+	Close()
+}
+
 // PullOptions is the resolved configuration a Pull acts on. Callers pass the
 // With* options to Pull, which apply to a zero PullOptions. Exactly one
 // source feeds a pull: FromDir, BlobSource, or — when neither is set — the
@@ -290,6 +317,13 @@ type Engine interface {
 	// returned Image reports, so pulling one image by its index and by its
 	// manifest stores it once.
 	Pull(ctx context.Context, ref string, opts ...PullOption) (*Image, error)
+	// NewBuild starts a pull whose layers are ingested on the caller's cue. It
+	// takes the same reference and options as Pull, resolves the reference
+	// and verifies the metadata chain up front, and returns a Build to feed
+	// layers to; Pull is NewBuild followed by Finish. The store is held
+	// against gc from NewBuild until the build's Finish or Close, so gc
+	// reports ErrStoreBusy for the build's whole lifetime.
+	NewBuild(ctx context.Context, ref string, opts ...PullOption) (Build, error)
 	// Mount mounts ref at target: a single read-only composefs mount by
 	// default, a writable overlay over that composefs base when a writable
 	// With* option opts in, or the image's verified EROFS metadata alone with

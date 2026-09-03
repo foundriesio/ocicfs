@@ -4,7 +4,6 @@
 package knarr
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -16,10 +15,8 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/foundriesio/knarr/internal/composefs"
 	"github.com/foundriesio/knarr/internal/digestutil"
 	"github.com/foundriesio/knarr/internal/imagestore"
-	"github.com/foundriesio/knarr/internal/materialize"
 	"github.com/foundriesio/knarr/internal/objectstore"
 	"github.com/foundriesio/knarr/internal/ocichain"
 	"github.com/foundriesio/knarr/internal/ocilayout"
@@ -28,102 +25,26 @@ import (
 	"github.com/foundriesio/knarr/internal/refstore"
 )
 
-// Pull fetches ref into the local store and returns the stored image.
+// Pull fetches ref into the local store and returns the stored image. It is
+// NewBuild followed by Finish: the whole-image pull and the layer-at-a-time
+// build are one path.
 func (e *engine) Pull(ctx context.Context, ref string, opts ...PullOption) (*Image, error) {
-	img, err := e.pull(ctx, ref, opts...)
+	b, err := e.NewBuild(ctx, ref, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("pull %s: %w", ref, err)
+		return nil, err
 	}
-	return img, nil
+	defer b.Close()
+	return b.Finish(ctx)
 }
 
-func (e *engine) pull(ctx context.Context, ref string, opts ...PullOption) (*Image, error) {
-	var cfg PullOptions
-	for _, opt := range opts {
-		opt(&cfg)
-	}
-
-	// The store lock is held shared across the whole pull: objects are written
-	// before the ref record that makes them wanted, and a concurrent sweep in
-	// that window would eat the staged image. The wait is not interruptible;
-	// the ctx gate right after is the single pre-mutation cancellation check.
-	unlock, err := e.lockStoreShared()
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	src, root, err := pullSource(ctx, ref, cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	platform := hostPlatform()
-	// Descend the pinned root to the image identity before anything is looked up
-	// or recorded, so an index-rooted and a manifest-rooted pull of the same
-	// image converge on one key.
-	desc, fetched, err := e.pullDescent(ctx, src, root, platform)
-	if err != nil {
-		return nil, err
-	}
-
-	if cached, ok, err := verifiedPulledImage(ctx, e.obj, e.img, desc.Identity, platform); err != nil {
-		return nil, err
-	} else if ok {
-		normalized, err := normalizeRef(ref)
-		if err != nil {
-			return nil, err
-		}
-		// Store the root the descent had to fetch: the identity is already local
-		// on this path, but the document the reference resolved to is not, and
-		// the record about to be written names it. Sync before the record so no
-		// ref points at a blob a crash could lose.
-		if fetched != nil {
-			if err := e.obj.WriteBlob(ctx, root, bytes.NewReader(fetched)); err != nil {
-				return nil, err
-			}
-			if err := e.obj.Sync(); err != nil {
-				return nil, err
-			}
-		}
-		if err := e.refs.Put(normalized, desc.Root, desc.Identity, time.Now(), []string{ocilayout.PlatformString(&cached.platform)}); err != nil {
-			return nil, err
-		}
-		return &Image{
-			Ref:    ref,
-			Digest: desc.Identity.Digest.String(),
-			Size:   cached.descriptor.Size,
-		}, nil
-	}
-
-	// Materialize only reaches mkcomposefs after every layer is downloaded and
-	// unpacked; check it here so a missing binary fails in seconds, not after
-	// the whole download. The cached path above never builds an image and
-	// deliberately stays usable without mkcomposefs.
-	if err := composefs.Preflight(); err != nil {
-		return nil, err
-	}
-
-	built, err := materialize.Materialize(ctx, e.obj, e.img, src, root, platform)
-	if err != nil {
-		return nil, err
-	}
+// recordRef records ref, in its normalized form, as resolving to root and
+// keyed by identity for platform.
+func (e *engine) recordRef(ref string, root, identity ocispec.Descriptor, platform ocispec.Platform) error {
 	normalized, err := normalizeRef(ref)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if err := e.refs.Put(normalized, built.RootDesc, built.Identity, time.Now(), []string{ocilayout.PlatformString(&built.Platform)}); err != nil {
-		return nil, err
-	}
-
-	return &Image{
-		Ref:    ref,
-		Digest: built.Identity.Digest.String(),
-		Size:   built.Descriptor.Size,
-	}, nil
+	return e.refs.Put(normalized, root, identity, time.Now(), []string{ocilayout.PlatformString(&platform)})
 }
 
 // pullSource picks where a pull reads its blobs from and the root digest it
