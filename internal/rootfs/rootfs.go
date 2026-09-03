@@ -49,6 +49,94 @@ type ObjectSink interface {
 	WriteObject(ctx context.Context, r io.Reader) (digest.Digest, objectstore.Sealed, error)
 }
 
+// Builder assembles one composefs image from layers handed to it one at a
+// time. Between layers it holds only the merged tree: each Apply runs the
+// store's background sealer for that layer and waits for it before returning,
+// so nothing the caller's context owns outlives the call.
+type Builder struct {
+	store *objectstore.Store
+	m     *merge
+	next  int  // index of the next layer expected
+	spent bool // Finish or Close has run, or an Apply failed
+}
+
+// errBuilderSpent reports a call on a Builder that has finished, been closed,
+// or failed an Apply.
+var errBuilderSpent = errors.New("rootfs: builder is spent")
+
+// NewBuilder returns a Builder that stores objects and the image in store.
+func NewBuilder(store *objectstore.Store) *Builder {
+	return &Builder{store: store, m: newMerge()}
+}
+
+// Apply merges the next layer's decompressed tar stream into the tree. diffID
+// is verified at end of stream. Objects are staged on the calling goroutine
+// and sealed by a writer opened for this call and closed before it returns;
+// every sealed digest of the layer is resolved into the tree. A failed Apply
+// leaves the tree partially applied and spends the builder: no later Apply or
+// Finish is accepted.
+func (b *Builder) Apply(ctx context.Context, layer io.Reader, diffID digest.Digest) (err error) {
+	if b.spent {
+		return errBuilderSpent
+	}
+	defer func() {
+		if err != nil {
+			b.spent = true
+		}
+	}()
+	idx := b.next
+	b.next++
+
+	// Objects are sealed on the writer's background worker while the layer walk
+	// goes on producing them. Defers run last-in first-out: on an error return
+	// the cancel runs before the deferred Close, so the queue drains by
+	// discarding its temps instead of sealing objects for a layer that has
+	// already failed. The success path closes explicitly first, so every
+	// object — including ones this layer removed from the tree — is sealed
+	// before its digest is resolved. A worker failure the walk did not observe
+	// is reported alongside the walk's own error rather than dropped; a
+	// context error is not, being either the cancellation this error path
+	// itself induces or the caller's own, which the walk already reported.
+	wctx, cancel := context.WithCancel(ctx)
+	w := b.store.NewWriter(wctx)
+	defer func() {
+		cerr := w.Close()
+		if cerr == nil || errors.Is(err, cerr) || errors.Is(cerr, context.Canceled) || errors.Is(cerr, context.DeadlineExceeded) {
+			return
+		}
+		err = errors.Join(err, cerr)
+	}()
+	defer cancel()
+	if err := b.m.apply(wctx, w, layer, diffID, idx); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return resolveSealed(b.m.tree)
+}
+
+// Finish assembles the merged entries, writes the composefs image, stores it
+// in CAS, and returns its descriptor plus measured fs-verity digest. The
+// builder is spent afterwards.
+func (b *Builder) Finish(ctx context.Context) (Image, error) {
+	if b.spent {
+		return Image{}, errBuilderSpent
+	}
+	b.spent = true
+	entries, canonical, err := b.m.entries()
+	if err != nil {
+		return Image{}, err
+	}
+	return storeImage(ctx, b.store, entries, canonical)
+}
+
+// Close marks a build that will not finish as spent. There is nothing to
+// cancel: no goroutine outlives an Apply. Idempotent; a no-op after Finish.
+func (b *Builder) Close() {
+	b.spent = true
+}
+
 // Assemble merges decompressed layer tar streams, writes regular files larger
 // than the inline threshold to CAS (smaller ones ride inline in the image),
 // generates a composefs image, stores it in CAS, and returns its descriptor
@@ -58,38 +146,30 @@ type ObjectSink interface {
 // [0, len(diffIDs)). It is called once per layer, in order, and at most one
 // returned reader is open at a time: each is read to EOF and closed before the
 // next is opened.
-func Assemble(ctx context.Context, store *objectstore.Store, openLayer func(int) (io.ReadCloser, error), diffIDs []digest.Digest) (img Image, err error) {
+func Assemble(ctx context.Context, store *objectstore.Store, openLayer func(int) (io.ReadCloser, error), diffIDs []digest.Digest) (Image, error) {
 	if store == nil {
 		return Image{}, errors.New("rootfs: nil CAS store")
 	}
-	// Objects are sealed on the writer's background worker while the layer walk
-	// goes on producing them. Defers run last-in first-out: on an error return
-	// the cancel runs before the deferred Close, so the queue drains by
-	// discarding its temps instead of sealing objects for a pull that has
-	// already failed. The success path closes explicitly first, so every
-	// object — including ones a later layer removed from the tree — is sealed
-	// before the image is written. A worker failure the walk did not observe
-	// is reported alongside the walk's own error rather than dropped; a
-	// context error is not, being either the cancellation this error path
-	// itself induces or the caller's own, which the walk already reported.
-	wctx, cancel := context.WithCancel(ctx)
-	w := store.NewWriter(wctx)
-	defer func() {
-		cerr := w.Close()
-		if cerr == nil || errors.Is(err, cerr) || errors.Is(cerr, context.Canceled) || errors.Is(cerr, context.DeadlineExceeded) {
-			return
+	if openLayer == nil {
+		return Image{}, errors.New("rootfs: nil layer opener")
+	}
+	b := NewBuilder(store)
+	defer b.Close()
+	for i, id := range diffIDs {
+		err := applyOpened(openLayer, i, func(layer io.Reader) error {
+			return b.Apply(ctx, layer, id)
+		})
+		if err != nil {
+			return Image{}, err
 		}
-		err = errors.Join(err, cerr)
-	}()
-	defer cancel()
-	entries, canonical, err := BuildEntries(wctx, w, openLayer, diffIDs)
-	if err != nil {
-		return Image{}, err
 	}
-	if err := w.Close(); err != nil {
-		return Image{}, err
-	}
+	return b.Finish(ctx)
+}
 
+// storeImage writes the composefs image for entries into a store temp, stores
+// it as a CAS object, and returns its descriptor plus measured fs-verity
+// digest.
+func storeImage(ctx context.Context, store *objectstore.Store, entries []composefs.Entry, canonical bool) (Image, error) {
 	out, err := tempOutput(store.TempDir())
 	if err != nil {
 		return Image{}, err
@@ -204,39 +284,81 @@ func BuildEntries(ctx context.Context, sink ObjectSink, openLayer func(int) (io.
 	if openLayer == nil {
 		return nil, false, errors.New("rootfs: nil layer opener")
 	}
-	tree := make(map[string]*node)
-	diverged := false
+	m := newMerge()
 	for i, id := range diffIDs {
-		layer, err := openLayer(i)
+		err := applyOpened(openLayer, i, func(layer io.Reader) error {
+			return m.apply(ctx, sink, layer, id, i)
+		})
 		if err != nil {
-			return nil, false, fmt.Errorf("rootfs: open layer %d: %w", i, err)
+			return nil, false, err
 		}
-		if layer == nil {
-			return nil, false, fmt.Errorf("rootfs: layer[%d] is nil", i)
-		}
-
-		layerDiverged, applyErr := applyLayer(ctx, sink, tree, layer, id, i)
-		closeErr := layer.Close()
-		if closeErr != nil {
-			closeErr = fmt.Errorf("rootfs: layer %d: close: %w", i, closeErr)
-		}
-		if applyErr != nil || closeErr != nil {
-			return nil, false, errors.Join(applyErr, closeErr)
-		}
-		diverged = diverged || layerDiverged
 	}
-	if err := resolveSealed(tree); err != nil {
+	if err := resolveSealed(m.tree); err != nil {
 		return nil, false, err
 	}
-	synthesized, err := ensureParents(tree)
+	return m.entries()
+}
+
+// merge is one image's layers being applied in order into one tree. diverged
+// records whether any layer so far diverged from the upstream-reproducible
+// construction.
+type merge struct {
+	tree     map[string]*node
+	diverged bool
+}
+
+// newMerge returns an empty merge no layer has been applied to yet.
+func newMerge() *merge {
+	return &merge{tree: make(map[string]*node)}
+}
+
+// apply merges layer idx into the tree through sink, verifying diffID at end
+// of stream.
+func (m *merge) apply(ctx context.Context, sink ObjectSink, layer io.Reader, diffID digest.Digest, idx int) error {
+	layerDiverged, err := applyLayer(ctx, sink, m.tree, layer, diffID, idx)
+	if err != nil {
+		return err
+	}
+	m.diverged = m.diverged || layerDiverged
+	return nil
+}
+
+// entries synthesises any missing parent directories, applies the canonical
+// tree transforms, and returns the merged composefs inventory. The bool
+// reports whether the tree was built without any divergence. Every stored
+// payload's sealed digest must have been resolved first.
+func (m *merge) entries() ([]composefs.Entry, bool, error) {
+	synthesized, err := ensureParents(m.tree)
 	if err != nil {
 		return nil, false, err
 	}
-	diverged = diverged || synthesized
+	diverged := m.diverged || synthesized
 
-	root, transformDiverged := transformCanonical(tree)
+	root, transformDiverged := transformCanonical(m.tree)
 	diverged = diverged || transformDiverged
-	return entriesFromTree(tree, root), !diverged, nil
+	return entriesFromTree(m.tree, root), !diverged, nil
+}
+
+// applyOpened opens layer i through openLayer, hands its stream to apply, and
+// closes it, joining a close failure with the apply failure so neither is
+// dropped. At most one layer is open at a time.
+func applyOpened(openLayer func(int) (io.ReadCloser, error), i int, apply func(io.Reader) error) error {
+	layer, err := openLayer(i)
+	if err != nil {
+		return fmt.Errorf("rootfs: open layer %d: %w", i, err)
+	}
+	if layer == nil {
+		return fmt.Errorf("rootfs: layer[%d] is nil", i)
+	}
+	applyErr := apply(layer)
+	closeErr := layer.Close()
+	if closeErr != nil {
+		closeErr = fmt.Errorf("rootfs: layer %d: close: %w", i, closeErr)
+	}
+	if applyErr != nil || closeErr != nil {
+		return errors.Join(applyErr, closeErr)
+	}
+	return nil
 }
 
 // applyLayer walks one decompressed layer tar into tree, then verifies the whole

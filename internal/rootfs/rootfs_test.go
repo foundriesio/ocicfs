@@ -977,6 +977,104 @@ func TestBuild(t *testing.T) {
 	}
 }
 
+// TestBuilderFreshContextPerApply asserts the per-layer build reproduces the
+// whole-image path exactly when every Apply runs under its own context and the
+// previous call's context is canceled before the next call: nothing an Apply
+// starts outlives it, so a dead context cannot reach into a later layer.
+func TestBuilderFreshContextPerApply(t *testing.T) {
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+	layers, diffIDs := writerFixture(t)
+	want, err := Assemble(context.Background(), newVerityStore(t), openTestLayers(t, layers...), diffIDs)
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+
+	b := NewBuilder(newVerityStore(t))
+	defer b.Close()
+	cancelPrev := func() {}
+	for i, layer := range layers {
+		cancelPrev()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancelPrev = cancel
+		if err := b.Apply(ctx, bytes.NewReader(layer), diffIDs[i]); err != nil {
+			t.Fatalf("Apply layer %d: %v", i, err)
+		}
+	}
+	cancelPrev()
+	got, err := b.Finish(context.Background())
+	if err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if got.Descriptor.Digest != want.Descriptor.Digest || got.Descriptor.Size != want.Descriptor.Size ||
+		got.FsverityDigest != want.FsverityDigest || got.RootfsSize != want.RootfsSize || got.Canonical != want.Canonical {
+		t.Fatalf("Builder image = %#v, want Assemble's %#v", got, want)
+	}
+}
+
+// TestBuilderFailedApplySpends asserts a failed Apply spends the builder — the
+// next Apply and Finish are refused — and leaves no temp behind.
+func TestBuilderFailedApplySpends(t *testing.T) {
+	store := newVerityStore(t)
+	layer := tarBytes(t, tarEntry{name: "f", typ: tar.TypeReg, mode: 0o644, body: large("f")})
+	b := NewBuilder(store)
+	defer b.Close()
+	err := b.Apply(context.Background(), bytes.NewReader(layer), digest.FromBytes([]byte("not this layer")))
+	skipIfNoVerity(t, err)
+	if err == nil || !strings.Contains(err.Error(), "diff_id mismatch") {
+		t.Fatalf("Apply error = %v, want diff_id mismatch", err)
+	}
+	if err := b.Apply(context.Background(), bytes.NewReader(layer), digest.FromBytes(layer)); !errors.Is(err, errBuilderSpent) {
+		t.Fatalf("Apply after a failed Apply = %v, want errBuilderSpent", err)
+	}
+	if _, err := b.Finish(context.Background()); !errors.Is(err, errBuilderSpent) {
+		t.Fatalf("Finish after a failed Apply = %v, want errBuilderSpent", err)
+	}
+	temps, err := os.ReadDir(store.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("temps left after failed Apply: %d", len(temps))
+	}
+}
+
+// TestAssembleJoinsLayerCloseError asserts a layer reader whose Close fails
+// has that failure in Assemble's result: alone when the layer applied cleanly,
+// joined with the apply failure otherwise. The layer holds only a directory,
+// so no object is written and a plain store suffices.
+func TestAssembleJoinsLayerCloseError(t *testing.T) {
+	layer := tarBytes(t, tarEntry{name: "dir", typ: tar.TypeDir, mode: 0o755})
+	tests := []struct {
+		name      string
+		diffID    digest.Digest
+		wantApply string
+	}{
+		{"clean apply", digest.FromBytes(layer), ""},
+		{"failed apply", digest.FromBytes([]byte("not this layer")), "diff_id mismatch"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, err := objectstore.New(t.TempDir())
+			if err != nil {
+				t.Fatalf("objectstore.New: %v", err)
+			}
+			openLayer := func(int) (io.ReadCloser, error) {
+				return failingCloser{Reader: bytes.NewReader(layer)}, nil
+			}
+			_, err = Assemble(context.Background(), store, openLayer, []digest.Digest{tt.diffID})
+			if !errors.Is(err, errCloseSentinel) {
+				t.Fatalf("Assemble error = %v, want the close sentinel", err)
+			}
+			if tt.wantApply != "" && !strings.Contains(err.Error(), tt.wantApply) {
+				t.Fatalf("Assemble error = %v, want it to also report %q", err, tt.wantApply)
+			}
+		})
+	}
+}
+
 func TestBuildEntriesOpensConsumesClosesLayerBeforeNext(t *testing.T) {
 	layers := [][]byte{
 		tarBytes(t, tarEntry{name: "one", typ: tar.TypeDir, mode: 0o755}),
@@ -1119,6 +1217,14 @@ func (l *observedLayer) Close() error {
 	*l.open = false
 	return nil
 }
+
+// errCloseSentinel is the failure failingCloser reports from Close.
+var errCloseSentinel = errors.New("close sentinel")
+
+// failingCloser serves a layer whose Close fails with errCloseSentinel.
+type failingCloser struct{ io.Reader }
+
+func (failingCloser) Close() error { return errCloseSentinel }
 
 func openTestLayers(t *testing.T, layers ...[]byte) func(int) (io.ReadCloser, error) {
 	t.Helper()
