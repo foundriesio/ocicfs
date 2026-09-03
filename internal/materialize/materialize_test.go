@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -375,6 +376,163 @@ func TestMaterializeNonCanonicalSealingPolicy(t *testing.T) {
 			t.Fatal("divergent binding recorded canonical = true")
 		}
 	})
+}
+
+// threeLayerImage builds a three-layer image whose every layer stores a
+// regular file over the inline threshold, so each Ingest writes an object.
+func threeLayerImage(t *testing.T) octest.Layout {
+	t.Helper()
+	body := func(n int) string {
+		return fmt.Sprintf("layer %d payload larger than the sixty-four byte inline limit so it becomes an object\n", n)
+	}
+	lay, err := octest.BuildImage(t.TempDir(), octest.ImageSpec{
+		Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"},
+		Layers: []octest.LayerSpec{
+			{Files: []octest.File{{Name: "usr", Dir: true}, {Name: "usr/bin", Dir: true}, {Name: "usr/bin/app", Mode: 0o755, Body: body(0)}}},
+			{Files: []octest.File{{Name: "usr/lib", Dir: true}, {Name: "usr/lib/one", Mode: 0o644, Body: body(1)}}},
+			{Files: []octest.File{{Name: "etc", Dir: true}, {Name: "etc/two", Mode: 0o644, Body: body(2)}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildImage: %v", err)
+	}
+	return lay
+}
+
+// openLog records which layer blobs a source was asked to open, so a test can
+// tell which layers an Ingest actually read.
+type openLog struct {
+	src    memorySource
+	layers []digest.Digest
+	opened []int
+}
+
+func (l *openLog) Open(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
+	for i, d := range l.layers {
+		if d == desc.Digest {
+			l.opened = append(l.opened, i)
+		}
+	}
+	return l.src.Open(ctx, desc)
+}
+
+// layerDigests reads the layout's manifest and returns its layer digests in
+// manifest order.
+func layerDigests(t *testing.T, lay octest.Layout) []digest.Digest {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(lay.Dir, "blobs", "sha256", lay.Manifest.Encoded())) // #nosec G304 -- test fixture path
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	var m ocispec.Manifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("parse manifest: %v", err)
+	}
+	out := make([]digest.Digest, len(m.Layers))
+	for i, l := range m.Layers {
+		out[i] = l.Digest
+	}
+	return out
+}
+
+// TestBuildMatchesMaterialize asserts Begin, one Ingest per layer, and Finish
+// produce the same binding, image object, and result as Materialize.
+func TestBuildMatchesMaterialize(t *testing.T) {
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+	lay := threeLayerImage(t)
+	src := readLayoutBlobs(t, lay.Dir)
+
+	wholeRoot, wholeObj, wholeImg := newStores(t)
+	want, err := Materialize(context.Background(), wholeObj, wholeImg, src, lay.Root, lay.Platform)
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+
+	layerRoot, layerObj, layerImg := newStores(t)
+	b, err := Begin(context.Background(), layerObj, layerImg, src, lay.Root, lay.Platform)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer b.Close()
+	for i := range lay.DiffIDs {
+		if err := b.Ingest(context.Background(), i); err != nil {
+			t.Fatalf("Ingest(%d): %v", i, err)
+		}
+	}
+	got, err := b.Finish(context.Background())
+	if err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if !sameBuilt(got, want) {
+		t.Fatalf("built mismatch:\n layer=%#v\n whole=%#v", got, want)
+	}
+	assertObjectBytesEqual(t, wholeRoot, layerRoot, want.Descriptor.Digest)
+	assertFileBytesEqual(t, octest.BindingPath(wholeRoot, lay.Root, lay.Platform), octest.BindingPath(layerRoot, lay.Root, lay.Platform))
+}
+
+// TestBuildIngestForwardJumpThenNoop asserts Ingest(2) on a fresh build reads
+// and applies layers 0, 1 and 2 in order, a following Ingest(1) reads nothing,
+// and an index past the last layer is refused.
+func TestBuildIngestForwardJumpThenNoop(t *testing.T) {
+	lay := threeLayerImage(t)
+	src := &openLog{src: readLayoutBlobs(t, lay.Dir), layers: layerDigests(t, lay)}
+
+	_, obj, img := newStores(t)
+	b, err := Begin(context.Background(), obj, img, src, lay.Root, lay.Platform)
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer b.Close()
+	if err := b.Ingest(context.Background(), 2); err != nil {
+		t.Fatalf("Ingest(2): %v", err)
+	}
+	if want := []int{0, 1, 2}; !reflect.DeepEqual(src.opened, want) {
+		t.Fatalf("layers opened by Ingest(2) = %v, want %v", src.opened, want)
+	}
+	if err := b.Ingest(context.Background(), 1); err != nil {
+		t.Fatalf("Ingest(1) after Ingest(2): %v", err)
+	}
+	if want := []int{0, 1, 2}; !reflect.DeepEqual(src.opened, want) {
+		t.Fatalf("layers opened after Ingest(1) = %v, want no new opens over %v", src.opened, want)
+	}
+	if err := b.Ingest(context.Background(), 3); err == nil || !strings.Contains(err.Error(), "out of range") {
+		t.Fatalf("Ingest(3) on a three-layer image = %v, want out-of-range error", err)
+	}
+}
+
+// TestBuildCloseLeavesNoTempsNoBinding asserts abandoning a build after two of
+// three layers leaves no staging temp and writes no binding: the objects
+// already sealed stay as unreferenced content.
+func TestBuildCloseLeavesNoTempsNoBinding(t *testing.T) {
+	lay := threeLayerImage(t)
+	root, obj, img := newStores(t)
+	b, err := Begin(context.Background(), obj, img, readLayoutBlobs(t, lay.Dir), lay.Root, lay.Platform)
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if err := b.Ingest(context.Background(), 1); err != nil {
+		t.Fatalf("Ingest(1): %v", err)
+	}
+	b.Close()
+
+	temps, err := os.ReadDir(obj.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("temps left after Close: %d", len(temps))
+	}
+	if _, statErr := os.Stat(octest.BindingPath(root, lay.Root, lay.Platform)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("binding must not exist after Close, stat: %v", statErr)
+	}
+	if err := b.Ingest(context.Background(), 2); err == nil {
+		t.Fatal("Ingest after Close succeeded")
+	}
 }
 
 // corruptLayerBlob flips the last byte of the layout's single layer blob in

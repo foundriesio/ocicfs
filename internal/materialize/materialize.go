@@ -10,7 +10,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -35,46 +34,79 @@ type Built struct {
 	Identity       ocispec.Descriptor
 }
 
-// Materialize resolves root from src, builds the rootfs image, and records its
-// binding in img under the resolved platform manifest, the digest that
-// identifies the image however the caller named it.
-func Materialize(ctx context.Context, store *objectstore.Store, img *imagestore.Store, src ocichain.BlobSource, root digest.Digest, platform ocispec.Platform) (Built, error) {
+// Build is one image being materialized a layer at a time. It stores no
+// context: every read runs under the context of the call that asked for it,
+// and nothing a call starts outlives it.
+type Build struct {
+	store *objectstore.Store
+	img   *imagestore.Store
+	src   ocichain.BlobSource
+	root  digest.Digest
+	res   ocichain.Resolved
+	b     *rootfs.Builder
+	next  int // index of the next layer to ingest
+}
+
+// Begin does everything Materialize does before the first layer: verifies the
+// store can enable fs-verity, resolves root from src for platform, writes the
+// metadata blobs, and creates the rootfs builder. ctx governs this call's
+// reads only. The caller must Finish or Close the build.
+func Begin(ctx context.Context, store *objectstore.Store, img *imagestore.Store, src ocichain.BlobSource, root digest.Digest, platform ocispec.Platform) (*Build, error) {
 	if store == nil {
-		return Built{}, errors.New("materialize: nil object store")
+		return nil, errors.New("materialize: nil object store")
 	}
 	if img == nil {
-		return Built{}, errors.New("materialize: nil image store")
+		return nil, errors.New("materialize: nil image store")
 	}
 	if src == nil {
-		return Built{}, errors.New("materialize: nil blob source")
+		return nil, errors.New("materialize: nil blob source")
 	}
 	if err := store.CheckVerity(); err != nil {
-		return Built{}, err
+		return nil, err
 	}
 
 	res, err := ocichain.Resolve(ctx, src, root, platform)
 	if err != nil {
-		return Built{}, err
+		return nil, err
 	}
 	if err := writeMetadataBlobs(ctx, store, res); err != nil {
+		return nil, err
+	}
+	return &Build{store: store, img: img, src: src, root: root, res: res, b: rootfs.NewBuilder(store)}, nil
+}
+
+// Ingest applies every layer not yet applied up to and including i, in
+// manifest order: each is opened through the blob source (its compressed
+// digest verified as it is consumed), applied (its diff_id verified at end of
+// stream), and closed before the next is opened. A jump forward applies every
+// missing layer; an index at or below the last applied one does nothing; an
+// index outside the manifest's layers is an error.
+func (b *Build) Ingest(ctx context.Context, i int) error {
+	if i < 0 || i >= len(b.res.DiffIDs) {
+		return fmt.Errorf("materialize: layer index %d out of range for an image with %d layers", i, len(b.res.DiffIDs))
+	}
+	return b.ingestThrough(ctx, i)
+}
+
+// Finish ingests the remaining layers, finishes the rootfs build, verifies the
+// sealing annotations, syncs the store, and records the binding under the
+// resolved platform manifest. The build is spent afterwards.
+func (b *Build) Finish(ctx context.Context) (Built, error) {
+	if err := b.ingestThrough(ctx, len(b.res.DiffIDs)-1); err != nil {
 		return Built{}, err
 	}
-
-	openLayer := func(i int) (io.ReadCloser, error) {
-		return ocichain.OpenLayer(ctx, src, res.Manifest.Layers[i])
-	}
-	built, err := rootfs.Assemble(ctx, store, openLayer, res.DiffIDs)
+	built, err := b.b.Finish(ctx)
 	if err != nil {
 		return Built{}, err
 	}
-	if err := ociseal.VerifyAnnotations(ctx, store, res, built.FsverityDigest, built.Canonical); err != nil {
+	if err := ociseal.VerifyAnnotations(ctx, b.store, b.res, built.FsverityDigest, built.Canonical); err != nil {
 		return Built{}, fmt.Errorf("materialize: verify sealing annotations: %w", err)
 	}
 
-	if err := store.Sync(); err != nil {
+	if err := b.store.Sync(); err != nil {
 		return Built{}, err
 	}
-	if err := img.Put(res.ManifestDesc.Digest, res.Platform, imagestore.Binding{
+	if err := b.img.Put(b.res.ManifestDesc.Digest, b.res.Platform, imagestore.Binding{
 		Descriptor:     built.Descriptor,
 		FsverityDigest: built.FsverityDigest,
 		RootfsSize:     built.RootfsSize,
@@ -84,13 +116,54 @@ func Materialize(ctx context.Context, store *objectstore.Store, img *imagestore.
 	}
 
 	return Built{
-		Root:           root,
-		Platform:       res.Platform,
+		Root:           b.root,
+		Platform:       b.res.Platform,
 		Descriptor:     built.Descriptor,
 		FsverityDigest: built.FsverityDigest,
-		RootDesc:       res.RootDesc,
-		Identity:       res.ManifestDesc,
+		RootDesc:       b.res.RootDesc,
+		Identity:       b.res.ManifestDesc,
 	}, nil
+}
+
+// Close abandons a build that will not finish. Objects already sealed stay in
+// the store as unreferenced content. Idempotent; a no-op after Finish.
+func (b *Build) Close() {
+	b.b.Close()
+}
+
+// ingestThrough applies layers next..i in order, opening, applying, and
+// closing each before the next; a close failure is joined with the apply
+// failure so neither is dropped.
+func (b *Build) ingestThrough(ctx context.Context, i int) error {
+	for ; b.next <= i; b.next++ {
+		idx := b.next
+		layer, err := ocichain.OpenLayer(ctx, b.src, b.res.Manifest.Layers[idx])
+		if err != nil {
+			return fmt.Errorf("materialize: open layer %d: %w", idx, err)
+		}
+		applyErr := b.b.Apply(ctx, layer, b.res.DiffIDs[idx])
+		closeErr := layer.Close()
+		if closeErr != nil {
+			closeErr = fmt.Errorf("materialize: layer %d: close: %w", idx, closeErr)
+		}
+		if applyErr != nil || closeErr != nil {
+			return errors.Join(applyErr, closeErr)
+		}
+	}
+	return nil
+}
+
+// Materialize resolves root from src, builds the rootfs image, and records its
+// binding in img under the resolved platform manifest, the digest that
+// identifies the image however the caller named it. It is Begin followed by
+// Finish.
+func Materialize(ctx context.Context, store *objectstore.Store, img *imagestore.Store, src ocichain.BlobSource, root digest.Digest, platform ocispec.Platform) (Built, error) {
+	b, err := Begin(ctx, store, img, src, root, platform)
+	if err != nil {
+		return Built{}, err
+	}
+	defer b.Close()
+	return b.Finish(ctx)
 }
 
 func writeMetadataBlobs(ctx context.Context, store *objectstore.Store, res ocichain.Resolved) error {
