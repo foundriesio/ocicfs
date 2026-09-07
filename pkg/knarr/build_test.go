@@ -7,9 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
-	"os"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -31,7 +29,7 @@ func TestBuildIngestMatchesPullE2E(t *testing.T) {
 	pullStore := verityStoreRoot(t)
 	buildStore := verityStoreRoot(t)
 	useRemoteDefaultTransport(t, failTransport{})
-	lay := threeLayerImage(t)
+	lay := octest.ThreeLayerImage(t, hostPlatform())
 	ref := "registry.example.com/team/app@" + lay.Root.String()
 
 	fromPull := pullInto(t, pullStore, ref, WithBlobSource(layoutBlobs(t, lay.Dir)))
@@ -68,7 +66,7 @@ func TestBuildIngestMatchesPullE2E(t *testing.T) {
 func TestBuildCachedIngestNoopFinishRecordsRef(t *testing.T) {
 	storeRoot := verityStoreRoot(t)
 	useRemoteDefaultTransport(t, failTransport{})
-	lay := threeLayerImage(t)
+	lay := octest.ThreeLayerImage(t, hostPlatform())
 	pullInto(t, storeRoot, "registry.example.com/team/app@"+lay.Root.String(), WithBlobSource(layoutBlobs(t, lay.Dir)))
 	objectsBefore := treeContents(t, storeRoot+"/objects")
 
@@ -76,7 +74,7 @@ func TestBuildCachedIngestNoopFinishRecordsRef(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	src := &layerOpenLog{src: layoutBlobs(t, lay.Dir), layers: layerDigests(t, lay)}
+	src := &layerOpenLog{src: layoutBlobs(t, lay.Dir), layers: lay.Layers}
 	aliasRef := "registry.example.com/team/alias@" + lay.Root.String()
 	b, err := eng.NewBuild(context.Background(), aliasRef, WithBlobSource(src))
 	if err != nil {
@@ -112,7 +110,7 @@ func TestBuildCachedIngestNoopFinishRecordsRef(t *testing.T) {
 func TestBuildCallsAfterCloseAndFinishError(t *testing.T) {
 	storeRoot := verityStoreRoot(t)
 	useRemoteDefaultTransport(t, failTransport{})
-	lay := threeLayerImage(t)
+	lay := octest.ThreeLayerImage(t, hostPlatform())
 	ref := "registry.example.com/team/app@" + lay.Root.String()
 	eng, err := New(Config{Root: storeRoot})
 	if err != nil {
@@ -178,7 +176,7 @@ func TestBuildFailedNewBuildLeavesGCRunnable(t *testing.T) {
 func TestBuildFailedFinishReleasesLock(t *testing.T) {
 	storeRoot := verityStoreRoot(t)
 	useRemoteDefaultTransport(t, failTransport{})
-	lay := threeLayerImage(t)
+	lay := octest.ThreeLayerImage(t, hostPlatform())
 	src := layoutBlobs(t, lay.Dir)
 	root := tamperDiffID(t, src, lay, 2)
 	eng, err := New(Config{Root: storeRoot})
@@ -204,7 +202,7 @@ func TestBuildFailedFinishReleasesLock(t *testing.T) {
 func TestBuildGCBusyDuringBuildOKAfterClose(t *testing.T) {
 	storeRoot := verityStoreRoot(t)
 	useRemoteDefaultTransport(t, failTransport{})
-	lay := threeLayerImage(t)
+	lay := octest.ThreeLayerImage(t, hostPlatform())
 	eng, err := New(Config{Root: storeRoot})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -235,7 +233,7 @@ func TestBuildGCBusyDuringBuildOKAfterClose(t *testing.T) {
 func TestBuildTamperedDiffIDSticky(t *testing.T) {
 	storeRoot := verityStoreRoot(t)
 	useRemoteDefaultTransport(t, failTransport{})
-	lay := threeLayerImage(t)
+	lay := octest.ThreeLayerImage(t, hostPlatform())
 	src := layoutBlobs(t, lay.Dir)
 	root := tamperDiffID(t, src, lay, 1)
 	eng, err := New(Config{Root: storeRoot})
@@ -271,10 +269,10 @@ func TestBuildTamperedDiffIDSticky(t *testing.T) {
 func TestBuildCloseWaitsForInflightIngest(t *testing.T) {
 	storeRoot := verityStoreRoot(t)
 	useRemoteDefaultTransport(t, failTransport{})
-	lay := threeLayerImage(t)
+	lay := octest.ThreeLayerImage(t, hostPlatform())
 	src := &gatedBlobSource{
 		src:     layoutBlobs(t, lay.Dir),
-		gate:    layerDigests(t, lay)[0],
+		gate:    lay.Layers[0],
 		entered: make(chan struct{}),
 		release: make(chan struct{}),
 	}
@@ -319,47 +317,6 @@ func TestBuildCloseWaitsForInflightIngest(t *testing.T) {
 	if err := b.Ingest(context.Background(), 1); !errors.Is(err, errBuildClosed) {
 		t.Fatalf("Ingest after Close = %v, want errBuildClosed", err)
 	}
-}
-
-// threeLayerImage builds a three-layer canonical image for the host platform
-// whose every layer stores a regular file over the inline threshold, so each
-// Ingest writes an object.
-func threeLayerImage(t *testing.T) octest.Layout {
-	t.Helper()
-	body := func(n int) string {
-		return fmt.Sprintf("layer %d payload larger than the sixty-four byte inline limit so it becomes an object\n", n)
-	}
-	lay, err := octest.BuildImage(t.TempDir(), octest.ImageSpec{
-		Platform: hostPlatform(),
-		Layers: []octest.LayerSpec{
-			{Files: []octest.File{{Name: "usr", Dir: true}, {Name: "usr/bin", Dir: true}, {Name: "usr/bin/app", Mode: 0o755, Body: body(0)}}},
-			{Files: []octest.File{{Name: "usr/lib", Dir: true}, {Name: "usr/lib/one", Mode: 0o644, Body: body(1)}}},
-			{Files: []octest.File{{Name: "etc", Dir: true}, {Name: "etc/two", Mode: 0o644, Body: body(2)}}},
-		},
-	})
-	if err != nil {
-		t.Fatalf("BuildImage: %v", err)
-	}
-	return lay
-}
-
-// layerDigests reads the layout's manifest and returns its layer digests in
-// manifest order.
-func layerDigests(t *testing.T, lay octest.Layout) []digest.Digest {
-	t.Helper()
-	raw, err := os.ReadFile(lay.Dir + "/blobs/sha256/" + lay.Manifest.Encoded()) // #nosec G304 -- test fixture path
-	if err != nil {
-		t.Fatalf("read manifest: %v", err)
-	}
-	var m ocispec.Manifest
-	if err := json.Unmarshal(raw, &m); err != nil {
-		t.Fatalf("parse manifest: %v", err)
-	}
-	out := make([]digest.Digest, len(m.Layers))
-	for i, l := range m.Layers {
-		out[i] = l.Digest
-	}
-	return out
 }
 
 // tamperDiffID rewrites the image in src so the config's diff_ids[i] names

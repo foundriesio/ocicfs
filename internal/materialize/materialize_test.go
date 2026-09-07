@@ -378,27 +378,6 @@ func TestMaterializeNonCanonicalSealingPolicy(t *testing.T) {
 	})
 }
 
-// threeLayerImage builds a three-layer image whose every layer stores a
-// regular file over the inline threshold, so each Ingest writes an object.
-func threeLayerImage(t *testing.T) octest.Layout {
-	t.Helper()
-	body := func(n int) string {
-		return fmt.Sprintf("layer %d payload larger than the sixty-four byte inline limit so it becomes an object\n", n)
-	}
-	lay, err := octest.BuildImage(t.TempDir(), octest.ImageSpec{
-		Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"},
-		Layers: []octest.LayerSpec{
-			{Files: []octest.File{{Name: "usr", Dir: true}, {Name: "usr/bin", Dir: true}, {Name: "usr/bin/app", Mode: 0o755, Body: body(0)}}},
-			{Files: []octest.File{{Name: "usr/lib", Dir: true}, {Name: "usr/lib/one", Mode: 0o644, Body: body(1)}}},
-			{Files: []octest.File{{Name: "etc", Dir: true}, {Name: "etc/two", Mode: 0o644, Body: body(2)}}},
-		},
-	})
-	if err != nil {
-		t.Fatalf("BuildImage: %v", err)
-	}
-	return lay
-}
-
 // openLog records which layer blobs a source was asked to open, so a test can
 // tell which layers an Ingest actually read.
 type openLog struct {
@@ -416,32 +395,13 @@ func (l *openLog) Open(ctx context.Context, desc ocispec.Descriptor) (io.ReadClo
 	return l.src.Open(ctx, desc)
 }
 
-// layerDigests reads the layout's manifest and returns its layer digests in
-// manifest order.
-func layerDigests(t *testing.T, lay octest.Layout) []digest.Digest {
-	t.Helper()
-	raw, err := os.ReadFile(filepath.Join(lay.Dir, "blobs", "sha256", lay.Manifest.Encoded())) // #nosec G304 -- test fixture path
-	if err != nil {
-		t.Fatalf("read manifest: %v", err)
-	}
-	var m ocispec.Manifest
-	if err := json.Unmarshal(raw, &m); err != nil {
-		t.Fatalf("parse manifest: %v", err)
-	}
-	out := make([]digest.Digest, len(m.Layers))
-	for i, l := range m.Layers {
-		out[i] = l.Digest
-	}
-	return out
-}
-
 // TestBuildMatchesMaterialize asserts Begin, one Ingest per layer, and Finish
 // produce the same binding, image object, and result as Materialize.
 func TestBuildMatchesMaterialize(t *testing.T) {
 	if _, err := exec.LookPath("mkcomposefs"); err != nil {
 		t.Skip("mkcomposefs not found in PATH")
 	}
-	lay := threeLayerImage(t)
+	lay := octest.ThreeLayerImage(t, ocispec.Platform{OS: "linux", Architecture: "amd64"})
 	src := readLayoutBlobs(t, lay.Dir)
 
 	wholeRoot, wholeObj, wholeImg := newStores(t)
@@ -477,8 +437,8 @@ func TestBuildMatchesMaterialize(t *testing.T) {
 // and applies layers 0, 1 and 2 in order, a following Ingest(1) reads nothing,
 // and an index past the last layer is refused.
 func TestBuildIngestForwardJumpThenNoop(t *testing.T) {
-	lay := threeLayerImage(t)
-	src := &openLog{src: readLayoutBlobs(t, lay.Dir), layers: layerDigests(t, lay)}
+	lay := octest.ThreeLayerImage(t, ocispec.Platform{OS: "linux", Architecture: "amd64"})
+	src := &openLog{src: readLayoutBlobs(t, lay.Dir), layers: lay.Layers}
 
 	_, obj, img := newStores(t)
 	b, err := Begin(context.Background(), obj, img, src, lay.Root, lay.Platform)
@@ -508,7 +468,7 @@ func TestBuildIngestForwardJumpThenNoop(t *testing.T) {
 // three layers leaves no staging temp and writes no binding: the objects
 // already sealed stay as unreferenced content.
 func TestBuildCloseLeavesNoTempsNoBinding(t *testing.T) {
-	lay := threeLayerImage(t)
+	lay := octest.ThreeLayerImage(t, ocispec.Platform{OS: "linux", Architecture: "amd64"})
 	root, obj, img := newStores(t)
 	b, err := Begin(context.Background(), obj, img, readLayoutBlobs(t, lay.Dir), lay.Root, lay.Platform)
 	skipIfNoVerity(t, err)

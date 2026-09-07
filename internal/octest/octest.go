@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"testing"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/opencontainers/go-digest"
@@ -25,7 +26,7 @@ import (
 
 // Layout describes a written OCI image layout and the digests a pull test asserts
 // against. Root is the pinned reference target; for a single-manifest layout it
-// equals Manifest.
+// equals Manifest. Layers holds the compressed layer digests in manifest order.
 type Layout struct {
 	Dir        string
 	Ref        string
@@ -34,6 +35,7 @@ type Layout struct {
 	Manifest   digest.Digest
 	Config     digest.Digest
 	FileDigest digest.Digest
+	Layers     []digest.Digest
 	DiffIDs    []digest.Digest
 	Platform   ocispec.Platform
 }
@@ -69,8 +71,8 @@ type ImageSpec struct {
 // image, all referenced from index.json. A single image is pinned by its
 // manifest digest; multiple images are pinned by the index digest, which is
 // then also written as a blob so a pinned root resolves through the index.
-// The returned Layout's Manifest, Config, DiffIDs, Platform, and FileDigest
-// describe images[0] (FileDigest is left empty when its first layer holds no
+// The returned Layout's Manifest, Config, Layers, DiffIDs, Platform, and
+// FileDigest describe images[0] (FileDigest is left empty when its first layer holds no
 // regular file).
 func BuildImage(dir string, images ...ImageSpec) (Layout, error) {
 	if len(images) == 0 {
@@ -159,6 +161,9 @@ func BuildImage(dir string, images ...ImageSpec) (Layout, error) {
 				DiffIDs:  diffIDs,
 				Platform: img.Platform,
 			}
+			for _, d := range layerDescs {
+				out.Layers = append(out.Layers, d.Digest)
+			}
 			for _, f := range img.Layers[0].Files {
 				if f.Dir || f.Link != "" {
 					continue
@@ -208,6 +213,28 @@ func BuildSingleLayerGzip(dir string, platform ocispec.Platform, files ...File) 
 		return Layout{}, fmt.Errorf("octest: need at least one file")
 	}
 	return BuildImage(dir, ImageSpec{Platform: platform, Layers: []LayerSpec{{Files: files}}})
+}
+
+// ThreeLayerImage builds a three-layer image for platform under a fresh temp
+// directory. Every layer stores a regular file over the inline threshold, so
+// each layer materializes an object.
+func ThreeLayerImage(t testing.TB, platform ocispec.Platform) Layout {
+	t.Helper()
+	body := func(n int) string {
+		return fmt.Sprintf("layer %d payload larger than the sixty-four byte inline limit so it becomes an object\n", n)
+	}
+	lay, err := BuildImage(t.TempDir(), ImageSpec{
+		Platform: platform,
+		Layers: []LayerSpec{
+			{Files: []File{{Name: "usr", Dir: true}, {Name: "usr/bin", Dir: true}, {Name: "usr/bin/app", Mode: 0o755, Body: body(0)}}},
+			{Files: []File{{Name: "usr/lib", Dir: true}, {Name: "usr/lib/one", Mode: 0o644, Body: body(1)}}},
+			{Files: []File{{Name: "etc", Dir: true}, {Name: "etc/two", Mode: 0o644, Body: body(2)}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildImage: %v", err)
+	}
+	return lay
 }
 
 // ObjectPath returns the CAS path a stored object with digest d lands at.
