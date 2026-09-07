@@ -83,6 +83,15 @@ digest, not the channel (for a tag, the resolution itself trusts the loopback
 channel). There is no insecure-registry option for any other host. Pull
 currently emits no progress output.
 
+Pull scans layers concurrently: `--ingest-workers N` sets how many layers are
+scanned at once (default 2). On a registry pull each layer is streamed from the
+registry as it is scanned, so N is also the number of concurrent blob
+downloads. The cap is per engine, shared by every build that engine runs; a
+`knarr pull` run beside a daemon adds its own workers to the daemon's. Scanning
+is bound by the store's write and fs-verity sealing throughput, so more than
+the default helps only on fast storage; on an SD card or eMMC the default is
+the right setting.
+
 ## Local OCI Layout Sideload
 
 Any tool that writes a standard OCI image layout works. For example, with
@@ -103,6 +112,9 @@ knarr pull --from-dir ./layout "app@$digest"
 The layout's `index.json` may name an index rather than a manifest; pinning it
 is fine either way, since the pull descends to the host platform's manifest and
 prints that identity.
+
+`--ingest-workers N` applies to a sideload exactly as to a registry pull: the
+layers are read from the layout directory and scanned N at a time (default 2).
 
 ## Inspect What Landed
 

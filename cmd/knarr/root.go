@@ -30,9 +30,16 @@ type globalOptions struct {
 	logger *slog.Logger
 }
 
+// config returns the engine configuration named by the resolved global
+// options; a subcommand with settings of its own adds them before
+// constructing the engine.
+func (g *globalOptions) config() knarr.Config {
+	return knarr.Config{Root: g.root, OverlayRoot: g.overlayRoot}
+}
+
 // engine constructs the knarr engine from the resolved global options.
 func (g *globalOptions) engine() (knarr.Engine, error) {
-	return knarr.New(knarr.Config{Root: g.root, OverlayRoot: g.overlayRoot})
+	return knarr.New(g.config())
 }
 
 // newRootCommand builds the knarr command tree. stdout and stderr are the

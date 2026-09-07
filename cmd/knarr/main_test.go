@@ -210,6 +210,30 @@ func TestRunRemoveDispatchesToEngine(t *testing.T) {
 	}
 }
 
+func TestRunPullNegativeIngestWorkersFails(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := run(context.Background(), []string{
+		"--root", t.TempDir(),
+		"pull", "--ingest-workers", "-1", "app@sha256:" + strings.Repeat("a", 64),
+	}, &out, &errOut)
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(errOut.String(), "ingest workers must not be negative") {
+		t.Errorf("stderr = %q, want the engine's negative-workers error", errOut.String())
+	}
+}
+
+func TestRunPullHelpListsIngestWorkers(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"pull", "--help"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "--ingest-workers") || !strings.Contains(out.String(), "(default 2)") {
+		t.Errorf("pull --help = %q, want --ingest-workers with default 2", out.String())
+	}
+}
+
 // TestRunPullFromDirE2E drives a real `knarr pull --from-dir` through the command
 // front end: it exercises flag binding, engine construction from --root, and the
 // --format json output contract end to end, against a local OCI layout. It is

@@ -12,14 +12,17 @@ import (
 
 func newPullCommand(g *globalOptions) *cobra.Command {
 	var fromDir string
+	var ingestWorkers int
 	format := cli.FormatText
 
 	cmd := &cobra.Command{
-		Use:   "pull [--from-dir <dir>] <ref>",
+		Use:   "pull [--from-dir <dir>] [--ingest-workers <n>] <ref>",
 		Short: "fetch an image into the local store",
 		Args:  cli.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			eng, err := g.engine()
+			cfg := g.config()
+			cfg.IngestWorkers = ingestWorkers
+			eng, err := knarr.New(cfg)
 			if err != nil {
 				return err
 			}
@@ -36,6 +39,7 @@ func newPullCommand(g *globalOptions) *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&fromDir, "from-dir", "", "sideload from an OCI image layout directory instead of a registry")
+	cmd.Flags().IntVar(&ingestWorkers, "ingest-workers", knarr.DefaultIngestWorkers, "layers scanned (and, from a registry, downloaded) concurrently; more than the default helps only on fast storage")
 	cli.AddFormatFlag(cmd, &format)
 	return cmd
 }
