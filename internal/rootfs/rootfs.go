@@ -50,18 +50,18 @@ type ObjectSink interface {
 }
 
 // Builder assembles one composefs image from layers handed to it one at a
-// time. Between layers it holds only the merged tree: each Apply runs the
-// store's background sealer for that layer and waits for it before returning,
-// so nothing the caller's context owns outlives the call.
+// time. Between layers it holds only the merged tree: every stored object of a
+// layer is sealed and its fs-verity digest resolved before the Scan that
+// produced it returns, so nothing the caller's context owns outlives the call.
 type Builder struct {
 	store *objectstore.Store
 	m     *merge
-	next  int  // index of the next layer expected
-	spent bool // Finish or Close has run, or an Apply failed
+	next  int  // index of the next layer Merge expects
+	spent bool // Finish or Close has run, or a Merge failed
 }
 
 // errBuilderSpent reports a call on a Builder that has finished, been closed,
-// or failed an Apply.
+// or failed a Merge.
 var errBuilderSpent = errors.New("rootfs: builder is spent")
 
 // NewBuilder returns a Builder that stores objects and the image in store.
@@ -69,33 +69,24 @@ func NewBuilder(store *objectstore.Store) *Builder {
 	return &Builder{store: store, m: newMerge()}
 }
 
-// Apply merges the next layer's decompressed tar stream into the tree. diffID
-// is verified at end of stream. Objects are staged on the calling goroutine
-// and sealed by a writer opened for this call and closed before it returns;
-// every sealed digest of the layer is resolved into the tree. A failed Apply
-// leaves the tree partially applied and spends the builder: no later Apply or
-// Finish is accepted.
-func (b *Builder) Apply(ctx context.Context, layer io.Reader, diffID digest.Digest) (err error) {
-	if b.spent {
-		return errBuilderSpent
-	}
-	defer func() {
-		if err != nil {
-			b.spent = true
-		}
-	}()
-	idx := b.next
-	b.next++
-
+// Scan reads layer idx's decompressed tar stream and returns its entries, every
+// stored payload carrying its content and fs-verity digests. diffID is verified
+// at end of stream. Objects are staged on the calling goroutine and sealed by a
+// writer opened for this call and closed before it returns. Scan is
+// independent of the builder's lifetime: it touches no builder state but the
+// store, so scans of different layers may run concurrently, and one may run
+// after Close or Finish, when its Layer can no longer be merged; only Merge,
+// which applies layers in index order, and Finish refuse a spent builder.
+func (b *Builder) Scan(ctx context.Context, layer io.Reader, diffID digest.Digest, idx int) (_ *Layer, err error) {
 	// Objects are sealed on the writer's background worker while the layer walk
 	// goes on producing them. Defers run last-in first-out: on an error return
 	// the cancel runs before the deferred Close, so the queue drains by
 	// discarding its temps instead of sealing objects for a layer that has
 	// already failed. The success path closes explicitly first, so every
-	// object — including ones this layer removed from the tree — is sealed
-	// before its digest is resolved. A worker failure the walk did not observe
-	// is reported alongside the walk's own error rather than dropped; a
-	// context error is not, being either the cancellation this error path
+	// object — including ones a later merge will drop from the tree — is
+	// sealed before its digest is resolved. A worker failure the walk did not
+	// observe is reported alongside the walk's own error rather than dropped;
+	// a context error is not, being either the cancellation this error path
 	// itself induces or the caller's own, which the walk already reported.
 	wctx, cancel := context.WithCancel(ctx)
 	w := b.store.NewWriter(wctx)
@@ -107,13 +98,36 @@ func (b *Builder) Apply(ctx context.Context, layer io.Reader, diffID digest.Dige
 		err = errors.Join(err, cerr)
 	}()
 	defer cancel()
-	if err := b.m.apply(wctx, w, layer, diffID, idx); err != nil {
-		return err
+	l, err := scanLayer(wctx, w, layer, diffID, idx)
+	if err != nil {
+		return nil, err
 	}
 	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	if err := l.resolve(); err != nil {
+		return nil, err
+	}
+	return l, nil
+}
+
+// Merge applies a scanned layer into the tree. Layers merge in index order: a
+// layer whose index is not the next expected one is refused, and that refusal,
+// like a failed merge, spends the builder.
+func (b *Builder) Merge(l *Layer) error {
+	if b.spent {
+		return errBuilderSpent
+	}
+	if l.idx != b.next {
+		b.spent = true
+		return fmt.Errorf("rootfs: merge layer %d, expected layer %d", l.idx, b.next)
+	}
+	if err := b.m.merge(l); err != nil {
+		b.spent = true
 		return err
 	}
-	return resolveSealed(b.m.tree)
+	b.next++
+	return nil
 }
 
 // Finish assembles the merged entries, writes the composefs image, stores it
@@ -131,8 +145,9 @@ func (b *Builder) Finish(ctx context.Context) (Image, error) {
 	return storeImage(ctx, b.store, entries, canonical)
 }
 
-// Close marks a build that will not finish as spent. There is nothing to
-// cancel: no goroutine outlives an Apply. Idempotent; a no-op after Finish.
+// Close marks a build that will not finish as spent: Merge and Finish refuse
+// it from then on; Scan does not depend on it. There is nothing to cancel: no
+// goroutine outlives a Scan. Idempotent; a no-op after Finish.
 func (b *Builder) Close() {
 	b.spent = true
 }
@@ -157,7 +172,11 @@ func Assemble(ctx context.Context, store *objectstore.Store, openLayer func(int)
 	defer b.Close()
 	for i, id := range diffIDs {
 		err := applyOpened(openLayer, i, func(layer io.Reader) error {
-			return b.Apply(ctx, layer, id)
+			l, err := b.Scan(ctx, layer, id, i)
+			if err != nil {
+				return err
+			}
+			return b.Merge(l)
 		})
 		if err != nil {
 			return Image{}, err
@@ -249,8 +268,8 @@ func tempOutput(dir string) (string, error) {
 
 // node is one name in the merged tree while layers are applied: its metadata,
 // the content bytes (for a small inlined regular file) or the content digest
-// and the pending fs-verity digest (for a stored one — sealed resolves it, and
-// verity holds it once resolved), and the index of the
+// and the fs-verity digest (for a stored one — sealed resolves it while it is
+// pending, and verity holds it once resolved), and the index of the
 // layer that last wrote it (so an opaque marker removes only lower-layer names).
 // A hardlink name carries only link and layer: link points at the node holding
 // the shared inode's metadata and content, so every name of one inode reads the
@@ -276,25 +295,32 @@ type node struct {
 	link      *node
 }
 
-// BuildEntries applies every layer in order into one tree, synthesises any
-// missing parent directories, applies the canonical tree transforms, and
-// returns the merged composefs inventory. The bool reports whether the tree was
-// built without any divergence from the upstream-reproducible construction.
+// BuildEntries scans and merges every layer in order into one tree,
+// synthesises any missing parent directories, applies the canonical tree
+// transforms, and returns the merged composefs inventory. The bool reports
+// whether the tree was built without any divergence from the
+// upstream-reproducible construction.
 func BuildEntries(ctx context.Context, sink ObjectSink, openLayer func(int) (io.ReadCloser, error), diffIDs []digest.Digest) ([]composefs.Entry, bool, error) {
 	if openLayer == nil {
 		return nil, false, errors.New("rootfs: nil layer opener")
 	}
 	m := newMerge()
 	for i, id := range diffIDs {
+		var l *Layer
 		err := applyOpened(openLayer, i, func(layer io.Reader) error {
-			return m.apply(ctx, sink, layer, id, i)
+			var scanErr error
+			l, scanErr = scanLayer(ctx, sink, layer, id, i)
+			return scanErr
 		})
 		if err != nil {
 			return nil, false, err
 		}
-	}
-	if err := resolveSealed(m.tree); err != nil {
-		return nil, false, err
+		if err := l.resolve(); err != nil {
+			return nil, false, err
+		}
+		if err := m.merge(l); err != nil {
+			return nil, false, err
+		}
 	}
 	return m.entries()
 }
@@ -312,21 +338,28 @@ func newMerge() *merge {
 	return &merge{tree: make(map[string]*node)}
 }
 
-// apply merges layer idx into the tree through sink, verifying diffID at end
-// of stream.
-func (m *merge) apply(ctx context.Context, sink ObjectSink, layer io.Reader, diffID digest.Digest, idx int) error {
-	layerDiverged, err := applyLayer(ctx, sink, m.tree, layer, diffID, idx)
-	if err != nil {
-		return err
+// merge replays a scanned layer's entries into the tree in stream order.
+func (m *merge) merge(l *Layer) error {
+	for _, rec := range l.records {
+		if err := m.mergeRecord(rec, l.idx); err != nil {
+			return err
+		}
 	}
-	m.diverged = m.diverged || layerDiverged
 	return nil
+}
+
+// mergeRecord merges one entry of layer idx into the tree and accumulates
+// whether it diverged.
+func (m *merge) mergeRecord(rec record, idx int) error {
+	diverged, err := mergeRecord(m.tree, rec, idx)
+	m.diverged = m.diverged || diverged
+	return err
 }
 
 // entries synthesises any missing parent directories, applies the canonical
 // tree transforms, and returns the merged composefs inventory. The bool
 // reports whether the tree was built without any divergence. Every stored
-// payload's sealed digest must have been resolved first.
+// payload's sealed digest is resolved before its layer is merged.
 func (m *merge) entries() ([]composefs.Entry, bool, error) {
 	synthesized, err := ensureParents(m.tree)
 	if err != nil {
@@ -361,27 +394,60 @@ func applyOpened(openLayer func(int) (io.ReadCloser, error), i int, apply func(i
 	return nil
 }
 
-// applyLayer walks one decompressed layer tar into tree, then verifies the whole
-// decompressed stream hashes to its diff_id at end of stream. The stream is teed
-// into the hash as the tar reader consumes it, so a regular file's content is
-// captured (stored, or read inline) and hashed toward the diff_id in one pass.
-// The bool reports whether this layer diverged from the upstream-reproducible
-// construction: an entry (or marker) reached a name whose immediate parent was
-// absent at that moment — upstream errors there while knarr synthesises the
-// parent later — or an opaque marker cleared same-layer content.
-func applyLayer(ctx context.Context, sink ObjectSink, tree map[string]*node, layer io.Reader, diffID digest.Digest, idx int) (bool, error) {
+// Layer is one scanned layer: its entries in stream order, each normalized and
+// with every regular file's content captured, so merging it into a tree needs
+// neither the stream nor the sink. Whiteout and opaque markers stay entries and
+// take effect at merge time, since their effect depends on the layers below.
+type Layer struct {
+	idx     int
+	records []record
+}
+
+// entryKind classifies a scanned tar entry by how merge applies it; the
+// type of a node entry is in its mode.
+type entryKind uint8
+
+const (
+	kindNode     entryKind = iota // installs the record's node
+	kindHardlink                  // another name of its target's inode
+	kindWhiteout                  // .wh.<name>: removes target and everything beneath it
+	kindOpaque                    // .wh..wh..opq: removes the lower-layer content of its directory
+)
+
+// record is one normalized entry of a scanned layer. n is the node the entry
+// installs, complete but for a stored payload's fs-verity digest while that is
+// still pending; a hardlink or marker carries no node — a hardlink's node
+// points at its target's and is made at merge time, once the target is known.
+// target is a hardlink's normalized target name or the path a whiteout removes.
+type record struct {
+	kind   entryKind
+	name   string
+	target string
+	n      *node
+}
+
+// scanLayer walks one decompressed layer tar and returns it as a Layer of
+// normalized records in stream order — a regular file's content captured
+// (stored through sink, or read inline) and every other entry's metadata
+// converted — after verifying the whole decompressed stream hashes to its
+// diff_id at end of stream. The stream is teed into the hash as the tar reader
+// consumes it, so content is captured and hashed toward the diff_id in one
+// pass. Whatever can be checked without the merged tree — names, link targets,
+// entry types, the sink a stored file needs — is checked here, before the next
+// entry is read.
+func scanLayer(ctx context.Context, sink ObjectSink, layer io.Reader, diffID digest.Digest, idx int) (*Layer, error) {
+	l := &Layer{idx: idx}
 	h := sha256.New()
 	teed := io.TeeReader(&ctxReader{ctx: ctx, r: layer}, h)
 	tr := tar.NewReader(teed)
 
-	diverged := false
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			return false, fmt.Errorf("rootfs: layer %d: read tar: %w", idx, err)
+			return nil, fmt.Errorf("rootfs: layer %d: read tar: %w", idx, err)
 		}
 		if hdr.Typeflag == tar.TypeXGlobalHeader {
 			continue
@@ -389,159 +455,166 @@ func applyLayer(ctx context.Context, sink ObjectSink, tree map[string]*node, lay
 
 		name, err := normalizeName(hdr.Name)
 		if err != nil {
-			return false, fmt.Errorf("rootfs: layer %d: %w", idx, err)
+			return nil, fmt.Errorf("rootfs: layer %d: %w", idx, err)
 		}
 		if name == "" {
 			continue
 		}
-
-		dir, base := splitPath(name)
-		// Upstream resolves the parent chain before inserting a name or applying a
-		// marker and errors if any component is missing or not a directory; knarr
-		// instead repairs the tree after merging, so a name whose immediate parent
-		// is absent — or present as a non-directory — right now is a divergence.
-		// The immediate-parent check accumulates the whole chain by induction: a
-		// parent inserted while absent flagged its own name.
-		if dir != "" {
-			if p, ok := tree[dir]; !ok || p.mode&os.ModeDir == 0 {
-				diverged = true
-			}
+		rec, err := scanHeader(ctx, sink, tr, hdr, name, idx)
+		if err != nil {
+			return nil, fmt.Errorf("rootfs: layer %d: %w", idx, err)
 		}
-		switch {
-		case base == ".wh..wh..opq":
-			if removeOpaque(tree, dir, idx) {
-				diverged = true
-			}
-			continue
-		case strings.HasPrefix(base, ".wh."):
-			target := strings.TrimPrefix(base, ".wh.")
-			if target == "" {
-				return false, fmt.Errorf("rootfs: layer %d: empty whiteout target %q", idx, hdr.Name)
-			}
-			removeSubtree(tree, path.Join(dir, target))
-			continue
-		}
-
-		if err := applyHeader(ctx, sink, tree, tr, hdr, name, idx); err != nil {
-			return false, fmt.Errorf("rootfs: layer %d: %w", idx, err)
-		}
+		l.records = append(l.records, rec)
 	}
 	if _, err := io.Copy(io.Discard, teed); err != nil {
-		return false, fmt.Errorf("rootfs: layer %d: drain: %w", idx, err)
+		return nil, fmt.Errorf("rootfs: layer %d: drain: %w", idx, err)
 	}
 	if got := digest.NewDigest(digest.SHA256, h); got != diffID {
-		return false, fmt.Errorf("rootfs: layer %d diff_id mismatch: expected %s, got %s", idx, diffID, got)
+		return nil, fmt.Errorf("rootfs: layer %d diff_id mismatch: expected %s, got %s", idx, diffID, got)
 	}
-	return diverged, nil
+	return l, nil
 }
 
-// applyHeader merges a single tar entry into tree: a regular file of at most
+// scanHeader converts one tar entry into a record: a whiteout or opaque marker
+// by its base name, otherwise by type — a regular file of at most
 // composefs.InlineContentMax bytes has its bytes read inline, a larger one
-// streams from tr into the object sink (recording its content and fs-verity
-// digests), a hardlink becomes another name of its target's inode, and the
-// remaining types become metadata-only nodes. Every node type carries the tar
-// entry's modification time. Whiteout and opaque markers are handled by the
-// caller before this is reached.
-func applyHeader(ctx context.Context, sink ObjectSink, tree map[string]*node, tr *tar.Reader, hdr *tar.Header, name string, idx int) error {
-	// A non-directory entry replaces whatever occupied name. If that was a
-	// directory, its children lose their parent, so drop the whole subtree
-	// before inserting the replacement (last-writer-wins, matching overlay
-	// merge semantics). A directory entry instead merges over any existing
-	// node and keeps children.
-	if hdr.Typeflag != tar.TypeDir {
-		if existing, ok := tree[name]; ok && existing.mode&os.ModeDir != 0 {
-			removeSubtree(tree, name)
+// streams from tr into the object sink (recording its content digest and
+// pending fs-verity digest), a hardlink keeps its normalized target, and the
+// remaining types become metadata-only nodes. Every node carries the tar
+// entry's modification time.
+func scanHeader(ctx context.Context, sink ObjectSink, tr *tar.Reader, hdr *tar.Header, name string, idx int) (record, error) {
+	dir, base := splitPath(name)
+	switch {
+	case base == ".wh..wh..opq":
+		return record{kind: kindOpaque, name: name}, nil
+	case strings.HasPrefix(base, ".wh."):
+		target := strings.TrimPrefix(base, ".wh.")
+		if target == "" {
+			return record{}, fmt.Errorf("empty whiteout target %q", hdr.Name)
 		}
+		return record{kind: kindWhiteout, name: name, target: path.Join(dir, target)}, nil
 	}
 
-	sec, nsec := mtimeFromHeader(hdr)
+	rec := record{kind: kindNode, name: name}
 	switch hdr.Typeflag {
 	case tar.TypeReg, '\x00': // '\x00' is the legacy regular-file flag (formerly tar.TypeRegA)
+		rec.n = nodeFromHeader(hdr, 0, idx)
 		if hdr.Size <= composefs.InlineContentMax {
 			// A small file is inlined into the EROFS metadata: read its bytes (the
 			// tar reader caps the read at the entry size) and skip the object store.
 			content, err := io.ReadAll(tr)
 			if err != nil {
-				return fmt.Errorf("read inline content for %s: %w", name, err)
+				return record{}, fmt.Errorf("read inline content for %s: %w", name, err)
 			}
-			tree[name] = &node{
-				mode:      modeFromHeader(hdr, 0),
-				uid:       hdr.Uid,
-				gid:       hdr.Gid,
-				xattrs:    xattrsFromHeader(hdr),
-				content:   content,
-				size:      int64(len(content)),
-				mtimeSec:  sec,
-				mtimeNsec: nsec,
-				layer:     idx,
-			}
-			return nil
+			rec.n.content = content
+			rec.n.size = int64(len(content))
+			return rec, nil
 		}
 		if sink == nil {
-			return errors.New("regular file requires object sink")
+			return record{}, errors.New("regular file requires object sink")
 		}
 		d, sealed, err := sink.WriteObject(ctx, tr)
 		if err != nil {
-			return fmt.Errorf("write object for %s: %w", name, err)
+			return record{}, fmt.Errorf("write object for %s: %w", name, err)
 		}
-		tree[name] = &node{
-			mode:      modeFromHeader(hdr, 0),
-			uid:       hdr.Uid,
-			gid:       hdr.Gid,
-			xattrs:    xattrsFromHeader(hdr),
-			digest:    d,
-			sealed:    sealed,
-			size:      hdr.Size,
-			mtimeSec:  sec,
-			mtimeNsec: nsec,
-			layer:     idx,
-		}
+		rec.n.digest = d
+		rec.n.sealed = sealed
+		rec.n.size = hdr.Size
 	case tar.TypeLink:
 		target, err := normalizeName(hdr.Linkname)
 		if err != nil {
-			return fmt.Errorf("hardlink %s target: %w", name, err)
+			return record{}, fmt.Errorf("hardlink %s target: %w", name, err)
 		}
-		if err := linkHardlink(tree, name, target, idx); err != nil {
-			return fmt.Errorf("hardlink %s -> %s: %w", name, target, err)
-		}
+		rec.kind = kindHardlink
+		rec.target = target
 	case tar.TypeSymlink:
 		if hdr.Linkname == "" {
-			return fmt.Errorf("symlink %s has empty target", name)
+			return record{}, fmt.Errorf("symlink %s has empty target", name)
 		}
-		tree[name] = &node{
-			mode:      modeFromHeader(hdr, os.ModeSymlink),
-			uid:       hdr.Uid,
-			gid:       hdr.Gid,
-			xattrs:    xattrsFromHeader(hdr),
-			linkname:  hdr.Linkname,
-			mtimeSec:  sec,
-			mtimeNsec: nsec,
-			layer:     idx,
-		}
+		rec.n = nodeFromHeader(hdr, os.ModeSymlink, idx)
+		rec.n.linkname = hdr.Linkname
 	case tar.TypeDir:
-		tree[name] = &node{
-			mode:      modeFromHeader(hdr, os.ModeDir),
-			uid:       hdr.Uid,
-			gid:       hdr.Gid,
-			xattrs:    xattrsFromHeader(hdr),
-			mtimeSec:  sec,
-			mtimeNsec: nsec,
-			layer:     idx,
-		}
+		rec.n = nodeFromHeader(hdr, os.ModeDir, idx)
 	case tar.TypeChar:
-		tree[name] = deviceNode(hdr, os.ModeDevice|os.ModeCharDevice, idx)
+		rec.n = deviceNode(hdr, os.ModeDevice|os.ModeCharDevice, idx)
 	case tar.TypeBlock:
-		tree[name] = deviceNode(hdr, os.ModeDevice, idx)
+		rec.n = deviceNode(hdr, os.ModeDevice, idx)
 	case tar.TypeFifo:
-		tree[name] = deviceNode(hdr, os.ModeNamedPipe, idx)
+		rec.n = deviceNode(hdr, os.ModeNamedPipe, idx)
 	default:
-		return fmt.Errorf("unsupported tar entry type %q for %s", hdr.Typeflag, name)
+		return record{}, fmt.Errorf("unsupported tar entry type %q for %s", hdr.Typeflag, name)
+	}
+	return rec, nil
+}
+
+// resolve fills in the fs-verity digest of every stored payload once its
+// object is sealed, waiting as needed.
+func (l *Layer) resolve() error {
+	for _, rec := range l.records {
+		if rec.n == nil || rec.n.sealed == nil {
+			continue
+		}
+		if err := resolveNode(rec.name, rec.n); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// deviceNode builds a metadata-only node for a character, block, or fifo special file.
-func deviceNode(hdr *tar.Header, typ os.FileMode, idx int) *node {
+// mergeRecord merges one scanned entry of layer idx into tree: a marker
+// removes what it names, a hardlink becomes another name of its target's
+// inode, and any other entry installs its node. The bool reports whether the
+// entry diverged from the upstream-reproducible construction: it (or a marker)
+// reached a name whose immediate parent was absent at that moment — upstream
+// errors there while knarr synthesises the parent later — or an opaque marker
+// cleared same-layer content.
+func mergeRecord(tree map[string]*node, rec record, idx int) (bool, error) {
+	dir, _ := splitPath(rec.name)
+	// Upstream resolves the parent chain before inserting a name or applying a
+	// marker and errors if any component is missing or not a directory; knarr
+	// instead repairs the tree after merging, so a name whose immediate parent
+	// is absent — or present as a non-directory — right now is a divergence.
+	// The immediate-parent check accumulates the whole chain by induction: a
+	// parent inserted while absent flagged its own name.
+	diverged := false
+	if dir != "" {
+		if p, ok := tree[dir]; !ok || p.mode&os.ModeDir == 0 {
+			diverged = true
+		}
+	}
+	switch rec.kind {
+	case kindOpaque:
+		if removeOpaque(tree, dir, idx) {
+			diverged = true
+		}
+		return diverged, nil
+	case kindWhiteout:
+		removeSubtree(tree, rec.target)
+		return diverged, nil
+	}
+
+	// A non-directory entry replaces whatever occupied name. If that was a
+	// directory, its children lose their parent, so drop the whole subtree
+	// before inserting the replacement (last-writer-wins, matching overlay
+	// merge semantics). A directory entry instead merges over any existing
+	// node and keeps children.
+	if rec.kind == kindHardlink || rec.n.mode&os.ModeDir == 0 {
+		if existing, ok := tree[rec.name]; ok && existing.mode&os.ModeDir != 0 {
+			removeSubtree(tree, rec.name)
+		}
+	}
+	if rec.kind == kindHardlink {
+		if err := linkHardlink(tree, rec.name, rec.target, idx); err != nil {
+			return diverged, fmt.Errorf("rootfs: layer %d: hardlink %s -> %s: %w", idx, rec.name, rec.target, err)
+		}
+		return diverged, nil
+	}
+	tree[rec.name] = rec.n
+	return diverged, nil
+}
+
+// nodeFromHeader builds a metadata-only node of the given type from a tar header.
+func nodeFromHeader(hdr *tar.Header, typ os.FileMode, idx int) *node {
 	sec, nsec := mtimeFromHeader(hdr)
 	return &node{
 		mode:      modeFromHeader(hdr, typ),
@@ -550,10 +623,16 @@ func deviceNode(hdr *tar.Header, typ os.FileMode, idx int) *node {
 		xattrs:    xattrsFromHeader(hdr),
 		mtimeSec:  sec,
 		mtimeNsec: nsec,
-		devmajor:  hdr.Devmajor,
-		devminor:  hdr.Devminor,
 		layer:     idx,
 	}
+}
+
+// deviceNode builds a metadata-only node for a character, block, or fifo special file.
+func deviceNode(hdr *tar.Header, typ os.FileMode, idx int) *node {
+	n := nodeFromHeader(hdr, typ, idx)
+	n.devmajor = hdr.Devmajor
+	n.devminor = hdr.Devminor
+	return n
 }
 
 // mtimeFromHeader extracts a tar header's modification time as whole seconds and
@@ -613,29 +692,19 @@ func splitPath(name string) (string, string) {
 	return strings.TrimSuffix(dir, "/"), base
 }
 
-// resolveSealed fills in the fs-verity digest of every stored payload node once
-// its object is sealed, waiting as needed. Payloads are reached through
-// hardlink wrappers as well as by name: a payload whose own name was whited
-// out survives only via link. Each payload is resolved once.
-func resolveSealed(tree map[string]*node) error {
-	for name, n := range tree {
-		if n.link != nil {
-			n = n.link
-		}
-		if n.sealed == nil {
-			continue
-		}
-		fsv, err := n.sealed()
-		if err != nil {
-			return fmt.Errorf("rootfs: seal object for %s: %w", name, err)
-		}
-		verity, err := digestutil.ParseSHA256(fsv)
-		if err != nil {
-			return fmt.Errorf("rootfs: parse fs-verity digest for %s: %w", name, err)
-		}
-		n.verity = verity
-		n.sealed = nil
+// resolveNode waits for the object behind n, named name, to be sealed and
+// records its fs-verity digest.
+func resolveNode(name string, n *node) error {
+	fsv, err := n.sealed()
+	if err != nil {
+		return fmt.Errorf("rootfs: seal object for %s: %w", name, err)
 	}
+	verity, err := digestutil.ParseSHA256(fsv)
+	if err != nil {
+		return fmt.Errorf("rootfs: parse fs-verity digest for %s: %w", name, err)
+	}
+	n.verity = verity
+	n.sealed = nil
 	return nil
 }
 

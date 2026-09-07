@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -977,11 +979,21 @@ func TestBuild(t *testing.T) {
 	}
 }
 
-// TestBuilderFreshContextPerApply asserts the per-layer build reproduces the
-// whole-image path exactly when every Apply runs under its own context and the
-// previous call's context is canceled before the next call: nothing an Apply
+// scanMerge scans layer at the builder's next index and merges it: the
+// sequential, one-layer-at-a-time build.
+func scanMerge(ctx context.Context, b *Builder, layer io.Reader, diffID digest.Digest) error {
+	l, err := b.Scan(ctx, layer, diffID, b.next)
+	if err != nil {
+		return err
+	}
+	return b.Merge(l)
+}
+
+// TestBuilderFreshContextPerScan asserts the per-layer build reproduces the
+// whole-image path exactly when every Scan runs under its own context and the
+// previous call's context is canceled before the next call: nothing a Scan
 // starts outlives it, so a dead context cannot reach into a later layer.
-func TestBuilderFreshContextPerApply(t *testing.T) {
+func TestBuilderFreshContextPerScan(t *testing.T) {
 	if _, err := exec.LookPath("mkcomposefs"); err != nil {
 		t.Skip("mkcomposefs not found in PATH")
 	}
@@ -999,8 +1011,8 @@ func TestBuilderFreshContextPerApply(t *testing.T) {
 		cancelPrev()
 		ctx, cancel := context.WithCancel(context.Background())
 		cancelPrev = cancel
-		if err := b.Apply(ctx, bytes.NewReader(layer), diffIDs[i]); err != nil {
-			t.Fatalf("Apply layer %d: %v", i, err)
+		if err := scanMerge(ctx, b, bytes.NewReader(layer), diffIDs[i]); err != nil {
+			t.Fatalf("Scan/Merge layer %d: %v", i, err)
 		}
 	}
 	cancelPrev()
@@ -1014,30 +1026,31 @@ func TestBuilderFreshContextPerApply(t *testing.T) {
 	}
 }
 
-// TestBuilderFailedApplySpends asserts a failed Apply spends the builder — the
-// next Apply and Finish are refused — and leaves no temp behind.
-func TestBuilderFailedApplySpends(t *testing.T) {
+// TestScanFailureLeavesBuilderUsable asserts a failed Scan touches no builder
+// state — the same layer scans and merges afterwards — and leaves no temp
+// behind.
+func TestScanFailureLeavesBuilderUsable(t *testing.T) {
 	store := newVerityStore(t)
 	layer := tarBytes(t, tarEntry{name: "f", typ: tar.TypeReg, mode: 0o644, body: large("f")})
 	b := NewBuilder(store)
 	defer b.Close()
-	err := b.Apply(context.Background(), bytes.NewReader(layer), digest.FromBytes([]byte("not this layer")))
+	err := scanMerge(context.Background(), b, bytes.NewReader(layer), digest.FromBytes([]byte("not this layer")))
 	skipIfNoVerity(t, err)
 	if err == nil || !strings.Contains(err.Error(), "diff_id mismatch") {
-		t.Fatalf("Apply error = %v, want diff_id mismatch", err)
-	}
-	if err := b.Apply(context.Background(), bytes.NewReader(layer), digest.FromBytes(layer)); !errors.Is(err, errBuilderSpent) {
-		t.Fatalf("Apply after a failed Apply = %v, want errBuilderSpent", err)
-	}
-	if _, err := b.Finish(context.Background()); !errors.Is(err, errBuilderSpent) {
-		t.Fatalf("Finish after a failed Apply = %v, want errBuilderSpent", err)
+		t.Fatalf("Scan error = %v, want diff_id mismatch", err)
 	}
 	temps, err := os.ReadDir(store.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(temps) != 0 {
-		t.Fatalf("temps left after failed Apply: %d", len(temps))
+		t.Fatalf("temps left after failed Scan: %d", len(temps))
+	}
+	if err := scanMerge(context.Background(), b, bytes.NewReader(layer), digest.FromBytes(layer)); err != nil {
+		t.Fatalf("Scan/Merge after a failed Scan = %v, want success", err)
+	}
+	if b.next != 1 {
+		t.Fatalf("next = %d after one merge, want 1", b.next)
 	}
 }
 
@@ -1550,5 +1563,298 @@ func TestAssembleLayerErrorDiscardsQueue(t *testing.T) {
 	}
 	if len(temps) != 0 {
 		t.Fatalf("temps left after failed Assemble: %d", len(temps))
+	}
+}
+
+// scanMergeFixtures returns images exercising every merge path — the Writer
+// fixture's whiteouts and opaque marker over stored files, hardlink groups
+// (to stored and inlined payloads, surviving a whiteout of the target),
+// a directory replaced by a file with a whiteout beneath it, an opaque marker
+// after same-layer content, and files on both sides of the inline threshold.
+func scanMergeFixtures(t *testing.T) map[string][][]byte {
+	t.Helper()
+	writer, _ := writerFixture(t)
+	return map[string][][]byte{
+		"writer": writer,
+		"hardlink": {
+			tarBytes(t,
+				tarEntry{name: "usr", typ: tar.TypeDir, mode: 0o755},
+				tarEntry{name: "bin", typ: tar.TypeDir, mode: 0o755},
+				tarEntry{name: "bin/app", typ: tar.TypeReg, mode: 0o755, body: large("app")},
+				tarEntry{name: "bin/alias1", typ: tar.TypeLink, link: "bin/app"},
+				tarEntry{name: "bin/alias2", typ: tar.TypeLink, link: "bin/alias1"},
+				tarEntry{name: "bin/small", typ: tar.TypeReg, mode: 0o644, body: "tiny"},
+				tarEntry{name: "bin/small-alias", typ: tar.TypeLink, link: "bin/small"},
+			),
+			tarBytes(t,
+				tarEntry{name: "bin/.wh.app", typ: tar.TypeReg, mode: 0o000},
+				tarEntry{name: "bin/alias1", typ: tar.TypeReg, mode: 0o644, body: large("detached")},
+			),
+		},
+		"whiteout": {
+			tarBytes(t,
+				tarEntry{name: "d", typ: tar.TypeDir, mode: 0o755},
+				tarEntry{name: "d/x", typ: tar.TypeReg, mode: 0o644, body: large("x")},
+				tarEntry{name: "d/sub", typ: tar.TypeDir, mode: 0o755},
+				tarEntry{name: "d/sub/y", typ: tar.TypeReg, mode: 0o644, body: large("y")},
+				tarEntry{name: "e", typ: tar.TypeDir, mode: 0o755},
+				tarEntry{name: "e/z", typ: tar.TypeReg, mode: 0o644, body: large("z")},
+			),
+			tarBytes(t,
+				tarEntry{name: "d/.wh.sub", typ: tar.TypeReg, mode: 0o000},
+				tarEntry{name: "e", typ: tar.TypeReg, mode: 0o644, body: large("e is a file now")},
+			),
+		},
+		"opaque": {
+			tarBytes(t,
+				tarEntry{name: "usr", typ: tar.TypeDir, mode: 0o755},
+				tarEntry{name: "d", typ: tar.TypeDir, mode: 0o755},
+				tarEntry{name: "d/lower", typ: tar.TypeReg, mode: 0o644, body: large("lower")},
+			),
+			tarBytes(t,
+				tarEntry{name: "d/before", typ: tar.TypeReg, mode: 0o644, body: large("before")},
+				tarEntry{name: "d/.wh..wh..opq", typ: tar.TypeReg, mode: 0o000},
+				tarEntry{name: "d/after", typ: tar.TypeReg, mode: 0o644, body: large("after")},
+			),
+		},
+		"inline": {
+			tarBytes(t,
+				tarEntry{name: "empty", typ: tar.TypeReg, mode: 0o644},
+				tarEntry{name: "one", typ: tar.TypeReg, mode: 0o644, body: "a"},
+				tarEntry{name: "max", typ: tar.TypeReg, mode: 0o644, body: strings.Repeat("b", composefs.InlineContentMax)},
+				tarEntry{name: "over", typ: tar.TypeReg, mode: 0o644, body: strings.Repeat("c", composefs.InlineContentMax+1)},
+				tarEntry{name: "link", typ: tar.TypeSymlink, mode: 0o777, link: "over"},
+				tarEntry{name: "fifo", typ: tar.TypeFifo, mode: 0o600},
+			),
+		},
+	}
+}
+
+// TestScanAheadMatchesSequential asserts that scanning every layer up front —
+// in reverse index order, so no scan can lean on an earlier merge — and merging
+// the scanned layers in order yields exactly what scanning and merging each
+// layer in turn yields: the same entries, canonical flag, and composefs image.
+func TestScanAheadMatchesSequential(t *testing.T) {
+	_, mkcomposefsErr := exec.LookPath("mkcomposefs")
+	for name, layers := range scanMergeFixtures(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			diffIDs := make([]digest.Digest, len(layers))
+			for i, l := range layers {
+				diffIDs[i] = digest.FromBytes(l)
+			}
+
+			seqStore := newVerityStore(t)
+			sequential := NewBuilder(seqStore)
+			defer sequential.Close()
+			for i, layer := range layers {
+				err := scanMerge(ctx, sequential, bytes.NewReader(layer), diffIDs[i])
+				skipIfNoVerity(t, err)
+				if err != nil {
+					t.Fatalf("sequential Scan/Merge layer %d: %v", i, err)
+				}
+			}
+			want, wantCanonical, err := sequential.m.entries()
+			if err != nil {
+				t.Fatalf("sequential entries: %v", err)
+			}
+
+			scanStore := newVerityStore(t)
+			scanned := NewBuilder(scanStore)
+			defer scanned.Close()
+			scans := make([]*Layer, len(layers))
+			for i := len(layers) - 1; i >= 0; i-- {
+				scans[i], err = scanned.Scan(ctx, bytes.NewReader(layers[i]), diffIDs[i], i)
+				if err != nil {
+					t.Fatalf("Scan layer %d: %v", i, err)
+				}
+			}
+			for i, l := range scans {
+				if err := scanned.Merge(l); err != nil {
+					t.Fatalf("Merge layer %d: %v", i, err)
+				}
+			}
+			got, gotCanonical, err := scanned.m.entries()
+			if err != nil {
+				t.Fatalf("Scan/Merge entries: %v", err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("scan-ahead entries differ from sequential:\n got %#v\nwant %#v", got, want)
+			}
+			if gotCanonical != wantCanonical {
+				t.Fatalf("scan-ahead canonical = %t, sequential = %t", gotCanonical, wantCanonical)
+			}
+			if mkcomposefsErr != nil {
+				return
+			}
+			wantImg, err := storeImage(ctx, seqStore, want, wantCanonical)
+			if err != nil {
+				t.Fatalf("sequential storeImage: %v", err)
+			}
+			gotImg, err := storeImage(ctx, scanStore, got, gotCanonical)
+			if err != nil {
+				t.Fatalf("scan-ahead storeImage: %v", err)
+			}
+			if !reflect.DeepEqual(gotImg, wantImg) {
+				t.Fatalf("scan-ahead image = %#v, sequential = %#v", gotImg, wantImg)
+			}
+		})
+	}
+}
+
+// countingSink counts the objects written through it and discards their bytes.
+type countingSink struct{ writes int }
+
+func (s *countingSink) WriteObject(_ context.Context, r io.Reader) (digest.Digest, objectstore.Sealed, error) {
+	s.writes++
+	if _, err := io.Copy(io.Discard, r); err != nil {
+		return "", nil, err
+	}
+	return digest.FromString("unused"), objectstore.Resolved("sha256:" + strings.Repeat("0", 64)), nil
+}
+
+// TestScanRejectsBeforeNextEntry asserts every check a scan can make without
+// the merged tree fails the scan at the offending entry: the large regular
+// file that follows is never read, so the sink never sees it and no layer is
+// returned.
+func TestScanRejectsBeforeNextEntry(t *testing.T) {
+	big := tarEntry{name: "big", typ: tar.TypeReg, mode: 0o644, body: large("big")}
+	tests := []struct {
+		name  string
+		first tarEntry
+		sink  *countingSink
+		want  string
+	}{
+		{"escaping name", tarEntry{name: "../x", typ: tar.TypeDir, mode: 0o755}, &countingSink{}, "escapes root"},
+		{"escaping hardlink target", tarEntry{name: "l", typ: tar.TypeLink, link: "../x"}, &countingSink{}, "hardlink l target"},
+		{"empty whiteout target", tarEntry{name: ".wh.", typ: tar.TypeReg, mode: 0o000}, &countingSink{}, "empty whiteout target"},
+		{"empty symlink target", tarEntry{name: "s", typ: tar.TypeSymlink, mode: 0o777}, &countingSink{}, "symlink s has empty target"},
+		{"unsupported type", tarEntry{name: "z", typ: 'Z', mode: 0o644}, &countingSink{}, "unsupported tar entry type"},
+		{"stored file without sink", tarEntry{name: "a", typ: tar.TypeReg, mode: 0o644, body: large("a")}, nil, "regular file requires object sink"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			layer := tarBytes(t, tt.first, big)
+			var sink ObjectSink
+			if tt.sink != nil {
+				sink = tt.sink
+			}
+			l, err := scanLayer(context.Background(), sink, bytes.NewReader(layer), digest.FromBytes(layer), 0)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("scanLayer error = %v, want %q", err, tt.want)
+			}
+			if l != nil {
+				t.Fatalf("scanLayer returned a layer with %d records past the invalid entry", len(l.records))
+			}
+			if tt.sink != nil && tt.sink.writes != 0 {
+				t.Fatalf("sink received %d objects past the invalid entry", tt.sink.writes)
+			}
+		})
+	}
+}
+
+// TestScanConcurrentSameObject asserts two layers carrying the same stored
+// file can be scanned at once on one store: both scans succeed, both names
+// resolve to the same content and fs-verity digests, and the store holds the
+// object once — the second commit collided with the first and verified it.
+func TestScanConcurrentSameObject(t *testing.T) {
+	store := newVerityStore(t)
+	body := large("shared")
+	layers := [][]byte{
+		tarBytes(t, tarEntry{name: "a", typ: tar.TypeReg, mode: 0o644, body: body}),
+		tarBytes(t, tarEntry{name: "b", typ: tar.TypeReg, mode: 0o644, body: body}),
+	}
+	b := NewBuilder(store)
+	defer b.Close()
+
+	var wg sync.WaitGroup
+	scans := make([]*Layer, len(layers))
+	errs := make([]error, len(layers))
+	for i, layer := range layers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			scans[i], errs[i] = b.Scan(context.Background(), bytes.NewReader(layer), digest.FromBytes(layer), i)
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		skipIfNoVerity(t, err)
+		if err != nil {
+			t.Fatalf("Scan layer %d: %v", i, err)
+		}
+	}
+	for i, l := range scans {
+		if err := b.Merge(l); err != nil {
+			t.Fatalf("Merge layer %d: %v", i, err)
+		}
+	}
+	entries, _, err := b.m.entries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPath := entriesByPath(entries)
+	a, bb := byPath["/a"], byPath["/b"]
+	if a.Digest != digest.FromBytes([]byte(body)) || a.Verity == "" {
+		t.Fatalf("/a = %#v, want the stored payload with its fs-verity digest", a)
+	}
+	if bb.Digest != a.Digest || bb.Verity != a.Verity {
+		t.Fatalf("/b = %#v, want the digests of /a %#v", bb, a)
+	}
+
+	objectPath, err := store.ObjectPath(a.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectsDir := filepath.Dir(filepath.Dir(filepath.Dir(objectPath)))
+	inodes := make(map[uint64]bool)
+	err = filepath.WalkDir(objectsDir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		inodes[fi.Sys().(*syscall.Stat_t).Ino] = true
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inodes) != 1 {
+		t.Fatalf("store holds %d distinct objects, want the shared one only", len(inodes))
+	}
+}
+
+// TestMergeOutOfOrderSpends asserts a Merge of a layer other than the next
+// expected one is refused and spends the builder: neither the layer that was
+// due nor Finish is accepted afterwards.
+func TestMergeOutOfOrderSpends(t *testing.T) {
+	store, err := objectstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	layers := [][]byte{
+		tarBytes(t, tarEntry{name: "a", typ: tar.TypeDir, mode: 0o755}),
+		tarBytes(t, tarEntry{name: "b", typ: tar.TypeDir, mode: 0o755}),
+	}
+	b := NewBuilder(store)
+	defer b.Close()
+	scans := make([]*Layer, len(layers))
+	for i, layer := range layers {
+		scans[i], err = b.Scan(context.Background(), bytes.NewReader(layer), digest.FromBytes(layer), i)
+		if err != nil {
+			t.Fatalf("Scan layer %d: %v", i, err)
+		}
+	}
+	if err := b.Merge(scans[1]); err == nil || !strings.Contains(err.Error(), "expected layer 0") {
+		t.Fatalf("Merge of layer 1 first = %v, want an out-of-order error", err)
+	}
+	if err := b.Merge(scans[0]); !errors.Is(err, errBuilderSpent) {
+		t.Fatalf("Merge after an out-of-order Merge = %v, want errBuilderSpent", err)
+	}
+	if _, err := b.Finish(context.Background()); !errors.Is(err, errBuilderSpent) {
+		t.Fatalf("Finish after an out-of-order Merge = %v, want errBuilderSpent", err)
 	}
 }

@@ -141,7 +141,10 @@ func (b *Build) ingestThrough(ctx context.Context, i int) error {
 		if err != nil {
 			return fmt.Errorf("materialize: open layer %d: %w", idx, err)
 		}
-		applyErr := b.b.Apply(ctx, layer, b.res.DiffIDs[idx])
+		l, applyErr := b.b.Scan(ctx, layer, b.res.DiffIDs[idx], idx)
+		if applyErr == nil {
+			applyErr = b.b.Merge(l)
+		}
 		closeErr := layer.Close()
 		if closeErr != nil {
 			closeErr = fmt.Errorf("materialize: layer %d: close: %w", idx, closeErr)
