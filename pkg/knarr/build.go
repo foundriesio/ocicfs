@@ -19,6 +19,13 @@ import (
 // build is the Build an engine hands out: the state of one pull between
 // NewBuild and its Finish or Close. It holds the shared store lock for that
 // whole span and keeps no context of its own.
+//
+// Ingest and Finish hold mu for their whole call, so calls queue behind one
+// another, and the store lock is released only by the call that finishes
+// the build or by Close, never while a call is in progress. Close does not
+// queue: it stops the materialize build first, which interrupts a blocked
+// call and waits for a Finish that is already writing, and only then takes
+// mu to release the lock.
 type build struct {
 	e        *engine
 	ref      string
@@ -107,7 +114,7 @@ func (e *engine) newBuild(ctx context.Context, ref string, opts ...PullOption) (
 	if err := composefs.Preflight(); err != nil {
 		return nil, err
 	}
-	mat, err := materialize.Begin(ctx, e.obj, e.img, src, root, platform)
+	mat, err := materialize.Begin(ctx, e.obj, e.img, src, root, platform, e.slots)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +122,10 @@ func (e *engine) newBuild(ctx context.Context, ref string, opts ...PullOption) (
 	return b, nil
 }
 
-// Ingest materializes every layer up to and including i not yet materialized.
+// Ingest blocks until every layer up to and including i is materialized; a
+// failure of any layer scanned so far is reported here and by every later
+// call. A cancelled ctx returns its error and leaves the build running, so the
+// call may be repeated.
 func (b *build) Ingest(ctx context.Context, i int) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -126,20 +136,37 @@ func (b *build) Ingest(ctx context.Context, i int) error {
 		// The store already holds the image: there is nothing to materialize.
 		return nil
 	}
-	if err := b.mat.Ingest(ctx, i); err != nil {
-		b.fail(err)
-		return b.err
+	err := b.mat.Ingest(ctx, i)
+	if err == nil {
+		return nil
 	}
-	return nil
+	// The caller's cancellation interrupts the wait and nothing else: the
+	// scans go on, so it is not the build's failure.
+	if cerr := ctx.Err(); cerr != nil && errors.Is(err, cerr) {
+		return fmt.Errorf("pull %s: %w", b.ref, err)
+	}
+	b.fail(err)
+	return b.err
 }
 
-// Finish ingests any remaining layers, records the image, and returns it. The
-// store lock is released whether or not it succeeds.
+// Finish ingests any remaining layers, records the image, and returns it. It
+// drains every scan before returning, on every path including a build that
+// failed earlier, and only then releases the store lock: the lock is never
+// dropped while a scan can still write to the store, nor between the image
+// being materialized and its reference being recorded. A Close arriving
+// while Finish runs interrupts a wait but cannot release the lock before
+// Finish returns; a Close that came first ends Finish with errBuildClosed
+// before anything is recorded.
 func (b *build) Finish(ctx context.Context) (*Image, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	defer b.release()
 	if b.err != nil {
+		// A failed build is spent, but its scans may still be running: stop
+		// them before the lock drops. The failure to report is recorded already.
+		if b.mat != nil {
+			_ = b.mat.Close()
+		}
 		return nil, b.err
 	}
 	img, err := b.finish(ctx)
@@ -151,21 +178,30 @@ func (b *build) Finish(ctx context.Context) (*Image, error) {
 	return img, nil
 }
 
-// Close abandons an unfinished build and releases the store lock. It takes
-// the build's mutex like any other call, so it waits for a call in progress
-// to return rather than interrupting it.
+// Close abandons an unfinished build: it cancels every scan and waits for
+// them, which interrupts a blocked Ingest or Finish, then releases the store
+// lock once that call has returned. A Finish already writing its image
+// completes and records it first, so an image that was materialized is never
+// stranded. A layer failure the build had recorded stays its error;
+// otherwise every later call returns errBuildClosed. Idempotent, and a no-op
+// after Finish.
 func (b *build) Close() {
+	var cerr error
+	if b.mat != nil {
+		cerr = b.mat.Close()
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.fail(errBuildClosed)
-	if b.mat != nil {
-		b.mat.Close()
+	if cerr != nil {
+		b.fail(cerr)
 	}
+	b.fail(errBuildClosed)
 	b.release()
 }
 
 // finish runs the tail of the pull: the built image's binding and reference,
-// or the reference alone for an image the store already held.
+// or the reference alone for an image the store already held. The caller
+// holds mu.
 func (b *build) finish(ctx context.Context) (*Image, error) {
 	if b.mat == nil {
 		return b.finishCached(ctx)
@@ -209,11 +245,17 @@ func (b *build) finishCached(ctx context.Context) (*Image, error) {
 }
 
 // fail records err, wrapped with the pull's reference, as the build's sticky
-// error unless one is recorded already. The caller holds mu.
+// error unless one is recorded already. A call the materialize build reports
+// as interrupted by Close is recorded as this build's own closed state. The
+// caller holds mu.
 func (b *build) fail(err error) {
-	if b.err == nil {
-		b.err = fmt.Errorf("pull %s: %w", b.ref, err)
+	if b.err != nil {
+		return
 	}
+	if errors.Is(err, materialize.ErrClosed) {
+		err = errBuildClosed
+	}
+	b.err = fmt.Errorf("pull %s: %w", b.ref, err)
 }
 
 // release drops the store lock exactly once across Finish and Close.

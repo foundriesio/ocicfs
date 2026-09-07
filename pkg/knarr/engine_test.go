@@ -21,6 +21,27 @@ func TestNewRejectsEmptyRoot(t *testing.T) {
 	}
 }
 
+func TestNewIngestWorkers(t *testing.T) {
+	if _, err := New(Config{Root: t.TempDir(), IngestWorkers: -1}); err == nil || !strings.Contains(err.Error(), "ingest workers must not be negative") {
+		t.Fatalf("New with IngestWorkers -1: got %v, want a negative-workers error", err)
+	}
+	for _, tt := range []struct {
+		workers, wantCap int
+	}{
+		{0, DefaultIngestWorkers},
+		{1, 1},
+		{4, 4},
+	} {
+		eng, err := New(Config{Root: t.TempDir(), IngestWorkers: tt.workers})
+		if err != nil {
+			t.Fatalf("New with IngestWorkers %d: %v", tt.workers, err)
+		}
+		if got := cap(eng.(*engine).slots); got != tt.wantCap {
+			t.Errorf("IngestWorkers %d: limiter cap = %d, want %d", tt.workers, got, tt.wantCap)
+		}
+	}
+}
+
 func TestEngineStubReturnsNotImplemented(t *testing.T) {
 	eng, err := New(Config{Root: t.TempDir()})
 	if err != nil {

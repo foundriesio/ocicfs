@@ -96,7 +96,12 @@ type LayerInfo struct {
 
 // BlobSource opens the raw blob bytes for a descriptor. An embedder supplies
 // one to pull an image out of content it already holds, for example a container
-// runtime's content store.
+// runtime's content store. Open may be called concurrently, and a build calls
+// it for layers ahead of the ones the caller has asked for: an Open that
+// fails for such a layer, however the source reports a blob it does not hold
+// yet, is retried until the caller asks for that layer. Open may do I/O, but
+// it must report a blob it does not currently hold rather than wait for one to
+// arrive, and it must return promptly once ctx is cancelled.
 type BlobSource interface {
 	Open(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error)
 }
@@ -104,27 +109,37 @@ type BlobSource interface {
 // Build is an image pull whose layers the caller feeds one at a time, for an
 // embedder that receives an image's layers incrementally — a container runtime
 // unpacking a pull — and wants each one materialized as it lands rather than
-// all of them at the end. Each call runs entirely under its own context;
-// nothing a call starts outlives it, so a build may span request handlers.
-// Calls are serialized: one runs at a time, and a call on a build that has
-// finished, been closed, or failed returns an error — after a failure, the
-// same error every time.
+// all of them at the end. From the first Ingest or Finish on, a build scans
+// layers ahead of the caller's calls in the background, under the engine's
+// worker cap; it keeps the values of the
+// NewBuild context but not its cancellation, so a build may span request
+// handlers, and Finish or Close stops whatever it started.
+//
+// Calls are serialized: a call that arrives while another is in progress
+// waits for it, except Close, which interrupts a blocked Ingest or Finish. A
+// call on a build that has finished, been closed, or failed returns an error
+// — after a failure, the same error every time. The store is held against gc
+// from NewBuild until Finish or Close returns.
 type Build interface {
-	// Ingest materializes every layer up to and including index i that has
-	// not been materialized yet, reading them from the pull's blob source.
-	// Layers are applied in manifest order: a jump forward applies every
-	// layer in between, and an index at or below one already ingested does
-	// nothing. On a build whose image the store already held at NewBuild it
-	// does nothing at all. It is an error after Finish or Close.
+	// Ingest blocks until every layer up to and including index i is
+	// materialized, reading them from the pull's blob source. Layers are
+	// applied in manifest order: a jump forward applies every layer in
+	// between, and an index at or below one already ingested returns at
+	// once. The failure of layer i — or of any layer scanned ahead of it —
+	// is reported here. A cancelled ctx returns its error and leaves the
+	// build running, so the call may be repeated. On a build whose image the
+	// store already held at NewBuild it does nothing at all. It is an error
+	// after Finish or Close.
 	Ingest(ctx context.Context, i int) error
 	// Finish ingests any remaining layers, builds and records the image, and
 	// returns it; for an image the store already held it records the
-	// reference alone, as Pull does. The build is spent afterwards, whether
-	// or not it succeeded.
+	// reference alone, as Pull does. It drains every scan before returning,
+	// whether or not it succeeded, and the build is spent afterwards.
 	Finish(ctx context.Context) (*Image, error)
-	// Close abandons an unfinished build and releases the store; objects
-	// already sealed stay in the store as unreferenced content for gc. A
-	// no-op after Finish. It waits for a call in progress to return.
+	// Close abandons an unfinished build: it cancels every scan and waits
+	// for them, interrupting an Ingest or Finish blocked meanwhile, then
+	// releases the store; objects already sealed stay in the store as
+	// unreferenced content for gc. Idempotent, and a no-op after Finish.
 	Close()
 }
 
@@ -413,7 +428,15 @@ type Config struct {
 	// per-mount upperdir and workdir are allocated. Empty defaults to a
 	// directory under Root. A per-mount WithOverlayRoot overrides it.
 	OverlayRoot string
+	// IngestWorkers is the number of layers scanned concurrently across all
+	// builds of the engine. 0 means DefaultIngestWorkers; a negative value is
+	// rejected by New.
+	IngestWorkers int
 }
+
+// DefaultIngestWorkers is the number of layers an engine scans at once when
+// Config.IngestWorkers is 0.
+const DefaultIngestWorkers = 2
 
 // engine is the default Engine backed by a local knarr data root.
 type engine struct {
@@ -423,6 +446,7 @@ type engine struct {
 	img         *imagestore.Store
 	refs        *refstore.Store
 	holds       *holdstore.Store
+	slots       chan struct{} // caps the layer scans running at once across all builds
 }
 
 // New returns an Engine backed by the store under cfg.Root, creating the
@@ -430,6 +454,13 @@ type engine struct {
 func New(cfg Config) (Engine, error) {
 	if cfg.Root == "" {
 		return nil, errors.New("knarr: empty root directory")
+	}
+	workers := cfg.IngestWorkers
+	if workers < 0 {
+		return nil, fmt.Errorf("knarr: ingest workers must not be negative, got %d", workers)
+	}
+	if workers == 0 {
+		workers = DefaultIngestWorkers
 	}
 	obj, err := objectstore.New(cfg.Root)
 	if err != nil {
@@ -447,5 +478,8 @@ func New(cfg Config) (Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("knarr: open hold store: %w", err)
 	}
-	return &engine{root: cfg.Root, overlayRoot: cfg.OverlayRoot, obj: obj, img: img, refs: refs, holds: holds}, nil
+	return &engine{
+		root: cfg.Root, overlayRoot: cfg.OverlayRoot, obj: obj, img: img, refs: refs, holds: holds,
+		slots: make(chan struct{}, workers),
+	}, nil
 }

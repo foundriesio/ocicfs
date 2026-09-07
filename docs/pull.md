@@ -168,31 +168,46 @@ img, err := b.Finish(ctx)
 
 `NewBuild` takes the same reference and options as `Pull`, resolves the
 reference, verifies the metadata chain, and decides whether the store already
-holds the image. `Ingest(i)` materializes every layer up to and including `i`
-that has not been materialized yet, in manifest order — a jump forward applies
-every layer in between, an index at or below one already ingested does nothing,
-and on an image the store already held it does nothing at all. `Finish`
-ingests whatever is left, builds and records the image, and returns it exactly
-as `Pull` would; `Pull` itself is `NewBuild` followed by `Finish`, so the two
-paths store the same objects, bindings and reference records, differing only
-in the timestamp a reference record carries.
+holds the image. From the first `Ingest` or `Finish` on, the build scans
+layers ahead of the caller's calls in the background, under the engine's worker
+cap. `Ingest(i)` blocks
+until every layer up to and including `i` is merged, in manifest order — a
+jump forward applies every layer in between, an index at or below one already
+ingested returns at once, and on an image the store already held it does
+nothing at all. `Finish` ingests whatever is left, builds and records the
+image, and returns it exactly as `Pull` would; `Pull` itself is `NewBuild`
+followed by `Finish`, so the two paths store the same objects, bindings and
+reference records, differing only in the timestamp a reference record carries.
 
 Rules the build enforces:
 
-- **Each call runs under its own context.** The build keeps no context and
-  starts nothing that outlives a call, so it can span request handlers whose
-  contexts end on return. Each `Ingest` seals that layer's objects before it
-  returns.
-- **One call at a time.** `Ingest`, `Finish`, and `Close` are serialized;
-  `Close` waits for a call in progress to return rather than interrupting it.
-- **Fail closed, and stay failed.** A layer that fails verification fails the
-  build: every later call returns the same error, and nothing is recorded.
-  Calls after `Finish` or `Close` return an error too.
-- **The store is held against `gc` for the build's lifetime.** `gc` reports
-  `ErrStoreBusy` from `NewBuild` until `Finish` or `Close`, downloads
-  included, rather than for the conversion alone. Always `Close` a build that
-  will not `Finish`; objects it already sealed stay as unreferenced content
-  for `gc` to reclaim.
+- **Layers are scanned ahead, under the cap.** The build keeps the values of
+  the `NewBuild` context but not its cancellation, so it can span request
+  handlers whose contexts end on return; the scans it starts run until
+  `Finish` or `Close` stops them. A layer the blob source does not hold yet
+  is retried until the caller asks for it. `Config.IngestWorkers` sets the
+  cap for every build of the engine (0 means the default of 2).
+- **`Ingest(i)` blocks until layer `i` is merged.** It returns once every
+  layer up to `i` is in the store, whichever scan got there first. A
+  cancelled context returns its error and leaves the build running; the
+  call may be repeated.
+- **Failures surface early, and stay.** A layer that fails verification
+  fails the build: every later call returns the same error, and nothing is
+  recorded. Because layers are scanned ahead, the failure of layer `j` may
+  be reported by the `Ingest` of an earlier index `i < j` that was blocked
+  meanwhile. Calls after `Finish` or `Close` return an error too.
+- **`Close` cancels and waits.** It cancels every scan, waits for them, and
+  interrupts an `Ingest` or `Finish` blocked meanwhile, which then returns
+  an error. `Finish` drains every scan before returning, whether or not it
+  succeeded.
+- **One call at a time.** `Ingest` and `Finish` are serialized: a call that
+  arrives while another is in progress waits for it. Only `Close` cuts in,
+  as above.
+- **The store is held against `gc` until `Finish` or `Close` returns.** `gc`
+  reports `ErrStoreBusy` from `NewBuild` until then, downloads included,
+  rather than for the conversion alone. Always `Close` a build that will not
+  `Finish`; objects it already sealed stay as unreferenced content for `gc`
+  to reclaim.
 
 ## Notes
 
