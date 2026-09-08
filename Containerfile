@@ -68,7 +68,8 @@ RUN MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH)" \
 # Rust-free.
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS cfsctl-builder
 
-ARG COMPOSEFS_RS_COMMIT=e836ce4f0f944663e6afdad1817c6061bd548751
+# v0.9.2.
+ARG COMPOSEFS_RS_COMMIT=f720d6c79ac6b082fb1e182eed3b291f88e2a7f4
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
