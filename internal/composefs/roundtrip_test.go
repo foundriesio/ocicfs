@@ -448,3 +448,45 @@ func mustRead(t *testing.T, path string) []byte {
 	}
 	return b
 }
+
+// TestWriteImageMatchesRustMkcomposefs proves the dump WriteImage feeds to the C
+// mkcomposefs yields the same EROFS bytes under composefs-rs's mkcomposefs
+// (cfsctl's multi-call entry, the drop-in for the C binary). The fixture spans
+// every column WriteDump emits: directories with xattrs and non-zero mtime, a
+// by-digest regular file, an inlined one, a symlink, a hardlink with its name
+// count, a device node, and a fifo. Needs mkcomposefs and cfsctl on PATH.
+func TestWriteImageMatchesRustMkcomposefs(t *testing.T) {
+	lookPathOrSkip(t, "mkcomposefs") // WriteImage invokes it internally
+	cfsctl := lookPathOrSkip(t, "cfsctl")
+
+	entries := []Entry{
+		{Path: "/", Mode: os.ModeDir | 0o755, Mtime: 1700000000},
+		{Path: "/dir", Mode: os.ModeDir | 0o750, UID: 1000, GID: 1000, Mtime: 1700000000, MtimeNsec: 500, Xattrs: map[string]string{"user.k": "v"}},
+		{Path: "/dir/data", Mode: 0o644, Size: 4096, Digest: d('a'), Verity: d('b'), Nlink: 2, Mtime: 1700000001},
+		{Path: "/dir/data.link", Hardlink: "/dir/data"},
+		{Path: "/dir/inline", Mode: 0o600, Content: []byte("k=v\n"), Mtime: 1700000002},
+		{Path: "/dir/link", Mode: os.ModeSymlink | 0o777, Linkname: "data"},
+		{Path: "/dev-null", Mode: os.ModeDevice | os.ModeCharDevice | 0o666, Devmajor: 1, Devminor: 3},
+		{Path: "/fifo", Mode: os.ModeNamedPipe | 0o600},
+		{Path: "/suid", Mode: os.ModeSetuid | 0o755, Size: 100, Digest: d('c'), Verity: d('e')},
+	}
+
+	out := t.TempDir()
+	ours := filepath.Join(out, "ours.cfs")
+	if err := WriteImage(context.Background(), ours, entries); err != nil {
+		t.Fatalf("WriteImage: %v", err)
+	}
+
+	var dump bytes.Buffer
+	if err := WriteDump(&dump, entries); err != nil {
+		t.Fatalf("WriteDump: %v", err)
+	}
+	dumpPath := filepath.Join(out, "image.dump")
+	mustWriteFile(t, dumpPath, dump.Bytes())
+	rust := filepath.Join(out, "rust.cfs")
+	runCmd(t, cfsctl, "mkcomposefs", "--min-version=1", "--max-version=1", "--from-file", dumpPath, rust)
+
+	if oursBytes, rustBytes := mustRead(t, ours), mustRead(t, rust); !bytes.Equal(oursBytes, rustBytes) {
+		t.Fatalf("the Rust mkcomposefs built a different image from the same dump (%d vs %d bytes)", len(oursBytes), len(rustBytes))
+	}
+}

@@ -13,7 +13,7 @@
 # (the pushing seal reads from the local layout via --from-dir, after a
 # dry-run parity check against the registry source; the busybox seal leg
 # below covers the registry-sourced push), runs seal-crosscheck.sh on it
-# expecting the exact three-way digest match, and drives the sealed image
+# expecting the exact four-way digest match, and drives the sealed image
 # through the full verb lifecycle.
 #
 # The rest exercises a real image: the full lifecycle -- pull -> ls ->
@@ -231,7 +231,7 @@ echo "==== phase 0: purpose-built image -> seal -> cross-check -> lifecycle ====
 # inline-sized file, an empty file, a symlink, an empty directory, /run
 # content the canonical transform drops, and a second layer carrying a
 # whiteout and an override. Hardlink-free so the cross-check below must
-# reach the exact three-way digest match, not its fallback.
+# reach the exact four-way digest match, not its fallback.
 echo "== build with umoci and push =="
 IMGDIR="$(mktemp -d /var/lib/knarr/smoke-img-XXXXXX)"
 umoci init --layout "$IMGDIR/layout"
@@ -269,11 +269,11 @@ jq -e '.annotations["composefs.merged.erofs.v1.fsverity-sha256-12"] | test("^[0-
 jq -e '.config.annotations["composefs.config.fsverity-sha256-12"] | test("^[0-9a-f]{64}$")' \
 	<<<"$cman" >/dev/null || fail "custom sealed manifest lacks a well-formed config fsverity annotation"
 
-echo "== seal-crosscheck (expect the exact three-way match) =="
+echo "== seal-crosscheck (expect the exact four-way match) =="
 ccheck="$(CROSSCHECK_REGISTRY="127.0.0.1:$port" scripts/seal-crosscheck.sh "$cref")"
 printf '%s\n' "$ccheck" | grep -E "knarr:|cfsctl:|mkcomposefs:|RESULT"
-printf '%s\n' "$ccheck" | grep -qF "RESULT: all three digests MATCH" \
-	|| fail "seal-crosscheck did not reach the exact three-way match"
+printf '%s\n' "$ccheck" | grep -qF "RESULT: all four digests MATCH" \
+	|| fail "seal-crosscheck did not reach the exact four-way match"
 
 echo "==== lifecycle 0: the sealed purpose-built image ===="
 # The purpose-built image is a plain manifest, so it is its own identity.
@@ -500,4 +500,4 @@ printf '%s\n' "$out"
 [ "$(printf '%s' "$out" | jq -r .objectsRemoved)" -gt 0 ] || fail "gc after plain unmount reclaimed nothing"
 [ -z "$(find "$STORE/objects/sha256" -type f)" ] || fail "objects remain in an empty store"
 
-echo "SMOKE OK: purpose-built image sealed, cross-checked three ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding, and a gc round (unwanted reclaimed, in-use survives until unmount on both mount paths, empty store fully reclaimed down to its shard directories) (checks passed)"
+echo "SMOKE OK: purpose-built image sealed, cross-checked four ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding, and a gc round (unwanted reclaimed, in-use survives until unmount on both mount paths, empty store fully reclaimed down to its shard directories) (checks passed)"

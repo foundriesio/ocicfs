@@ -4,24 +4,26 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # seal-crosscheck.sh <image-uri> -- verify the merged composefs fs-verity
-# digest `knarr seal` computes for an image against two independent
+# digest `knarr seal` computes for an image against three independent
 # implementations:
 #
 #   1. knarr seal --dry-run          (knarr's Go entry builder + EROFS writer)
 #   2. cfsctl oci compute-id         (composefs-rs, the reference oracle)
-#   3. umoci unpack + canonical transforms + mkcomposefs + fsverity
+#   3. cfsctl mkcomposefs --from-file (the Rust mkcomposefs fed the sealed
+#      image's own dump: the drop-in for the C binary knarr shells out to)
+#   4. umoci unpack + canonical transforms + mkcomposefs + fsverity
 #      (an independent OCI flattener feeding the format-defining C writer)
 #
-# Legs 1 and 2 must agree bit-for-bit; a mismatch fails the script. Leg 3
+# Legs 1, 2 and 3 must agree bit-for-bit; a mismatch fails the script. Leg 4
 # matches bit-for-bit only for images without hardlinks: mkcomposefs cannot
 # encode hardlinks when building from a directory, so for hardlink-carrying
 # images the leg falls back to comparing `composefs-info dump` of both EROFS
 # images with the hardlink encoding normalized away -- which still checks
 # every path, size, mode, owner, mtime, inline payload, and content digest.
-# The transforms replicated for leg 3 are the canonical ones: root directory
+# The transforms replicated for leg 4 are the canonical ones: root directory
 # metadata taken from /usr and /run emptied. The xattr allowlist (everything
 # but security.capability dropped) is not replicated; an image carrying other
-# xattrs shows up in the leg-3 diff.
+# xattrs shows up in the leg-4 diff.
 #
 # The image is pulled for the current platform; a multi-arch index resolves
 # to its linux/$(go env GOARCH) child. Needs the privileged dev container
@@ -95,7 +97,23 @@ sealed_erofs="$WORK/cfs-repo/objects/${cfsctl_hex:0:2}/${cfsctl_hex:2}"
 cp "$sealed_erofs" "$WORK/sealed.erofs"
 rm -rf "$WORK/cfs-repo"
 
-echo "== leg 3: umoci unpack + canonical transforms + mkcomposefs =="
+echo "== leg 3: cfsctl mkcomposefs --from-file =="
+# knarr builds its EROFS by piping a composefs dump through the C mkcomposefs.
+# composefs-rs ships its own mkcomposefs (cfsctl's multi-call entry) meant as
+# a drop-in for that binary, so the dump path must yield the same bytes under
+# either implementation. The sealed image's own dump is a faithful input: the
+# C tool's test suite asserts `composefs-info dump | mkcomposefs --from-file`
+# reproduces an image bit-for-bit.
+composefs-info dump "$WORK/sealed.erofs" >"$WORK/sealed.dump"
+cfsctl mkcomposefs --min-version=1 --max-version=1 --from-file "$WORK/sealed.dump" "$WORK/rust.erofs"
+rust_hex="$(fsverity digest "$WORK/rust.erofs" | awk '{print $1}')"
+rust_hex="${rust_hex#sha256:}"
+echo "cfsctl mkcomposefs: $rust_hex"
+cmp -s "$WORK/sealed.erofs" "$WORK/rust.erofs" \
+	|| fail "the Rust mkcomposefs rebuilt the sealed dump into different bytes: $knarr_hex vs $rust_hex"
+rm -f "$WORK/rust.erofs"
+
+echo "== leg 4: umoci unpack + canonical transforms + mkcomposefs =="
 # umoci addresses layouts by tag; crane layouts carry no ref.name annotation.
 jq '.manifests[0].annotations = {"org.opencontainers.image.ref.name": "crosscheck"}' \
 	"$WORK/layout/index.json" >"$WORK/index.json" && mv "$WORK/index.json" "$WORK/layout/index.json"
@@ -115,15 +133,15 @@ fi
 touch -r "$rootfs/usr" "$rootfs"
 # Pin the stable V1 EROFS format, the one knarr and the cfsctl oracle write;
 # the mkcomposefs default is a different format version with different bytes.
-mkcomposefs --min-version=1 --max-version=1 "$rootfs" "$WORK/third.erofs"
+mkcomposefs --min-version=1 --max-version=1 "$rootfs" "$WORK/umoci.erofs"
 # The EROFS is written; only the two metadata images are needed from here on.
 rm -rf "$WORK/bundle"
-third_hex="$(fsverity digest "$WORK/third.erofs" | awk '{print $1}')"
-third_hex="${third_hex#sha256:}"
-echo "mkcomposefs: $third_hex"
+umoci_hex="$(fsverity digest "$WORK/umoci.erofs" | awk '{print $1}')"
+umoci_hex="${umoci_hex#sha256:}"
+echo "mkcomposefs: $umoci_hex"
 
-if [ "$third_hex" = "$knarr_hex" ]; then
-	echo "RESULT: all three digests MATCH"
+if [ "$umoci_hex" = "$knarr_hex" ]; then
+	echo "RESULT: all four digests MATCH"
 	exit 0
 fi
 
@@ -132,15 +150,14 @@ fi
 normalize() {
 	awk '{ sub(/^@/, "", $3); $4 = 1; if ($NF != "-") $9 = substr($NF, 1, 2) "/" substr($NF, 3); print }' "$1"
 }
-composefs-info dump "$WORK/sealed.erofs" >"$WORK/sealed.dump"
-composefs-info dump "$WORK/third.erofs" >"$WORK/third.dump"
+composefs-info dump "$WORK/umoci.erofs" >"$WORK/umoci.dump"
 normalize "$WORK/sealed.dump" >"$WORK/sealed.norm"
-normalize "$WORK/third.dump" >"$WORK/third.norm"
-if diff -q "$WORK/sealed.norm" "$WORK/third.norm" >/dev/null; then
-	echo "RESULT: legs 1+2 MATCH; leg 3 differs only in hardlink encoding" \
+normalize "$WORK/umoci.dump" >"$WORK/umoci.norm"
+if diff -q "$WORK/sealed.norm" "$WORK/umoci.norm" >/dev/null; then
+	echo "RESULT: legs 1+2+3 MATCH; leg 4 differs only in hardlink encoding" \
 		"(trees identical across $(wc -l <"$WORK/sealed.norm") entries)"
 	exit 0
 fi
 echo "normalized dump diff (first 20 lines):" >&2
-diff "$WORK/sealed.norm" "$WORK/third.norm" | head -20 >&2
+diff "$WORK/sealed.norm" "$WORK/umoci.norm" | head -20 >&2
 fail "the independently built tree differs from the sealed image"
