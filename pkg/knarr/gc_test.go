@@ -637,3 +637,125 @@ func TestGCAbortsOnHeldIndex(t *testing.T) {
 	assertObjectExists(t, storeRoot, gcUniqueDigest("heldindex"))
 	assertObjectAbsent(t, storeRoot, index)
 }
+
+// Payloads for the shadowed-content fixtures, each past the inline threshold
+// so every one becomes its own object rather than riding inside the image.
+const (
+	gcWhitedOutBody = "payload whited out by the upper layer, padded past the sixty-four byte inline threshold\n"
+	gcOldBody       = "first version of an edited file, padded past the sixty-four byte inline threshold\n"
+	gcNewBody       = "second version of an edited file, padded past the sixty-four byte inline threshold\n"
+)
+
+// gcPullShadowed pulls a two-layer image whose upper layer whites out one file
+// of the lower layer and overwrites another, so the store ends up holding two
+// objects the merged image does not reference. removed names the payload the
+// whiteout hides, letting a caller point it at content another image wants.
+func gcPullShadowed(t *testing.T, eng Engine, removed string) octest.Layout {
+	t.Helper()
+	lay, err := octest.BuildImage(t.TempDir(), octest.ImageSpec{
+		Platform: hostPlatform(),
+		Layers: []octest.LayerSpec{
+			{Files: []octest.File{
+				{Name: "etc", Mode: 0o755, Dir: true},
+				{Name: "etc/gone.txt", Mode: 0o644, Body: removed},
+				{Name: "etc/edited.txt", Mode: 0o644, Body: gcOldBody},
+			}},
+			{Files: []octest.File{
+				{Name: "etc/.wh.gone.txt", Mode: 0o000},
+				{Name: "etc/edited.txt", Mode: 0o644, Body: gcNewBody},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("build shadowed layout: %v", err)
+	}
+	if _, err := eng.Pull(context.Background(), lay.Ref, WithFromDir(lay.Dir)); devtest.IsVerityUnsupported(err) {
+		t.Skipf("fs-verity unsupported on the test filesystem: %v", err)
+	} else if err != nil {
+		t.Fatalf("Pull %s: %v", lay.Ref, err)
+	}
+	return lay
+}
+
+// TestGCReclaimsShadowedObjects asserts that content a later layer whites out
+// or overwrites is stored during the pull — a scan cannot know what the layers
+// above it do — and is then reclaimed by gc even though the image that stored
+// it is still referenced. The surviving version and the image itself stay.
+func TestGCReclaimsShadowedObjects(t *testing.T) {
+	eng, storeRoot, _ := gcEngine(t, "keep")
+	ctx := context.Background()
+	lay := gcPullShadowed(t, eng, gcWhitedOutBody)
+
+	whitedOut := digest.SHA256.FromString(gcWhitedOutBody)
+	old := digest.SHA256.FromString(gcOldBody)
+	current := digest.SHA256.FromString(gcNewBody)
+
+	// The pull stores the shadowed payloads: the merge drops them from the
+	// tree, not from the store.
+	assertObjectExists(t, storeRoot, whitedOut)
+	assertObjectExists(t, storeRoot, old)
+	assertObjectExists(t, storeRoot, current)
+
+	report, err := eng.GC(ctx)
+	if err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	if report.ObjectsRemoved == 0 {
+		t.Fatalf("GC = %+v, want the shadowed objects reclaimed", report)
+	}
+	assertObjectAbsent(t, storeRoot, whitedOut)
+	assertObjectAbsent(t, storeRoot, old)
+	assertObjectExists(t, storeRoot, current)
+	assertObjectExists(t, storeRoot, gcUniqueDigest("keep"))
+	if _, err := eng.Inspect(ctx, lay.Ref); err != nil {
+		t.Fatalf("Inspect after gc: %v", err)
+	}
+}
+
+// TestGCKeepsShadowedObjectAnotherImageWants asserts the sweep is decided by
+// what every image references, not by what the image being pulled shadows: a
+// payload an upper layer whites out survives when an image pulled earlier
+// still names it. The store is content-addressed, so both images share the one
+// object.
+func TestGCKeepsShadowedObjectAnotherImageWants(t *testing.T) {
+	eng, storeRoot, _ := gcEngine(t, "keep")
+	ctx := context.Background()
+
+	// An earlier image whose only unique payload is the one the next image
+	// will white out.
+	wanted, err := octest.BuildSingleLayerGzip(t.TempDir(), hostPlatform(),
+		octest.File{Name: "etc/wanted.txt", Mode: 0o644, Body: gcWhitedOutBody},
+	)
+	if err != nil {
+		t.Fatalf("build wanted layout: %v", err)
+	}
+	if _, err := eng.Pull(ctx, wanted.Ref, WithFromDir(wanted.Dir)); devtest.IsVerityUnsupported(err) {
+		t.Skipf("fs-verity unsupported on the test filesystem: %v", err)
+	} else if err != nil {
+		t.Fatalf("Pull %s: %v", wanted.Ref, err)
+	}
+
+	shadowed := gcPullShadowed(t, eng, gcWhitedOutBody)
+	shared := digest.SHA256.FromString(gcWhitedOutBody)
+
+	if _, err := eng.GC(ctx); err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	// The second image whited this payload out; the first still wants it.
+	assertObjectExists(t, storeRoot, shared)
+	assertObjectAbsent(t, storeRoot, digest.SHA256.FromString(gcOldBody))
+	for _, ref := range []string{wanted.Ref, shadowed.Ref} {
+		if _, err := eng.Inspect(ctx, ref); err != nil {
+			t.Fatalf("Inspect %s after gc: %v", ref, err)
+		}
+	}
+
+	// Removing the image that wants it lets the same object go.
+	if err := eng.Remove(ctx, wanted.Ref); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if _, err := eng.GC(ctx); err != nil {
+		t.Fatalf("GC after remove: %v", err)
+	}
+	assertObjectAbsent(t, storeRoot, shared)
+}
