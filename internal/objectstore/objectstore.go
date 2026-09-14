@@ -247,16 +247,19 @@ func (s *Store) stage(ctx context.Context, tempPrefix string, expect digest.Dige
 	return tempPath, d, nil
 }
 
-// seal enables fs-verity on the staged temp whose content digest is d, measures
-// it, and commits it at the content-addressed path with no-replace semantics,
-// returning the measured fs-verity digest. On a collision it confirms the
-// existing object's measured fs-verity digest matches the staged one rather
-// than overwriting an immutable object, and returns that object's digest. The
-// temp is consumed on every path: renamed into place on success, removed
-// otherwise. Once enabled, fs-verity makes the bytes immutable and
-// kernel-verified on every read for the life of the object. No fsync is taken
-// per object: a pull makes all of its writes durable with a single store-wide
-// Sync before it writes the binding that references them.
+// seal commits the staged temp whose content digest is d at its
+// content-addressed path and returns its measured fs-verity digest. A temp for
+// an object the store does not hold is fs-verity-enabled, measured and committed
+// with no-replace semantics. A temp for an object already held is never
+// sealed: its fs-verity digest is computed in userspace and compared against
+// the existing object's measurement, which proves the bytes identical without
+// the enable ioctl's Merkle write, and the existing object's view link is
+// ensured. A collision on commit is resolved the same way. The temp is consumed
+// on every path: renamed into place on success, removed otherwise. Once
+// enabled, fs-verity makes the bytes immutable and kernel-verified on every
+// read for the life of the object. No fsync is taken per object: a pull makes
+// all of its writes durable with a single store-wide Sync before it writes the
+// binding that references them.
 func (s *Store) seal(ctx context.Context, tempPath string, d digest.Digest) (string, error) {
 	defer removeTemp(tempPath)
 
@@ -265,30 +268,47 @@ func (s *Store) seal(ctx context.Context, tempPath string, d digest.Digest) (str
 	if err := ctx.Err(); err != nil {
 		return "", fmt.Errorf("objectstore: %w", err)
 	}
+	finalPath := s.objectPath(d.Hex())
+	present, err := presentObject(finalPath)
+	if err != nil {
+		return "", err
+	}
 	rf, err := os.Open(tempPath) // #nosec G304 -- store-owned temp path
 	if err != nil {
 		return "", fmt.Errorf("objectstore: reopen temp: %w", err)
 	}
-	if err := verity.Enable(rf); err != nil {
+	var fsv string
+	if present {
+		fsv, err = verity.Digest(ctx, rf)
+		if err != nil {
+			_ = rf.Close()
+			return "", fmt.Errorf("objectstore: digest temp: %w", err)
+		}
+	} else if err := verity.Enable(rf); err != nil {
 		_ = rf.Close()
 		return "", fmt.Errorf("objectstore: enable verity on temp: %w", err)
 	}
-	// The enable ioctl cannot be interrupted, so check again before the object
-	// is committed: a pull canceled during the ioctl must not publish it.
+	// The enable ioctl cannot be interrupted and a userspace digest can finish
+	// its last read after a cancellation, so check again before the object is
+	// committed or resolved: a pull canceled here must not publish it.
 	if err := ctx.Err(); err != nil {
 		_ = rf.Close()
 		return "", fmt.Errorf("objectstore: %w", err)
 	}
-	fsv, err := verity.Measure(rf)
-	if err != nil {
-		_ = rf.Close()
-		return "", fmt.Errorf("objectstore: measure verity: %w", err)
+	if !present {
+		fsv, err = verity.Measure(rf)
+		if err != nil {
+			_ = rf.Close()
+			return "", fmt.Errorf("objectstore: measure verity: %w", err)
+		}
 	}
 	if err := rf.Close(); err != nil {
 		return "", fmt.Errorf("objectstore: close verity temp: %w", err)
 	}
+	if present {
+		return s.resolveExisting(finalPath, fsv)
+	}
 
-	finalPath := s.objectPath(d.Hex())
 	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil { // #nosec G301 -- knarr-owned object-store shard dir
 		return "", fmt.Errorf("objectstore: create shard dir: %w", err)
 	}
@@ -296,16 +316,7 @@ func (s *Store) seal(ctx context.Context, tempPath string, d digest.Digest) (str
 	// against the existing one rather than overwriting an immutable object.
 	if err := commitNoReplace(tempPath, finalPath); err != nil {
 		if errors.Is(err, os.ErrExist) {
-			existingFsv, vErr := s.verifyCollision(finalPath, fsv)
-			if vErr != nil {
-				return "", vErr
-			}
-			// The object was already present; repair the view link in case a
-			// prior write committed the object but not its view name.
-			if err := s.linkView(finalPath, existingFsv); err != nil {
-				return "", err
-			}
-			return existingFsv, nil
+			return s.resolveExisting(finalPath, fsv)
 		}
 		return "", fmt.Errorf("objectstore: commit to %s: %w", finalPath, err)
 	}
@@ -315,12 +326,30 @@ func (s *Store) seal(ctx context.Context, tempPath string, d digest.Digest) (str
 	return fsv, nil
 }
 
+// presentObject reports whether a regular file already holds the object at
+// path. A missing path is absent. Any other node there is store corruption,
+// reported rather than treated as absent: a commit against it would collide,
+// and the collision must not be resolved through a node that is not an object.
+func presentObject(path string) (bool, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("objectstore: stat object %s: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return false, fmt.Errorf("objectstore: object path %s is not a regular file", path)
+	}
+	return true, nil
+}
+
 // linkView hardlinks the committed object at objectPath into the fs-verity view
 // under objects/fsverity-sha256-12/, sharded like the sha256 namespace and keyed
 // by the object's measured fs-verity digest fsv ("sha256:<hex>"). Both names
 // share one inode, so fs-verity carries over. The link failing fails the write:
 // no write succeeds without its view name (a crash between the CAS commit and
-// the link leaves an object the next collision repairs). A view name that already resolves
+// the link leaves an object the next write of it repairs). A view name that already resolves
 // to the same inode is accepted — a concurrent writer of identical content, or a
 // collision repairing its own link; a different inode at the view name is store
 // corruption.
@@ -380,19 +409,29 @@ func (s *Store) WriteObject(ctx context.Context, r io.Reader) (digest.Digest, Se
 	return d, Resolved(fsv), nil
 }
 
-// verifyCollision confirms the object already at path is the one we just staged
-// by comparing its measured fs-verity digest against the staged object's. The
-// fs-verity measurement is a Merkle root over the file's content, so a match
-// proves byte-for-byte content identity and that the existing object was sealed
-// with the same fs-verity parameters; an O(1) metadata read replaces a full
-// re-hash of the existing bytes. It returns the existing object's measured
-// fs-verity digest.
-func (s *Store) verifyCollision(path string, stagedFsv string) (string, error) {
-	f, err := os.Open(path) // #nosec G304 -- digest-derived object-store path
+// resolveExisting confirms the object already at path is the one just staged
+// by comparing its measured fs-verity digest against stagedFsv, ensures its
+// view link, and returns that digest. The fs-verity measurement is a Merkle
+// root over the file's content, so a match proves byte-for-byte content
+// identity and that the existing object was sealed with the same fs-verity
+// parameters; an O(1) metadata read replaces a full re-hash of the existing
+// bytes. The path is opened without following symlinks and must be a regular
+// file: a view link made through anything else would put mutable indirection
+// under the fs-verity view. Ensuring the view link repairs an object a crash
+// left committed but unlinked.
+func (s *Store) resolveExisting(path string, stagedFsv string) (string, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0) // #nosec G304 -- digest-derived object-store path
 	if err != nil {
 		return "", fmt.Errorf("objectstore: open existing %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("objectstore: stat existing %s: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("objectstore: existing %s is not a regular file", path)
+	}
 
 	fsv, err := verity.Measure(f)
 	if err != nil {
@@ -400,6 +439,9 @@ func (s *Store) verifyCollision(path string, stagedFsv string) (string, error) {
 	}
 	if fsv != stagedFsv {
 		return "", fmt.Errorf("objectstore: collision at %s but fs-verity digest mismatch: existing %s, staged %s", path, fsv, stagedFsv)
+	}
+	if err := s.linkView(path, fsv); err != nil {
+		return "", err
 	}
 	return fsv, nil
 }

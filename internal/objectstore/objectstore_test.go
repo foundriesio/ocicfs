@@ -96,8 +96,8 @@ func TestWriteObjectRoundTrip(t *testing.T) {
 		t.Fatalf("WriteObject fs-verity digest = %q, VerityDigest = %q", fsv, measured)
 	}
 
-	// Re-writing identical content dedups via the collision path and still
-	// reports the existing object's fs-verity digest.
+	// Re-writing identical content takes the present-object path: the temp is
+	// never sealed and the existing object's fs-verity digest is reported.
 	d2, fsv2, err := writeObject(t, s, ctx, bytes.NewReader(content))
 	if err != nil {
 		t.Fatalf("WriteObject dedup: %v", err)
@@ -160,7 +160,7 @@ func TestWriteBlobLinksView(t *testing.T) {
 }
 
 // TestWriteObjectRepairsView removes a committed object's view link, then rewrites
-// identical content: the collision path must repair the missing view name.
+// identical content: the present-object path must repair the missing view name.
 func TestWriteObjectRepairsView(t *testing.T) {
 	s := newVerityStore(t)
 	ctx := context.Background()
@@ -175,7 +175,7 @@ func TestWriteObjectRepairsView(t *testing.T) {
 	if err := os.Remove(viewPath); err != nil {
 		t.Fatalf("remove view link: %v", err)
 	}
-	// Identical content hits the collision path, which repairs the view link.
+	// Identical content hits the present-object path, which repairs the view link.
 	if _, _, err := s.WriteObject(ctx, bytes.NewReader(content)); err != nil {
 		t.Fatalf("WriteObject repair: %v", err)
 	}
@@ -250,8 +250,8 @@ func TestWriteObjectConcurrentView(t *testing.T) {
 }
 
 // TestWriteObjectCollisionForeignView leaves the CAS object intact but replaces
-// its view name with a foreign inode: the collision verify succeeds, and the
-// view repair must then reject the mismatched link as corruption.
+// its view name with a foreign inode: the present-object check succeeds, and
+// the view repair must then reject the mismatched link as corruption.
 func TestWriteObjectCollisionForeignView(t *testing.T) {
 	s := newVerityStore(t)
 	ctx := context.Background()
@@ -270,7 +270,7 @@ func TestWriteObjectCollisionForeignView(t *testing.T) {
 		t.Fatalf("seed foreign view: %v", err)
 	}
 	if _, _, err := s.WriteObject(ctx, bytes.NewReader(content)); err == nil {
-		t.Fatal("expected error when the collision path finds a foreign inode at the view name")
+		t.Fatal("expected error when the present-object path finds a foreign inode at the view name")
 	}
 }
 
@@ -667,5 +667,43 @@ func TestWriteRepairsMissingViewLink(t *testing.T) {
 	}
 	if _, err := os.Lstat(viewPath); err != nil {
 		t.Fatalf("view link not repaired: %v", err)
+	}
+}
+
+// TestWriteObjectSymlinkAtObjectPath replaces a committed object's content path
+// with a symlink to the sealed bytes and rewrites the same content: the write
+// must fail rather than resolve through the symlink, and no view link may be
+// made for it. The commit-collision resolution must refuse the symlink too.
+func TestWriteObjectSymlinkAtObjectPath(t *testing.T) {
+	s := newVerityStore(t)
+	ctx := context.Background()
+	content := []byte("object behind a symlink")
+
+	d, fsv, err := writeObject(t, s, ctx, bytes.NewReader(content))
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("WriteObject: %v", err)
+	}
+	objPath := s.objectPath(d.Hex())
+	viewPath := s.viewPath(strings.TrimPrefix(fsv, "sha256:"))
+	if err := os.Remove(viewPath); err != nil {
+		t.Fatalf("remove view link: %v", err)
+	}
+	realPath := objPath + ".real"
+	if err := os.Rename(objPath, realPath); err != nil {
+		t.Fatalf("move object aside: %v", err)
+	}
+	if err := os.Symlink(realPath, objPath); err != nil {
+		t.Fatalf("symlink object path: %v", err)
+	}
+
+	if _, _, err := s.WriteObject(ctx, bytes.NewReader(content)); err == nil {
+		t.Fatal("expected error writing content whose object path is a symlink")
+	}
+	if _, err := os.Lstat(viewPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("view link must not be made through a symlink: lstat err = %v", err)
+	}
+	if _, err := s.resolveExisting(objPath, fsv); err == nil {
+		t.Fatal("expected resolveExisting to refuse a symlink at the object path")
 	}
 }
