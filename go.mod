@@ -1,6 +1,6 @@
 module github.com/foundriesio/knarr
 
-go 1.26
+go 1.26.0
 
 require (
 	github.com/distribution/reference v0.6.0
@@ -10,7 +10,7 @@ require (
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/spf13/cobra v1.10.2
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
