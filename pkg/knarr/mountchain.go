@@ -8,6 +8,9 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
 	"github.com/foundriesio/knarr/internal/digestutil"
 )
 
@@ -31,21 +34,22 @@ func (e *engine) mountChain(ctx context.Context, chainID, target string, opts ..
 }
 
 // resolveChain finds the stored image whose full layer chain ends at the chain
-// identity chainID, reading only local state. It inspects each stored reference
-// record and returns the first image whose final layer chain ID equals chainID;
-// images that share a full chain have byte-identical rootfs by construction, so
-// the first match is as good as any. A zero-layer image has no final chain ID
-// and is never a match. Records are enumerated by their identity digest alone;
-// their platform strings are not parsed here, so a record with an unparseable
-// platform is inspected like any other rather than aborting the scan.
+// identity chainID, reading only local state. It inspects every image the
+// store holds a binding for — a reference is not required, so an image a hold
+// alone keeps is found like any other — and returns the first whose final
+// layer chain ID equals chainID; images that share a full chain have
+// byte-identical rootfs by construction, so the first match is as good as
+// any. A zero-layer image has no final chain ID and is never a match. Bindings
+// are enumerated by their identity digest alone; an image bound for several
+// platforms is inspected once, for the host platform, like any other.
 //
 // An image that cannot be inspected is skipped and the scan continues, so one
-// unreadable or corrupt record cannot hide a healthy match. When the scan ends
-// with no match, the returned error satisfies errors.Is(err, ErrNotFound) and
-// joins every inspection error encountered, each naming the record that failed,
-// so store corruption stays visible instead of reading as a plain miss. A
-// chainID matching only a proper prefix of a chain, or matching nothing, is not
-// found.
+// unreadable or corrupt binding cannot hide a healthy match. When the scan
+// ends with no match, the returned error satisfies errors.Is(err, ErrNotFound)
+// and joins every inspection error encountered, each naming the image that
+// failed, so store corruption stays visible instead of reading as a plain
+// miss. A chainID matching only a proper prefix of a chain, or matching
+// nothing, is not found.
 func (e *engine) resolveChain(ctx context.Context, chainID string) (*ImageInfo, error) {
 	want, err := digestutil.ParseSHA256(chainID)
 	if err != nil {
@@ -54,29 +58,41 @@ func (e *engine) resolveChain(ctx context.Context, chainID string) (*ImageInfo, 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	records, err := e.refs.List()
-	if err != nil {
-		return nil, err
-	}
 
-	var scanErrs []error
-	for _, rec := range records {
-		// A cancelled scan aborts with its context error rather than folding
-		// into skip-and-continue, so a caller never reads cancellation as a
-		// not-found result.
-		if err := ctx.Err(); err != nil {
-			return nil, err
+	var (
+		found    *ImageInfo
+		scanErrs []error
+		seen     = map[digest.Digest]struct{}{}
+	)
+	err = e.img.Walk(ctx, func(root digest.Digest, _ ocispec.Platform) error {
+		if _, ok := seen[root]; ok {
+			return nil
 		}
-		info, err := e.inspect(ctx, rec.Identity.Digest.String())
+		seen[root] = struct{}{}
+		info, err := e.inspect(ctx, root.String())
 		if err != nil {
-			scanErrs = append(scanErrs, fmt.Errorf("inspect %s: %w", rec.Identity.Digest, err))
-			continue
+			scanErrs = append(scanErrs, fmt.Errorf("inspect %s: %w", root, err))
+			return nil
 		}
 		if n := len(info.Layers); n > 0 && info.Layers[n-1].ChainID == want {
-			return info, nil
+			found = info
+			return errChainFound
 		}
+		return nil
+	})
+	if found != nil {
+		return found, nil
+	}
+	// A cancelled scan aborts with its context error rather than folding into
+	// skip-and-continue, so a caller never reads cancellation as a not-found
+	// result; the walk checks the context before every binding.
+	if err != nil {
+		return nil, err
 	}
 
 	errs := []error{fmt.Errorf("no stored image with final chain ID %s: %w", want, ErrNotFound)}
 	return nil, errors.Join(append(errs, scanErrs...)...)
 }
+
+// errChainFound stops the binding walk at the first match.
+var errChainFound = errors.New("chain found")

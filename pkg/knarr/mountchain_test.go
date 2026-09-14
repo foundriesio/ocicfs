@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
@@ -20,7 +19,6 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/foundriesio/knarr/internal/devtest"
-	"github.com/foundriesio/knarr/internal/ocilayout"
 	"github.com/foundriesio/knarr/internal/octest"
 )
 
@@ -78,21 +76,46 @@ func TestResolveChainSharedChainReturnsFirstMatch(t *testing.T) {
 	eng := newChainEngine(t, root)
 	// Two stored images with identical layers but different history: same
 	// diff_ids (hence the same final chain ID), distinct root digests. The scan
-	// visits refs in sorted order, so the "aaa" image is the first match.
+	// walks bindings in digest order, so the lower digest is the first match.
 	layers := []octest.LayerSpec{{Files: []octest.File{{Name: "a", Mode: 0o644, Body: "one"}}}}
 	first := seedChainImage(t, root, "aaa@%s", layers, []ocispec.History{{CreatedBy: "first"}})
 	second := seedChainImage(t, root, "zzz@%s", layers, []ocispec.History{{CreatedBy: "second"}})
 	if first.Root == second.Root {
 		t.Fatal("fixture images share a root digest; they must differ to test first-match")
 	}
+	lower := min(first.Root, second.Root)
 
 	want := chainIDs(first.DiffIDs)
 	info, err := eng.resolveChain(context.Background(), want[len(want)-1].String())
 	if err != nil {
 		t.Fatalf("resolveChain: %v", err)
 	}
-	if info.Root != first.Root {
-		t.Fatalf("Root = %s, want the first-by-ref image %s", info.Root, first.Root)
+	if info.Root != lower {
+		t.Fatalf("Root = %s, want the first-by-digest image %s", info.Root, lower)
+	}
+}
+
+// TestResolveChainRefLessImageResolves: an image the store holds a binding
+// for is found whether or not any reference names it — a hold alone may be
+// what keeps it — so a runtime that pulled an image without registering a
+// reference can still mount it by chain.
+func TestResolveChainRefLessImageResolves(t *testing.T) {
+	root := t.TempDir()
+	eng := newChainEngine(t, root)
+	lay := seedChainImage(t, root, "app@%s", []octest.LayerSpec{
+		{Files: []octest.File{{Name: "a", Mode: 0o644, Body: "one"}}},
+	}, nil)
+	if err := os.RemoveAll(filepath.Join(root, "refs")); err != nil {
+		t.Fatalf("RemoveAll refs: %v", err)
+	}
+
+	want := chainIDs(lay.DiffIDs)
+	info, err := eng.resolveChain(context.Background(), want[len(want)-1].String())
+	if err != nil {
+		t.Fatalf("resolveChain: %v", err)
+	}
+	if info.Root != lay.Root {
+		t.Fatalf("Root = %s, want %s", info.Root, lay.Root)
 	}
 }
 
@@ -145,16 +168,21 @@ func TestResolveChainPoisonedNeighborDoesNotBlockMatch(t *testing.T) {
 	}
 }
 
-// TestResolveChainUnparseablePlatformRecordDoesNotBlockMatch: a ref record that
-// refstore accepts (valid schema and refKey, a non-empty platforms entry) but
-// whose platform string is not an os/arch pair must not hide a healthy image.
-// The resolver enumerates records by their resolved digest without parsing the
-// platform, so such a record is inspected and skipped like any other unreadable
-// one instead of aborting the scan.
-func TestResolveChainUnparseablePlatformRecordDoesNotBlockMatch(t *testing.T) {
+// TestResolveChainUnreadableBindingDoesNotBlockMatch: a binding file the
+// image store cannot key — its platform does not name the file it sits in —
+// must not hide a healthy image. The walk skips such an entry with a warning
+// instead of aborting the scan.
+func TestResolveChainUnreadableBindingDoesNotBlockMatch(t *testing.T) {
 	root := t.TempDir()
 	eng := newChainEngine(t, root)
-	seedPoisonImagePlatform(t, root, "aaa@%s", "garbage")
+	garbage := digest.SHA256.FromString("garbage binding")
+	path := octest.BindingPath(root, garbage, ocispec.Platform{OS: "linux", Architecture: "amd64"})
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("not a binding"), 0o600); err != nil { // #nosec G304 G703 -- test path
+		t.Fatalf("WriteFile: %v", err)
+	}
 	healthy := seedChainImage(t, root, "bbb@%s", []octest.LayerSpec{
 		{Files: []octest.File{{Name: "a", Mode: 0o644, Body: "one"}}},
 	}, nil)
@@ -338,35 +366,17 @@ func seedZeroLayerImage(t *testing.T, root, refFmt string) {
 	putEngineBinding(t, root, manifestDigest, p, digest.SHA256.FromString("cfs-"+ref))
 }
 
-// seedPoisonImage stores a ref whose root "metadata" blob is not valid OCI JSON,
-// so inspecting it fails with a parse error rather than a not-found result. It
-// returns the resolved digest, which the no-match diagnostic names.
+// seedPoisonImage stores a bound image whose root "metadata" blob is not valid
+// OCI JSON, so inspecting it fails with a parse error rather than a not-found
+// result. It returns the identity digest, which the no-match diagnostic names.
 func seedPoisonImage(t *testing.T, root, refFmt string) digest.Digest {
-	t.Helper()
-	p := hostPlatform()
-	return seedPoisonImagePlatform(t, root, refFmt, ocilayout.PlatformString(&p))
-}
-
-// seedPoisonImagePlatform is seedPoisonImage with an explicit platform string,
-// so a record with an unparseable platform can be stored to prove the resolver
-// enumerates records without parsing their platform. refstore only requires the
-// platforms entry to be non-empty, so it accepts an arbitrary string.
-func seedPoisonImagePlatform(t *testing.T, root, refFmt, platform string) digest.Digest {
 	t.Helper()
 	garbage := []byte("not a manifest")
 	d := digest.SHA256.FromBytes(garbage)
 	seedObject(t, root, d, garbage)
 	ref := strings.Replace(refFmt, "%s", d.String(), 1)
-	refStore := newRefStore(t, root)
-	desc := ocispec.Descriptor{
-		MediaType: ocispec.MediaTypeImageManifest,
-		Digest:    d,
-		Size:      int64(len(garbage)),
-	}
-	err := refStore.Put(ref, desc, desc, time.Unix(0, 0).UTC(), []string{platform})
-	if err != nil {
-		t.Fatalf("Put ref: %v", err)
-	}
+	putEngineRef(t, root, ref, d, int64(len(garbage)), hostPlatform())
+	putEngineBinding(t, root, d, hostPlatform(), digest.SHA256.FromString("cfs-"+ref))
 	return d
 }
 
