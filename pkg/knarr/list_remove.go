@@ -18,7 +18,8 @@ import (
 	"github.com/foundriesio/knarr/internal/refstore"
 )
 
-// List returns the images present in the local store.
+// List returns the images present in the local store: every referenced
+// image, then every image a hold alone keeps.
 func (e *engine) List(ctx context.Context) ([]Image, error) {
 	images, err := e.list(ctx)
 	if err != nil {
@@ -45,15 +46,44 @@ func (e *engine) list(ctx context.Context) ([]Image, error) {
 	}
 	// records is already sorted by ref.
 	images := make([]Image, 0, len(records))
+	referenced := make(map[digest.Digest]struct{}, len(records))
 	for _, rec := range records {
 		size, err := bindingSize(e.img, rec)
 		if err != nil {
 			return nil, err
 		}
+		referenced[rec.Identity.Digest] = struct{}{}
 		images = append(images, Image{
 			Ref:    rec.Ref,
 			Digest: rec.Identity.Digest.String(),
 			Size:   size,
+		})
+	}
+
+	// An image no reference names is still present while a hold keeps it —
+	// a runtime that pulled it under WithHold owns it that way — so it is
+	// listed too, by digest alone, after the referenced images. held is
+	// sorted. A held digest with no binding is a loose object or a broken
+	// store, neither an image; gc is where the latter is reported.
+	held, err := e.holds.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, root := range held {
+		if _, ok := referenced[root]; ok {
+			continue
+		}
+		platforms, err := e.img.Platforms(ctx, root)
+		if err != nil {
+			slog.Warn("knarr: skipping held image with unreadable bindings", "digest", root, "err", err)
+			continue
+		}
+		if len(platforms) == 0 {
+			continue
+		}
+		images = append(images, Image{
+			Digest: root.String(),
+			Size:   bindingObjectSize(e.img, root, platforms[0], "held image "+root.String()),
 		})
 	}
 	return images, nil
@@ -69,16 +99,22 @@ func bindingSize(imgStore *imagestore.Store, rec refstore.Record) (int64, error)
 	if len(platforms) == 0 {
 		return 0, fmt.Errorf("ref %s records no platforms", rec.Ref)
 	}
-	b, err := imgStore.Get(rec.Identity.Digest, platforms[0])
+	return bindingObjectSize(imgStore, rec.Identity.Digest, platforms[0], "ref "+rec.Ref), nil
+}
+
+// bindingObjectSize reports the size of the composefs image object the
+// binding for (root, platform) records, or 0 with a warning naming what
+// (a ref or a held image) when the binding is missing or unreadable. The
+// binding is an auxiliary, regenerable index: a bad one must not brick the
+// whole listing (matching refstore.List's treatment of bad records); a
+// re-pull restores it.
+func bindingObjectSize(imgStore *imagestore.Store, root digest.Digest, platform ocispec.Platform, what string) int64 {
+	b, err := imgStore.Get(root, platform)
 	if err != nil {
-		// The binding is an auxiliary, regenerable index: a missing or invalid
-		// one must not brick the whole listing (matching refstore.List's
-		// treatment of bad records), so list the image with a zero size and
-		// warn; a re-pull restores the binding.
-		slog.Warn("knarr: no usable image binding for listed ref", "ref", rec.Ref, "err", err)
-		return 0, nil
+		slog.Warn("knarr: no usable image binding for listed image", "image", what, "err", err)
+		return 0
 	}
-	return b.Descriptor.Size, nil
+	return b.Descriptor.Size
 }
 
 func (e *engine) remove(ctx context.Context, ref string, opts ...RemoveOption) error {

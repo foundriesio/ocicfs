@@ -17,6 +17,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/foundriesio/knarr/internal/devtest"
+	"github.com/foundriesio/knarr/internal/holdstore"
 	"github.com/foundriesio/knarr/internal/imagestore"
 	"github.com/foundriesio/knarr/internal/ocilayout"
 	"github.com/foundriesio/knarr/internal/octest"
@@ -309,5 +310,55 @@ func TestEngineListToleratesMissingBinding(t *testing.T) {
 	}
 	if images[1].Ref != "orphan@"+orphanRoot.String() || images[1].Size != 0 {
 		t.Fatalf("orphan image = %#v, want size 0", images[1])
+	}
+}
+
+// TestEngineListIncludesHeldOnlyImages: an image a hold alone keeps is listed
+// after the referenced images, by digest with no reference; a held image
+// that is also referenced is listed once, and a held digest with no binding
+// is not an image and is not listed.
+func TestEngineListIncludesHeldOnlyImages(t *testing.T) {
+	root := t.TempDir()
+	eng, err := New(Config{Root: root})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	referenced := digest.SHA256.FromString("referenced")
+	heldOnly := digest.SHA256.FromString("held only")
+	unbound := digest.SHA256.FromString("held without a binding")
+	putEngineRef(t, root, "z@"+referenced.String(), referenced, 10, platform)
+	putEngineBinding(t, root, referenced, platform, digest.SHA256.FromString("cfs-referenced"))
+	putEngineBinding(t, root, heldOnly, platform, digest.SHA256.FromString("cfs-held"))
+	holds, err := holdstore.New(root)
+	if err != nil {
+		t.Fatalf("holdstore.New: %v", err)
+	}
+	for _, d := range []digest.Digest{referenced, heldOnly, unbound} {
+		unlock, err := holds.Lock(d)
+		if err != nil {
+			t.Fatalf("Lock: %v", err)
+		}
+		if err := holds.Hold(d, "cfs-build-1"); err != nil {
+			t.Fatalf("Hold: %v", err)
+		}
+		unlock()
+	}
+
+	got, err := eng.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	want := []Image{
+		{Ref: "z@" + referenced.String(), Digest: referenced.String(), Size: 123},
+		{Ref: "", Digest: heldOnly.String(), Size: 123},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("List = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("List[%d] = %#v, want %#v", i, got[i], want[i])
+		}
 	}
 }

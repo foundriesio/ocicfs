@@ -64,6 +64,8 @@ func AddFormatFlag(cmd *cobra.Command, f *Format) {
 
 // ImageOutput is the JSON/text shape for an image in command output. Its JSON
 // field names are a stable contract for callers that parse knarr's output.
+// Ref is empty for an image no reference names — one a hold alone keeps —
+// which the text form renders as "-".
 type ImageOutput struct {
 	Ref    string `json:"ref"`
 	Digest string `json:"digest"`
@@ -95,7 +97,11 @@ func WriteImages(w io.Writer, format Format, imgs []knarr.Image) error {
 		return emitJSON(w, out)
 	}
 	for _, o := range out {
-		if _, err := fmt.Fprintf(w, "%s\t%s\t%d\n", o.Ref, o.Digest, o.Size); err != nil {
+		ref := o.Ref
+		if ref == "" {
+			ref = "-"
+		}
+		if _, err := fmt.Fprintf(w, "%s\t%s\t%d\n", ref, o.Digest, o.Size); err != nil {
 			return err
 		}
 	}

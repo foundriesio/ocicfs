@@ -1,8 +1,9 @@
 # Listing and forgetting local images (`knarr ls`, `knarr remove`)
 
-`knarr ls` lists image references that have been pulled into the local store.
-`knarr remove` forgets one exact reference from the auxiliary indexes. It does
-not delete content objects; object reclamation is handled by `gc`.
+`knarr ls` lists the images in the local store: every pulled reference, then
+every image a hold alone keeps. `knarr remove` forgets one exact reference from
+the auxiliary indexes. It does not delete content objects; object reclamation
+is handled by `gc`.
 
 ## Prerequisites
 
@@ -35,6 +36,20 @@ knarr ls --format json
 ```
 
 An empty store prints no text rows, or `[]` in JSON, and exits successfully.
+
+An image that no reference names but a hold keeps — one an embedder pulled
+with `WithHold`, the way a container runtime keeps the images it lists — is
+listed after the referenced images, with `-` in the reference column (an
+empty `"ref"` in JSON):
+
+```text
+-	sha256:<digest>	481
+```
+
+Such an image is addressed by its digest: `knarr inspect`, `knarr hold`,
+`knarr release` and `knarr mount` all take `sha256:<digest>`. There is no
+reference to `remove`; releasing its last holder makes it collectable, and
+`knarr gc` reclaims it (see [gc.md](gc.md)).
 
 ## 2. Forget one reference
 
