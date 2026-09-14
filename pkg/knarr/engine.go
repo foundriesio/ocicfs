@@ -160,6 +160,10 @@ type PullOptions struct {
 	// reference then carries its digest, and a registry pull resolves a tag
 	// itself.
 	ResolvedRoot digest.Digest
+	// Hold names a holder the pull records on the image's identity digest
+	// instead of a reference record for ref. Empty means the reference is
+	// recorded, as every plain pull does.
+	Hold string
 }
 
 // PullOption opts a Pull into a particular behaviour.
@@ -189,6 +193,18 @@ func WithBlobSource(src BlobSource) PullOption {
 // pulling the index would. It requires WithBlobSource.
 func WithResolvedRoot(root digest.Digest) PullOption {
 	return func(o *PullOptions) { o.ResolvedRoot = root }
+}
+
+// WithHold makes the pull take a hold under holder on the image's identity
+// digest instead of recording a reference for ref; the reference then only
+// names the pull in errors, and the image is kept for exactly as long as the
+// holder stands. The hold is taken once the image is in the store and before
+// the pull releases it to gc, so the image is never collectable in between.
+// A holder name the hold store rejects fails the pull before anything is
+// fetched. Release drops the hold; gc reclaims the image once nothing holds
+// or references it.
+func WithHold(holder string) PullOption {
+	return func(o *PullOptions) { o.Hold = holder }
 }
 
 // MountOptions is the resolved configuration a Mount acts on. Callers do not

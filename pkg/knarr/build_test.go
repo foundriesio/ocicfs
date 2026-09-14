@@ -622,3 +622,104 @@ func (r *closeSignalReader) Close() error {
 	r.src.once.Do(func() { close(r.src.closed) })
 	return r.ReadCloser.Close()
 }
+
+// TestBuildWithHoldHoldsInsteadOfRecordingRef builds an image under WithHold
+// and requires the store to end up with the same objects and bindings a plain
+// pull leaves, no reference record at all, and the named holder on the
+// image's identity — so gc keeps the image on the hold alone.
+func TestBuildWithHoldHoldsInsteadOfRecordingRef(t *testing.T) {
+	pullStore := verityStoreRoot(t)
+	heldStore := verityStoreRoot(t)
+	useRemoteDefaultTransport(t, failTransport{})
+	lay := octest.ThreeLayerImage(t, hostPlatform())
+	ref := "registry.example.com/team/app@" + lay.Root.String()
+	pullInto(t, pullStore, ref, WithBlobSource(layoutBlobs(t, lay.Dir)))
+
+	eng, err := New(Config{Root: heldStore})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	b, err := eng.NewBuild(context.Background(), ref, WithBlobSource(layoutBlobs(t, lay.Dir)), WithHold("cfs-build-1"))
+	if err != nil {
+		t.Fatalf("NewBuild: %v", err)
+	}
+	defer b.Close()
+	img, err := b.Finish(context.Background())
+	if err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if img.Digest != lay.Root.String() {
+		t.Fatalf("image digest = %s, want %s", img.Digest, lay.Root)
+	}
+	assertTreesEqual(t, pullStore, heldStore, "objects")
+	assertTreesEqual(t, pullStore, heldStore, "images")
+	if _, err := os.Stat(heldStore + "/refs"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("held build left a refs tree (stat: %v), want none", err)
+	}
+	assertHolders(t, heldStore, lay.Root, []string{"cfs-build-1"})
+
+	report, err := eng.GC(context.Background())
+	if err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	if report.ObjectsRemoved != 0 || report.BindingsRemoved != 0 {
+		t.Fatalf("GC removed %d objects and %d bindings from a held image", report.ObjectsRemoved, report.BindingsRemoved)
+	}
+	if _, err := eng.Inspect(context.Background(), lay.Root.String()); err != nil {
+		t.Fatalf("Inspect held image after GC: %v", err)
+	}
+}
+
+// TestBuildCachedWithHoldHolds asserts a held build of an image the store
+// already holds takes the hold and records no reference, leaving the
+// reference the earlier pull recorded untouched.
+func TestBuildCachedWithHoldHolds(t *testing.T) {
+	storeRoot := verityStoreRoot(t)
+	useRemoteDefaultTransport(t, failTransport{})
+	lay := octest.ThreeLayerImage(t, hostPlatform())
+	ref := "registry.example.com/team/app@" + lay.Root.String()
+	pullInto(t, storeRoot, ref, WithBlobSource(layoutBlobs(t, lay.Dir)))
+	refsBefore := refContents(t, storeRoot)
+
+	eng, err := New(Config{Root: storeRoot})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	aliasRef := "registry.example.com/team/alias@" + lay.Root.String()
+	b, err := eng.NewBuild(context.Background(), aliasRef, WithBlobSource(layoutBlobs(t, lay.Dir)), WithHold("cfs-build-2"))
+	if err != nil {
+		t.Fatalf("NewBuild: %v", err)
+	}
+	defer b.Close()
+	if _, err := b.Finish(context.Background()); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if !reflect.DeepEqual(refContents(t, storeRoot), refsBefore) {
+		t.Fatal("cached held build changed the reference records")
+	}
+	assertHolders(t, storeRoot, lay.Root, []string{"cfs-build-2"})
+}
+
+// TestBuildWithHoldRejectsBadHolderBeforeLock asserts a holder name the hold
+// store would refuse fails NewBuild up front, before the store is locked or
+// anything fetched: gc runs unhindered right after.
+func TestBuildWithHoldRejectsBadHolderBeforeLock(t *testing.T) {
+	useRemoteDefaultTransport(t, failTransport{})
+	lay := octest.ThreeLayerImage(t, hostPlatform())
+	ref := "registry.example.com/team/app@" + lay.Root.String()
+	eng, err := New(Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	src := &layerOpenLog{src: layoutBlobs(t, lay.Dir), layers: lay.Layers}
+	_, err = eng.NewBuild(context.Background(), ref, WithBlobSource(src), WithHold("Bad/Holder"))
+	if err == nil || !strings.Contains(err.Error(), "invalid holder name") {
+		t.Fatalf("NewBuild with a bad holder = %v, want an invalid holder name error", err)
+	}
+	if len(src.opened) != 0 {
+		t.Fatalf("a refused build opened layers %v", src.opened)
+	}
+	if _, err := eng.GC(context.Background()); err != nil {
+		t.Fatalf("GC after a refused build: %v", err)
+	}
+}

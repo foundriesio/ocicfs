@@ -100,7 +100,7 @@ func (s *Store) Lock(root digest.Digest) (func(), error) {
 // first use. It is idempotent: recording an already-present holder succeeds
 // without change. Call under Lock.
 func (s *Store) Hold(root digest.Digest, holder string) error {
-	if err := validateHolder(holder); err != nil {
+	if err := ValidateHolder(holder); err != nil {
 		return err
 	}
 	dir, err := s.holderDir(root)
@@ -123,7 +123,7 @@ func (s *Store) Hold(root digest.Digest, holder string) error {
 // its last holder is gone. It is idempotent: releasing a holder that is not
 // present succeeds. Call under Lock.
 func (s *Store) Release(root digest.Digest, holder string) error {
-	if err := validateHolder(holder); err != nil {
+	if err := ValidateHolder(holder); err != nil {
 		return err
 	}
 	dir, err := s.holderDir(root)
@@ -279,11 +279,12 @@ func (s *Store) lockPath(root digest.Digest) (string, error) {
 	return filepath.Join(s.root, "holds", ".locks", "sha256", hex[:2], hex[2:]), nil
 }
 
-// validateHolder rejects a holder name that is empty, "." or "..", or carries
+// ValidateHolder rejects a holder name that is empty, "." or "..", or carries
 // any character outside [a-z0-9._-] (which excludes the path separator), so a
 // holder name can only ever name a single file inside a digest's holder
-// directory.
-func validateHolder(holder string) error {
+// directory. Hold and Release validate their holder themselves; a caller that
+// takes a holder name long before it holds can reject a bad one up front.
+func ValidateHolder(holder string) error {
 	if holder == "" {
 		return errors.New("holdstore: empty holder name")
 	}

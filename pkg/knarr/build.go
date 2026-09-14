@@ -13,6 +13,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/foundriesio/knarr/internal/composefs"
+	"github.com/foundriesio/knarr/internal/holdstore"
 	"github.com/foundriesio/knarr/internal/materialize"
 )
 
@@ -36,6 +37,9 @@ type build struct {
 	// the image at NewBuild, mat otherwise.
 	cached *cachedImage
 	mat    *materialize.Build
+	// hold is the holder the finished image is held under in place of a
+	// reference record; empty records the reference.
+	hold string
 
 	unlock     func()
 	unlockOnce sync.Once
@@ -64,9 +68,17 @@ func (e *engine) newBuild(ctx context.Context, ref string, opts ...PullOption) (
 		opt(&cfg)
 	}
 
+	// A holder name the hold store would reject fails here, before any lock
+	// is taken or byte fetched, rather than at the end of the download.
+	if cfg.Hold != "" {
+		if err := holdstore.ValidateHolder(cfg.Hold); err != nil {
+			return nil, err
+		}
+	}
+
 	// The store lock is held shared from here until the build finishes or is
-	// closed: objects are written before the ref record that makes them
-	// wanted, and a concurrent sweep in that window would eat the staged
+	// closed: objects are written before the ref record or hold that makes
+	// them wanted, and a concurrent sweep in that window would eat the staged
 	// image. The wait is not interruptible; the ctx gate right after is the
 	// single pre-mutation cancellation check. A failure before the caller has
 	// a handle to close releases the lock here, since nothing else can.
@@ -96,7 +108,7 @@ func (e *engine) newBuild(ctx context.Context, ref string, opts ...PullOption) (
 	if err != nil {
 		return nil, err
 	}
-	b = &build{e: e, ref: ref, desc: desc, fetched: fetched, platform: platform, unlock: unlock}
+	b = &build{e: e, ref: ref, desc: desc, fetched: fetched, platform: platform, hold: cfg.Hold, unlock: unlock}
 
 	cached, ok, err := verifiedPulledImage(ctx, e.obj, e.img, desc.Identity, platform)
 	if err != nil {
@@ -199,9 +211,9 @@ func (b *build) Close() {
 	b.release()
 }
 
-// finish runs the tail of the pull: the built image's binding and reference,
-// or the reference alone for an image the store already held. The caller
-// holds mu.
+// finish runs the tail of the pull: the built image's binding and reference
+// (or hold), or the reference (or hold) alone for an image the store already
+// held. The caller holds mu.
 func (b *build) finish(ctx context.Context) (*Image, error) {
 	if b.mat == nil {
 		return b.finishCached(ctx)
@@ -210,7 +222,7 @@ func (b *build) finish(ctx context.Context) (*Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := b.e.recordRef(b.ref, built.RootDesc, built.Identity, built.Platform); err != nil {
+	if err := b.want(built.RootDesc, built.Identity, built.Platform); err != nil {
 		return nil, err
 	}
 	return &Image{
@@ -220,7 +232,8 @@ func (b *build) finish(ctx context.Context) (*Image, error) {
 	}, nil
 }
 
-// finishCached records the reference for an image the store already held.
+// finishCached records the reference, or takes the hold, for an image the
+// store already held.
 func (b *build) finishCached(ctx context.Context) (*Image, error) {
 	// Store the root the descent had to fetch: the identity is already local
 	// on this path, but the document the reference resolved to is not, and
@@ -234,7 +247,7 @@ func (b *build) finishCached(ctx context.Context) (*Image, error) {
 			return nil, err
 		}
 	}
-	if err := b.e.recordRef(b.ref, b.desc.Root, b.desc.Identity, b.cached.platform); err != nil {
+	if err := b.want(b.desc.Root, b.desc.Identity, b.cached.platform); err != nil {
 		return nil, err
 	}
 	return &Image{
@@ -242,6 +255,25 @@ func (b *build) finishCached(ctx context.Context) (*Image, error) {
 		Digest: b.desc.Identity.Digest.String(),
 		Size:   b.cached.descriptor.Size,
 	}, nil
+}
+
+// want makes the finished image wanted: a reference record by default, or
+// a hold on its identity when the build was opened with one. Either way it
+// runs after the binding is written and while the store lock is still held,
+// so the image is never in the store without something that keeps gc off
+// it. The hold nests the per-digest hold lock inside the store lock, the
+// order every hold takes; a hold needs no presence check here, since the
+// binding this build just wrote is what a hold protects.
+func (b *build) want(root, identity ocispec.Descriptor, platform ocispec.Platform) error {
+	if b.hold == "" {
+		return b.e.recordRef(b.ref, root, identity, platform)
+	}
+	unlock, err := b.e.holds.Lock(identity.Digest)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return b.e.holds.Hold(identity.Digest, b.hold)
 }
 
 // fail records err, wrapped with the pull's reference, as the build's sticky
