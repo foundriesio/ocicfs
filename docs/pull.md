@@ -229,6 +229,8 @@ Rules the build enforces:
   only — a tag cannot be resolved without a registry — and also accepts a bare
   `sha256:<hex>` because the OCI layout directory supplies the source.
 - **Idempotent.** Objects are content-addressed and committed without replacement,
-  so re-pulling the same image reuses existing content.
+  so re-pulling the same image reuses existing content. Content the store already
+  holds is recognized before fs-verity is enabled on it, so an update pays the
+  sealing cost only for files that are new.
 - **Mount is separate.** Pull only materializes content into the store; mounting
   it is a distinct step with `knarr mount`.
