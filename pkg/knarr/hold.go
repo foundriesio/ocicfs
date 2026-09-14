@@ -30,6 +30,27 @@ func (e *engine) Release(ctx context.Context, ref, holder string) error {
 	return nil
 }
 
+// Holds reports every held identity digest and the holders standing on it.
+func (e *engine) Holds(ctx context.Context) (map[digest.Digest][]string, error) {
+	held, err := e.holds.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list holds: %w", err)
+	}
+	out := make(map[digest.Digest][]string, len(held))
+	for _, root := range held {
+		holders, err := e.holds.Holders(root)
+		if err != nil {
+			return nil, fmt.Errorf("list holds: %w", err)
+		}
+		// A last release racing the census empties the digest between the
+		// two reads; it is then not held.
+		if len(holders) > 0 {
+			out[root] = holders
+		}
+	}
+	return out, nil
+}
+
 func (e *engine) hold(ctx context.Context, ref, holder string) error {
 	// The store lock is held shared across the whole hold: presence is checked
 	// before the marker is written, and a concurrent sweep between the two

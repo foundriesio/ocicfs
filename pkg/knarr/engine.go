@@ -406,6 +406,10 @@ type Engine interface {
 	// so a hold can always be dropped. Releasing a holder that is not present
 	// succeeds.
 	Release(ctx context.Context, ref, holder string) error
+	// Holds reports every identity digest at least one holder pins, with the
+	// sorted holder names standing on it. It reads only local state and takes
+	// no lock, so a hold or release racing it may or may not be reflected.
+	Holds(ctx context.Context) (map[digest.Digest][]string, error)
 	// Remove forgets a local image: its reference record, and the image
 	// binding for its identity digest that no other reference still resolves
 	// to. It declines while a hold pins that identity unless WithForce is set,

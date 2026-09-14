@@ -208,7 +208,9 @@ func (s *Store) Clear(root digest.Digest) error {
 // silently unprotect whatever its holders pinned. An empty holder directory
 // (a crash between a last release's unlink and its rmdir) has no holders and
 // is not listed. No per-digest locks are taken: gc reads the census under the
-// store's exclusive lock, which excludes every mutating verb.
+// store's exclusive lock, which excludes every mutating verb; a lock-free
+// reader racing a last release may find a holder directory gone between the
+// walk and the read, which is a digest with no holders, not an error.
 func (s *Store) List(ctx context.Context) ([]digest.Digest, error) {
 	base := filepath.Join(s.root, "holds", "sha256")
 	shards, err := os.ReadDir(base)
@@ -227,6 +229,9 @@ func (s *Store) List(ctx context.Context) ([]digest.Digest, error) {
 			return nil, fmt.Errorf("holdstore: foreign entry %q under holds", shard.Name())
 		}
 		rests, err := os.ReadDir(filepath.Join(base, shard.Name()))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
 		if err != nil {
 			return nil, fmt.Errorf("holdstore: read holds shard %s: %w", shard.Name(), err)
 		}
@@ -239,6 +244,9 @@ func (s *Store) List(ctx context.Context) ([]digest.Digest, error) {
 				return nil, fmt.Errorf("holdstore: foreign entry %q under holds shard %s", rest.Name(), shard.Name())
 			}
 			holders, err := os.ReadDir(filepath.Join(base, shard.Name(), rest.Name()))
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
 			if err != nil {
 				return nil, fmt.Errorf("holdstore: read holders of %s: %w", d, err)
 			}

@@ -399,3 +399,42 @@ func TestEngineHoldOverCapObject(t *testing.T) {
 	}
 	assertHolders(t, root, object, nil)
 }
+
+// TestEngineHoldsReportsHolders: Holds lists every held identity with its
+// sorted holders, and drops an identity once its last holder is released.
+func TestEngineHoldsReportsHolders(t *testing.T) {
+	root := t.TempDir()
+	eng, imageRoot, ref := seedHeldImage(t, root)
+
+	holds, err := eng.Holds(context.Background())
+	if err != nil {
+		t.Fatalf("Holds on an unheld store: %v", err)
+	}
+	if len(holds) != 0 {
+		t.Fatalf("Holds = %v, want none", holds)
+	}
+	for _, holder := range []string{"cli", "agent"} {
+		if err := eng.Hold(context.Background(), ref, holder); err != nil {
+			t.Fatalf("Hold %s: %v", holder, err)
+		}
+	}
+	holds, err = eng.Holds(context.Background())
+	if err != nil {
+		t.Fatalf("Holds: %v", err)
+	}
+	if len(holds) != 1 || strings.Join(holds[imageRoot], ",") != "agent,cli" {
+		t.Fatalf("Holds = %v, want %s held by agent,cli", holds, imageRoot)
+	}
+	for _, holder := range []string{"cli", "agent"} {
+		if err := eng.Release(context.Background(), ref, holder); err != nil {
+			t.Fatalf("Release %s: %v", holder, err)
+		}
+	}
+	holds, err = eng.Holds(context.Background())
+	if err != nil {
+		t.Fatalf("Holds after release: %v", err)
+	}
+	if len(holds) != 0 {
+		t.Fatalf("Holds after release = %v, want none", holds)
+	}
+}
