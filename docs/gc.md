@@ -17,7 +17,10 @@ half of the two-layer protection model:
   falls on the first gc after its unmount.
 
 gc deletes only what is neither. Everything it deletes is re-fetchable with
-`knarr pull`; ref records and holds are never touched.
+`knarr pull`; holds are never touched, nor are the reference records an
+agent's pulls wrote. A runtime reference — one a pull under `WithHold`
+recorded, naming the image for a holder — is dropped once that holder no
+longer stands on the image, since the name lived on the hold's behalf.
 
 Some garbage is expected immediately after a pull: the pull streams each
 layer and materializes every file it carries, so a file a later layer
@@ -48,8 +51,10 @@ With `--human` the size reads `33.0 MiB`; with `--list-removed` the removed
 digests precede it, one per line.
 
 JSON output carries the same counts (`objectsRemoved`, `bytesFreed`,
-`bindingsRemoved`, `inUseSkipped`, `dryRun`), always in exact bytes, plus a
-`removedObjects` array under `--list-removed`. The listing names deleted
+`bindingsRemoved`, `refsRemoved`, `inUseSkipped`, `dryRun`), always in exact
+bytes, plus a `removedObjects` array under `--list-removed`. `refsRemoved`
+counts runtime references dropped because their holder no longer stood; the
+text form mentions them only when there were any. The listing names deleted
 store objects; orphan fs-verity view entries (possible only after external
 store damage) are counted but not listed.
 

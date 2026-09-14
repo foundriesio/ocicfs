@@ -65,15 +65,17 @@ func AddFormatFlag(cmd *cobra.Command, f *Format) {
 // ImageOutput is the JSON/text shape for an image in command output. Its JSON
 // field names are a stable contract for callers that parse knarr's output.
 // Ref is empty for an image no reference names — one a hold alone keeps —
-// which the text form renders as "-".
+// which the text form renders as "-". Holder, JSON only, is set for a
+// runtime reference: one a holder named the image under, which pins nothing.
 type ImageOutput struct {
 	Ref    string `json:"ref"`
 	Digest string `json:"digest"`
 	Size   int64  `json:"size"`
+	Holder string `json:"holder,omitempty"`
 }
 
 func newImageOutput(img knarr.Image) ImageOutput {
-	return ImageOutput{Ref: img.Ref, Digest: img.Digest, Size: img.Size}
+	return ImageOutput{Ref: img.Ref, Digest: img.Digest, Size: img.Size, Holder: img.Holder}
 }
 
 // WriteImage renders a single image to w in the requested format.
@@ -448,6 +450,7 @@ type GCOutput struct {
 	ObjectsRemoved  int      `json:"objectsRemoved"`
 	BytesFreed      int64    `json:"bytesFreed"`
 	BindingsRemoved int      `json:"bindingsRemoved"`
+	RefsRemoved     int      `json:"refsRemoved"`
 	InUseSkipped    int      `json:"inUseSkipped"`
 	DryRun          bool     `json:"dryRun"`
 	RemovedObjects  []string `json:"removedObjects,omitempty"`
@@ -471,6 +474,7 @@ func WriteGCReport(w io.Writer, format Format, r *knarr.GCReport, opts GCOutputO
 		ObjectsRemoved:  r.ObjectsRemoved,
 		BytesFreed:      r.BytesFreed,
 		BindingsRemoved: r.BindingsRemoved,
+		RefsRemoved:     r.RefsRemoved,
 		InUseSkipped:    r.InUseSkipped,
 		DryRun:          opts.DryRun,
 	}
@@ -493,9 +497,13 @@ func WriteGCReport(w io.Writer, format Format, r *knarr.GCReport, opts GCOutputO
 	if opts.Human {
 		size = humanBytes(out.BytesFreed)
 	}
-	_, err := fmt.Fprintf(w, "%s %d %s (%s) and %d %s; %d in use kept\n",
+	refs := ""
+	if out.RefsRemoved > 0 {
+		refs = fmt.Sprintf(" and %d runtime %s", out.RefsRemoved, plural(out.RefsRemoved, "reference"))
+	}
+	_, err := fmt.Fprintf(w, "%s %d %s (%s) and %d %s%s; %d in use kept\n",
 		verb, out.ObjectsRemoved, plural(out.ObjectsRemoved, "object"), size,
-		out.BindingsRemoved, plural(out.BindingsRemoved, "binding"), out.InUseSkipped)
+		out.BindingsRemoved, plural(out.BindingsRemoved, "binding"), refs, out.InUseSkipped)
 	return err
 }
 

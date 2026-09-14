@@ -220,15 +220,20 @@ Rules the build enforces:
   rather than for the conversion alone. Always `Close` a build that will not
   `Finish`; objects it already sealed stay as unreferenced content for `gc`
   to reclaim.
-- **`WithHold` keeps the image by a hold instead of a reference.** An
-  embedder that owns an image's lifetime itself — a runtime that drops the
+- **`WithHold` keeps the image by a hold, and names it without pinning it.**
+  An embedder that owns an image's lifetime itself — a runtime that drops the
   image when its own records go — passes `knarr.WithHold(holder)`: `Finish`
-  then records no reference for `ref` and instead takes a hold under
-  `holder` on the image's identity digest, after the binding is written and
-  before the store is released to `gc`. The image shows in `knarr ls` with no
-  reference, is addressed by digest, and is collected by `gc` once the holder
-  is released (`Release`) and nothing else wants it. A holder name the hold
-  store rejects fails `NewBuild` before anything is fetched.
+  takes a hold under `holder` on the image's identity digest, after the
+  binding is written and before the store is released to `gc`, and records
+  `ref` as a *runtime reference*: a name that resolves like any other for
+  `inspect`, `mount`, `hold` and `release`, but keeps nothing alive — `gc`
+  drops it once `holder` is released, along with the image if nothing else
+  wants it. `knarr ls --format json` shows such a row with its `holder`. A
+  runtime reference never displaces a reference a plain pull recorded for
+  the same name (the image is then held but not named), while a plain pull
+  of the name replaces the runtime reference and keeps the image on its
+  own. A holder name the hold store rejects fails `NewBuild` before anything
+  is fetched.
 
 ## Notes
 

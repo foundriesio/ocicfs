@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/opencontainers/go-digest"
@@ -53,6 +54,9 @@ func (e *engine) gc(ctx context.Context, opts ...GCOption) (*GCReport, error) {
 	}
 
 	report := &GCReport{}
+	if err := e.sweepRuntimeRefs(ctx, cfg.DryRun, report); err != nil {
+		return nil, err
+	}
 	if err := e.sweepBindings(ctx, marks, cfg.DryRun, report); err != nil {
 		return nil, err
 	}
@@ -180,6 +184,12 @@ func (e *engine) markWanted(ctx context.Context) (*gcMarks, error) {
 	for _, rec := range records {
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		// A runtime reference names an image on a holder's behalf and pins
+		// nothing: the hold marks the image, and the sweep drops the name
+		// once the holder is gone.
+		if rec.Holder != "" {
+			continue
 		}
 		m.sha[rec.Resolved.Digest] = struct{}{}
 		m.sha[rec.Identity.Digest] = struct{}{}
@@ -381,6 +391,39 @@ func (e *engine) heldRootKind(root digest.Digest) (heldKind, error) {
 		return heldManifest, nil
 	}
 	return heldLoose, nil
+}
+
+// sweepRuntimeRefs deletes every runtime reference whose holder no longer
+// stands on the identity it names: the name lived on the hold's behalf, and
+// the image it named is unwanted, or wanted by someone else, from here on.
+func (e *engine) sweepRuntimeRefs(ctx context.Context, dryRun bool, report *GCReport) error {
+	records, err := e.refs.ListStrict(ctx)
+	if err != nil {
+		return err
+	}
+	for _, rec := range records {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if rec.Holder == "" {
+			continue
+		}
+		holders, err := e.holds.Holders(rec.Identity.Digest)
+		if err != nil {
+			return err
+		}
+		if slices.Contains(holders, rec.Holder) {
+			continue
+		}
+		if !dryRun {
+			if err := e.refs.Delete(rec.Ref); err != nil {
+				return err
+			}
+		}
+		report.RefsRemoved++
+		slog.Debug("knarr: gc removed runtime reference", "ref", rec.Ref, "holder", rec.Holder, "dryRun", dryRun)
+	}
+	return nil
 }
 
 // sweepBindings deletes bindings whose identity no reference record and no

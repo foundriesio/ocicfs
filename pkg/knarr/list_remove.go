@@ -57,6 +57,7 @@ func (e *engine) list(ctx context.Context) ([]Image, error) {
 			Ref:    rec.Ref,
 			Digest: rec.Identity.Digest.String(),
 			Size:   size,
+			Holder: rec.Holder,
 		})
 	}
 

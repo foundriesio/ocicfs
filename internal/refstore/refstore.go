@@ -20,14 +20,22 @@
 //	<root>/refs/sha256/<refkey-xx>/<refkey-rest>.json
 //
 // The record holds the exact ref, its refKey, two descriptors, the pull time,
-// and the platforms pulled. The file is written atomically and durably.
+// the platforms pulled and, for a runtime reference, the holder it names the
+// image for. The file is written atomically and durably.
 //
 //	{ "schema": "application/vnd.knarr.ref.v2+json",
 //	  "ref": "registry.example.com/team/app@sha256:...",
 //	  "refKey":   {"algorithm":"sha256","digest":"sha256:..."},
 //	  "resolved": {"mediaType":"...","digest":"sha256:...","size":N},
 //	  "identity": {"mediaType":"...","digest":"sha256:...","size":N},
-//	  "pulledAt": "<RFC3339>", "platforms": ["linux/arm64"] }
+//	  "pulledAt": "<RFC3339>", "platforms": ["linux/arm64"],
+//	  "holder": "cfs-build-..." }
+//
+// A record without a holder is an agent's: gc keeps the image it names. A
+// record with one is a runtime reference, written by a pull that holds the
+// image instead of naming it durably: it names the image on the holder's
+// behalf and pins nothing, and gc deletes it once that holder no longer
+// stands on the identity.
 //
 // The two descriptors say different things. "resolved" is provenance: the
 // document the reference itself landed on, an image index for a tag or an
@@ -52,6 +60,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"syscall"
 	"time"
 
 	"github.com/opencontainers/go-digest"
@@ -59,6 +68,7 @@ import (
 
 	"github.com/foundriesio/knarr/internal/digestutil"
 	"github.com/foundriesio/knarr/internal/durable"
+	"github.com/foundriesio/knarr/internal/holdstore"
 )
 
 // Store writes reference provenance under the knarr store root.
@@ -75,6 +85,9 @@ type Record struct {
 	Identity  ocispec.Descriptor
 	PulledAt  time.Time
 	Platforms []string
+	// Holder names the hold a runtime reference names the image for; empty
+	// for an agent's reference, which keeps the image on its own.
+	Holder string
 }
 
 // ErrNotFound reports that no reference record exists for an exact ref string.
@@ -91,8 +104,74 @@ func New(root string) (*Store, error) {
 // Put writes refs/sha256/<refkey-xx>/<refkey-rest>.json atomically. resolved is
 // the descriptor the reference landed on and identity the platform image
 // manifest it names; the two are the same descriptor when the reference already
-// names a manifest.
+// names a manifest. An agent's record: it replaces whatever record the
+// reference had, a runtime reference included.
 func (s *Store) Put(ref string, resolved, identity ocispec.Descriptor, pulledAt time.Time, platforms []string) error {
+	unlock, err := s.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return s.put(ref, resolved, identity, pulledAt, platforms, "")
+}
+
+// PutHeld writes the record of a runtime reference: Put, with holder as the
+// hold the record names the image for. It never replaces an agent's record —
+// a reference the agent named keeps naming what the agent pulled, and the
+// runtime's image stays held but unnamed — and reports whether it installed
+// the record. The holder must be a name the hold store accepts. The check
+// and the write are one step under the store's write lock, so an agent's
+// record landing meanwhile is never overwritten.
+func (s *Store) PutHeld(ref string, resolved, identity ocispec.Descriptor, pulledAt time.Time, platforms []string, holder string) (bool, error) {
+	if err := holdstore.ValidateHolder(holder); err != nil {
+		return false, err
+	}
+	unlock, err := s.lock()
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	if existing, err := s.Get(ref); err == nil && existing.Holder == "" {
+		return false, nil
+	}
+	if err := s.put(ref, resolved, identity, pulledAt, platforms, holder); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// lock takes the store's write lock — one flock on refs/.lock, created on
+// demand and never removed — and returns its release. Record writes are
+// serialized by it so a runtime reference's check-then-write cannot
+// interleave with an agent's write of the same reference; reads take no
+// lock, a record being an atomically renamed file. The wait is not
+// interruptible; writes are short.
+func (s *Store) lock() (func(), error) {
+	path := filepath.Join(s.root, "refs", ".lock")
+	if err := durable.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("refstore: create refs dir: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600) // #nosec G304 -- store-owned lock path
+	if err != nil {
+		return nil, fmt.Errorf("refstore: open lock: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil { // #nosec G115 -- a file descriptor always fits in int
+		if cerr := f.Close(); cerr != nil {
+			slog.Warn("refstore: failed to close lock file", "path", path, "err", cerr)
+		}
+		return nil, fmt.Errorf("refstore: lock: %w", err)
+	}
+	return func() {
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil { // #nosec G115 -- a file descriptor always fits in int
+			slog.Warn("refstore: failed to unlock", "path", path, "err", err)
+		}
+		if err := f.Close(); err != nil {
+			slog.Warn("refstore: failed to close lock file", "path", path, "err", err)
+		}
+	}, nil
+}
+
+func (s *Store) put(ref string, resolved, identity ocispec.Descriptor, pulledAt time.Time, platforms []string, holder string) error {
 	path, refKey := s.refPath(ref)
 	doc := refDoc{
 		Schema: refSchema,
@@ -105,6 +184,7 @@ func (s *Store) Put(ref string, resolved, identity ocispec.Descriptor, pulledAt 
 		Identity:  descriptorDoc{MediaType: identity.MediaType, Digest: identity.Digest, Size: identity.Size},
 		PulledAt:  pulledAt.Format(time.RFC3339),
 		Platforms: platforms,
+		Holder:    holder,
 	}
 	data, err := json.Marshal(doc)
 	if err != nil {
@@ -224,6 +304,7 @@ type (
 		Identity  descriptorDoc `json:"identity"`
 		PulledAt  string        `json:"pulledAt"`
 		Platforms []string      `json:"platforms"`
+		Holder    string        `json:"holder,omitempty"`
 	}
 
 	refKeyDoc struct {
@@ -305,6 +386,11 @@ func validateRecord(doc refDoc, wantRef string) (Record, error) {
 			return Record{}, errors.New("empty platform")
 		}
 	}
+	if doc.Holder != "" {
+		if err := holdstore.ValidateHolder(doc.Holder); err != nil {
+			return Record{}, fmt.Errorf("holder: %w", err)
+		}
+	}
 	return Record{
 		Ref: doc.Ref,
 		Resolved: ocispec.Descriptor{
@@ -319,6 +405,7 @@ func validateRecord(doc refDoc, wantRef string) (Record, error) {
 		},
 		PulledAt:  pulledAt,
 		Platforms: append([]string(nil), doc.Platforms...),
+		Holder:    doc.Holder,
 	}, nil
 }
 

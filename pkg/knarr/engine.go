@@ -38,6 +38,11 @@ type Image struct {
 	// Size is the size of the image's composefs image object, in bytes; file
 	// content shared in the object store is not counted.
 	Size int64
+	// Holder is the hold a runtime reference names the image for: the
+	// reference then pins nothing, and goes when that holder is released.
+	// Empty for an agent's reference, which keeps the image on its own, and
+	// for an image a hold alone keeps under no reference.
+	Holder string
 }
 
 // ImageInfo is the identity of a locally stored image: its OCI coordinates and
@@ -195,14 +200,17 @@ func WithResolvedRoot(root digest.Digest) PullOption {
 	return func(o *PullOptions) { o.ResolvedRoot = root }
 }
 
-// WithHold makes the pull take a hold under holder on the image's identity
-// digest instead of recording a reference for ref; the reference then only
-// names the pull in errors, and the image is kept for exactly as long as the
-// holder stands. The hold is taken once the image is in the store and before
-// the pull releases it to gc, so the image is never collectable in between.
-// A holder name the hold store rejects fails the pull before anything is
-// fetched. Release drops the hold; gc reclaims the image once nothing holds
-// or references it.
+// WithHold makes the pull keep the image by a hold under holder on its
+// identity digest, taken once the image is in the store and before the pull
+// releases it to gc, so the image is never collectable in between; ref is
+// then recorded as a runtime reference, a name that pins nothing and that gc
+// drops once the holder is released. The image is kept for exactly as long
+// as the holder stands. A runtime reference never displaces a reference an
+// agent's plain pull recorded for the same name — the image is then held but
+// not named — while a plain pull of the name replaces a runtime reference and
+// keeps the image on its own. A holder name the hold store rejects fails the
+// pull before anything is fetched. Release drops the hold; gc reclaims the
+// image once nothing holds or names it.
 func WithHold(holder string) PullOption {
 	return func(o *PullOptions) { o.Hold = holder }
 }
@@ -300,6 +308,9 @@ func WithDryRun() GCOption {
 
 // GCReport summarizes one garbage collection.
 type GCReport struct {
+	// RefsRemoved counts runtime references deleted because the holder they
+	// named an image for no longer stands on it.
+	RefsRemoved int
 	// ObjectsRemoved counts store objects deleted, orphan view entries
 	// included.
 	ObjectsRemoved int
@@ -415,10 +426,12 @@ type Engine interface {
 	// to. It declines while a hold pins that identity unless WithForce is set,
 	// which clears the holds first.
 	Remove(ctx context.Context, ref string, opts ...RemoveOption) error
-	// GC deletes every store object that is neither wanted — reachable from a
-	// reference record or a hold — nor in use by a mounter, along with orphan
-	// bindings, orphan fs-verity view entries, staging leftovers, and the
-	// empty shard directories earlier deletions left behind. It
+	// GC deletes every store object that is neither wanted — reachable from
+	// an agent's reference record or a hold; a runtime reference pins nothing
+	// — nor in use by a mounter, along with orphan bindings, runtime
+	// references whose holder no longer stands, orphan fs-verity view
+	// entries, staging leftovers, and the empty shard directories earlier
+	// deletions left behind. It
 	// holds the store lock exclusively and fails fast with an error matching
 	// ErrStoreBusy while a pull, hold, or mount is in progress; retry. A
 	// wanted image it cannot fully enumerate aborts the collection with

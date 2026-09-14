@@ -684,6 +684,8 @@ func assertRefsEqual(t *testing.T, wantRoot, gotRoot string) {
 func refContents(t *testing.T, root string) map[string][]byte {
 	t.Helper()
 	out := treeContents(t, filepath.Join(root, "refs"))
+	// The store's write lock lives beside the records and is not one.
+	delete(out, ".lock")
 	for path, data := range out {
 		var rec map[string]any
 		if err := json.Unmarshal(data, &rec); err != nil {
@@ -948,6 +950,7 @@ type (
 		Identity  pullRefDescDoc `json:"identity"`
 		PulledAt  string         `json:"pulledAt"`
 		Platforms []string       `json:"platforms"`
+		Holder    string         `json:"holder"`
 	}
 
 	pullRefDescDoc struct {

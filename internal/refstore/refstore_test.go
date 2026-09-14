@@ -466,3 +466,79 @@ func TestListStrictErrorsOnMalformedRecord(t *testing.T) {
 		t.Fatalf("ListStrict = %v, want the invalid-record error", err)
 	}
 }
+
+// TestPutHeldRoundTrip: a runtime reference records its holder and reads back
+// with it; a plain Put records none.
+func TestPutHeldRoundTrip(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	desc := ocispec.Descriptor{MediaType: ocispec.MediaTypeImageManifest, Digest: digest.SHA256.FromString("manifest"), Size: 1}
+	pulledAt := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	if named, err := s.PutHeld("app:v1", desc, desc, pulledAt, []string{"linux/amd64"}, "cfs-build-1"); err != nil || !named {
+		t.Fatalf("PutHeld = %v, %v; want the record installed", named, err)
+	}
+	if err := s.Put("app:v2", desc, desc, pulledAt, []string{"linux/amd64"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	held, err := s.Get("app:v1")
+	if err != nil {
+		t.Fatalf("Get held: %v", err)
+	}
+	if held.Holder != "cfs-build-1" {
+		t.Fatalf("held record holder = %q, want cfs-build-1", held.Holder)
+	}
+	plain, err := s.Get("app:v2")
+	if err != nil {
+		t.Fatalf("Get plain: %v", err)
+	}
+	if plain.Holder != "" {
+		t.Fatalf("plain record holder = %q, want none", plain.Holder)
+	}
+	if _, err := s.PutHeld("app:v3", desc, desc, pulledAt, []string{"linux/amd64"}, "Bad/Holder"); err == nil {
+		t.Fatal("PutHeld accepted a holder name the hold store rejects")
+	}
+}
+
+// TestPutHeldNeverReplacesAgentRecord: a runtime reference is not installed
+// over an agent's record of the same reference, which stays as it was; it
+// does replace an earlier runtime reference, and an agent's Put replaces it.
+func TestPutHeldNeverReplacesAgentRecord(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	agent := ocispec.Descriptor{MediaType: ocispec.MediaTypeImageManifest, Digest: digest.SHA256.FromString("agent"), Size: 1}
+	runtime := ocispec.Descriptor{MediaType: ocispec.MediaTypeImageManifest, Digest: digest.SHA256.FromString("runtime"), Size: 2}
+	pulledAt := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	if err := s.Put("app:v1", agent, agent, pulledAt, []string{"linux/amd64"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if named, err := s.PutHeld("app:v1", runtime, runtime, pulledAt, []string{"linux/amd64"}, "cfs-build-1"); err != nil || named {
+		t.Fatalf("PutHeld over an agent's record = %v, %v; want not installed", named, err)
+	}
+	got, err := s.Get("app:v1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Holder != "" || got.Identity.Digest != agent.Digest {
+		t.Fatalf("record after a refused PutHeld = %#v, want the agent's untouched", got)
+	}
+
+	if named, err := s.PutHeld("app:v2", runtime, runtime, pulledAt, []string{"linux/amd64"}, "cfs-build-1"); err != nil || !named {
+		t.Fatalf("PutHeld of a new name = %v, %v; want installed", named, err)
+	}
+	if named, err := s.PutHeld("app:v2", agent, agent, pulledAt, []string{"linux/amd64"}, "cfs-build-2"); err != nil || !named {
+		t.Fatalf("PutHeld over a runtime record = %v, %v; want installed", named, err)
+	}
+	if got, err := s.Get("app:v2"); err != nil || got.Holder != "cfs-build-2" {
+		t.Fatalf("record after a second PutHeld = %#v, %v; want the later runtime reference", got, err)
+	}
+	if err := s.Put("app:v2", agent, agent, pulledAt, []string{"linux/amd64"}); err != nil {
+		t.Fatalf("Put over a runtime record: %v", err)
+	}
+	if got, err := s.Get("app:v2"); err != nil || got.Holder != "" {
+		t.Fatalf("record after the agent's Put = %#v, %v; want the agent's", got, err)
+	}
+}

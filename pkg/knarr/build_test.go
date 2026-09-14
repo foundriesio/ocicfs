@@ -20,6 +20,7 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"github.com/foundriesio/knarr/internal/holdstore"
 	"github.com/foundriesio/knarr/internal/octest"
 )
 
@@ -625,8 +626,9 @@ func (r *closeSignalReader) Close() error {
 
 // TestBuildWithHoldHoldsInsteadOfRecordingRef builds an image under WithHold
 // and requires the store to end up with the same objects and bindings a plain
-// pull leaves, no reference record at all, and the named holder on the
-// image's identity — so gc keeps the image on the hold alone.
+// pull leaves, the named holder on the image's identity, and a runtime
+// reference naming the image for that holder — so gc keeps the image on the
+// hold alone, and drops the name and the image once the hold is released.
 func TestBuildWithHoldHoldsInsteadOfRecordingRef(t *testing.T) {
 	pullStore := verityStoreRoot(t)
 	heldStore := verityStoreRoot(t)
@@ -648,13 +650,13 @@ func TestBuildWithHoldHoldsInsteadOfRecordingRef(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
-	if img.Digest != lay.Root.String() {
-		t.Fatalf("image digest = %s, want %s", img.Digest, lay.Root)
+	if img.Digest != lay.Root.String() || img.Holder != "cfs-build-1" {
+		t.Fatalf("image = %#v, want digest %s named for cfs-build-1", img, lay.Root)
 	}
 	assertTreesEqual(t, pullStore, heldStore, "objects")
 	assertTreesEqual(t, pullStore, heldStore, "images")
-	if _, err := os.Stat(heldStore + "/refs"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("held build left a refs tree (stat: %v), want none", err)
+	if record := readPullRef(t, heldStore, ref); record.Holder != "cfs-build-1" || record.Identity.Digest != lay.Root {
+		t.Fatalf("ref record = %#v, want a runtime reference for cfs-build-1 naming %s", record, lay.Root)
 	}
 	assertHolders(t, heldStore, lay.Root, []string{"cfs-build-1"})
 
@@ -662,24 +664,94 @@ func TestBuildWithHoldHoldsInsteadOfRecordingRef(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GC: %v", err)
 	}
-	if report.ObjectsRemoved != 0 || report.BindingsRemoved != 0 {
-		t.Fatalf("GC removed %d objects and %d bindings from a held image", report.ObjectsRemoved, report.BindingsRemoved)
+	if report.ObjectsRemoved != 0 || report.BindingsRemoved != 0 || report.RefsRemoved != 0 {
+		t.Fatalf("GC removed %d objects, %d bindings and %d refs from a held image", report.ObjectsRemoved, report.BindingsRemoved, report.RefsRemoved)
 	}
-	if _, err := eng.Inspect(context.Background(), lay.Root.String()); err != nil {
-		t.Fatalf("Inspect held image after GC: %v", err)
+	if _, err := eng.Inspect(context.Background(), ref); err != nil {
+		t.Fatalf("Inspect held image by its runtime reference: %v", err)
+	}
+
+	// The name lives on the hold's behalf: releasing the holder makes the
+	// image, and its name, collectable.
+	if err := eng.Release(context.Background(), img.Digest, "cfs-build-1"); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	report, err = eng.GC(context.Background())
+	if err != nil {
+		t.Fatalf("GC after release: %v", err)
+	}
+	if report.RefsRemoved != 1 || report.BindingsRemoved != 1 || report.ObjectsRemoved == 0 {
+		t.Fatalf("GC after release = %+v, want the runtime reference, the binding and the objects gone", report)
+	}
+	if _, err := os.Stat(octest.RefPath(heldStore, ref)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("runtime reference survived the collection (stat: %v)", err)
+	}
+}
+
+// TestBuildWithHoldKeepsAgentRef asserts a runtime reference never displaces
+// an agent's: a held pull of a name a plain pull recorded leaves that record
+// as it is, and the image held but unnamed by the runtime.
+func TestBuildWithHoldKeepsAgentRef(t *testing.T) {
+	storeRoot := verityStoreRoot(t)
+	useRemoteDefaultTransport(t, failTransport{})
+	lay := octest.ThreeLayerImage(t, hostPlatform())
+	ref := "registry.example.com/team/app@" + lay.Root.String()
+	pullInto(t, storeRoot, ref, WithBlobSource(layoutBlobs(t, lay.Dir)))
+	before := readPullRef(t, storeRoot, ref)
+
+	if img := pullInto(t, storeRoot, ref, WithBlobSource(layoutBlobs(t, lay.Dir)), WithHold("cfs-build-3")); img.Holder != "" {
+		t.Fatalf("held pull over an agent's reference reported holder %q, want the image unnamed", img.Holder)
+	}
+	after := readPullRef(t, storeRoot, ref)
+	if after.Holder != "" || after.PulledAt != before.PulledAt {
+		t.Fatalf("ref record after a held pull = %#v, want the agent's record %#v untouched", after, before)
+	}
+	assertHolders(t, storeRoot, lay.Root, []string{"cfs-build-3"})
+}
+
+// TestBuildPlainPullAdoptsRuntimeRef asserts a plain pull of a name a runtime
+// reference holds replaces that reference with the agent's own: the image is
+// then kept by the reference, whatever becomes of the hold.
+func TestBuildPlainPullAdoptsRuntimeRef(t *testing.T) {
+	storeRoot := verityStoreRoot(t)
+	useRemoteDefaultTransport(t, failTransport{})
+	lay := octest.ThreeLayerImage(t, hostPlatform())
+	ref := "registry.example.com/team/app@" + lay.Root.String()
+	pullInto(t, storeRoot, ref, WithBlobSource(layoutBlobs(t, lay.Dir)), WithHold("cfs-build-4"))
+	if record := readPullRef(t, storeRoot, ref); record.Holder != "cfs-build-4" {
+		t.Fatalf("ref record = %#v, want a runtime reference", record)
+	}
+
+	pullInto(t, storeRoot, ref, WithBlobSource(layoutBlobs(t, lay.Dir)))
+	if record := readPullRef(t, storeRoot, ref); record.Holder != "" {
+		t.Fatalf("ref record after the agent's pull = %#v, want an agent's reference", record)
+	}
+	eng, err := New(Config{Root: storeRoot})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := eng.Release(context.Background(), lay.Root.String(), "cfs-build-4"); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	report, err := eng.GC(context.Background())
+	if err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	if report.RefsRemoved != 0 || report.ObjectsRemoved != 0 {
+		t.Fatalf("GC = %+v, want the adopted image kept by the agent's reference", report)
 	}
 }
 
 // TestBuildCachedWithHoldHolds asserts a held build of an image the store
-// already holds takes the hold and records no reference, leaving the
-// reference the earlier pull recorded untouched.
+// already holds takes the hold and records its own name as a runtime
+// reference, leaving the reference the earlier pull recorded untouched.
 func TestBuildCachedWithHoldHolds(t *testing.T) {
 	storeRoot := verityStoreRoot(t)
 	useRemoteDefaultTransport(t, failTransport{})
 	lay := octest.ThreeLayerImage(t, hostPlatform())
 	ref := "registry.example.com/team/app@" + lay.Root.String()
 	pullInto(t, storeRoot, ref, WithBlobSource(layoutBlobs(t, lay.Dir)))
-	refsBefore := refContents(t, storeRoot)
+	refsBefore := readPullRef(t, storeRoot, ref)
 
 	eng, err := New(Config{Root: storeRoot})
 	if err != nil {
@@ -691,11 +763,18 @@ func TestBuildCachedWithHoldHolds(t *testing.T) {
 		t.Fatalf("NewBuild: %v", err)
 	}
 	defer b.Close()
-	if _, err := b.Finish(context.Background()); err != nil {
+	img, err := b.Finish(context.Background())
+	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
-	if !reflect.DeepEqual(refContents(t, storeRoot), refsBefore) {
-		t.Fatal("cached held build changed the reference records")
+	if img.Holder != "cfs-build-2" {
+		t.Fatalf("cached held pull = %#v, want named for cfs-build-2", img)
+	}
+	if got := readPullRef(t, storeRoot, ref); !reflect.DeepEqual(got, refsBefore) {
+		t.Fatalf("cached held build changed the agent's reference record: %#v", got)
+	}
+	if alias := readPullRef(t, storeRoot, aliasRef); alias.Holder != "cfs-build-2" || alias.Identity.Digest != lay.Root {
+		t.Fatalf("alias record = %#v, want a runtime reference for cfs-build-2", alias)
 	}
 	assertHolders(t, storeRoot, lay.Root, []string{"cfs-build-2"})
 }
@@ -721,5 +800,107 @@ func TestBuildWithHoldRejectsBadHolderBeforeLock(t *testing.T) {
 	}
 	if _, err := eng.GC(context.Background()); err != nil {
 		t.Fatalf("GC after a refused build: %v", err)
+	}
+}
+
+// TestBuildWithHoldNamesUnderHoldLock asserts the name and the hold a held
+// build records are one step under the identity's hold lock: while another
+// holder of that lock stands — a remove or release in progress — the finish
+// publishes neither, and once the lock is free it publishes both.
+func TestBuildWithHoldNamesUnderHoldLock(t *testing.T) {
+	storeRoot := verityStoreRoot(t)
+	useRemoteDefaultTransport(t, failTransport{})
+	lay := octest.ThreeLayerImage(t, hostPlatform())
+	ref := "registry.example.com/team/app@" + lay.Root.String()
+	eng, err := New(Config{Root: storeRoot})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	holds, err := holdstore.New(storeRoot)
+	if err != nil {
+		t.Fatalf("holdstore.New: %v", err)
+	}
+	unlock, err := holds.Lock(lay.Root)
+	if err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+
+	b, err := eng.NewBuild(context.Background(), ref, WithBlobSource(layoutBlobs(t, lay.Dir)), WithHold("cfs-build-5"))
+	if err != nil {
+		unlock()
+		t.Fatalf("NewBuild: %v", err)
+	}
+	defer b.Close()
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Finish(context.Background())
+		done <- err
+	}()
+	// The finish converts the image, then blocks on the hold lock; give it
+	// time to reach that point and prove nothing was published meanwhile.
+	select {
+	case err := <-done:
+		unlock()
+		t.Fatalf("Finish returned %v while the hold lock was held", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if _, err := os.Stat(octest.RefPath(storeRoot, ref)); !errors.Is(err, os.ErrNotExist) {
+		unlock()
+		t.Fatalf("runtime reference published while the hold lock was held (stat: %v)", err)
+	}
+	unlock()
+	if err := <-done; err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if record := readPullRef(t, storeRoot, ref); record.Holder != "cfs-build-5" {
+		t.Fatalf("ref record = %#v, want a runtime reference for cfs-build-5", record)
+	}
+	assertHolders(t, storeRoot, lay.Root, []string{"cfs-build-5"})
+}
+
+// TestBuildFinishRefusesRemovedBinding asserts a pull whose image was removed
+// from under it — its binding deleted by a remove of another reference to the
+// same image while the build ran — fails at Finish and records nothing: a
+// reference or hold over a missing binding would be a wanted image gc cannot
+// enumerate. A held build and a plain one fail alike.
+func TestBuildFinishRefusesRemovedBinding(t *testing.T) {
+	for _, hold := range []string{"cfs-build-6", ""} {
+		storeRoot := verityStoreRoot(t)
+		useRemoteDefaultTransport(t, failTransport{})
+		lay := octest.ThreeLayerImage(t, hostPlatform())
+		ref := "registry.example.com/team/app@" + lay.Root.String()
+		pullInto(t, storeRoot, ref, WithBlobSource(layoutBlobs(t, lay.Dir)))
+		eng, err := New(Config{Root: storeRoot})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		aliasRef := "registry.example.com/team/alias@" + lay.Root.String()
+		var opts []PullOption
+		opts = append(opts, WithBlobSource(layoutBlobs(t, lay.Dir)))
+		if hold != "" {
+			opts = append(opts, WithHold(hold))
+		}
+		b, err := eng.NewBuild(context.Background(), aliasRef, opts...)
+		if err != nil {
+			t.Fatalf("NewBuild: %v", err)
+		}
+		// The build found the image present; a remove of its only reference
+		// now takes the binding away.
+		if err := eng.Remove(context.Background(), ref); err != nil {
+			b.Close()
+			t.Fatalf("Remove: %v", err)
+		}
+		_, err = b.Finish(context.Background())
+		b.Close()
+		if err == nil || !strings.Contains(err.Error(), "removed while the pull ran") {
+			t.Fatalf("Finish after the binding was removed (hold %q) = %v, want a removed-binding error", hold, err)
+		}
+		if _, err := os.Stat(octest.RefPath(storeRoot, aliasRef)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("a reference was recorded over a missing binding (hold %q, stat: %v)", hold, err)
+		}
+		assertHolders(t, storeRoot, lay.Root, nil)
+		if _, err := eng.GC(context.Background()); err != nil {
+			t.Fatalf("GC after the refused finish (hold %q): %v", hold, err)
+		}
 	}
 }

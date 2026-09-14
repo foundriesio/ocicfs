@@ -362,3 +362,29 @@ func TestEngineListIncludesHeldOnlyImages(t *testing.T) {
 		}
 	}
 }
+
+// TestEngineListReportsRuntimeRefHolder: a runtime reference lists like any
+// other row and reports the holder it names the image for.
+func TestEngineListReportsRuntimeRefHolder(t *testing.T) {
+	root := t.TempDir()
+	eng, err := New(Config{Root: root})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	imageRoot := digest.SHA256.FromString("runtime image")
+	desc := ocispec.Descriptor{MediaType: ocispec.MediaTypeImageManifest, Digest: imageRoot, Size: 10}
+	if _, err := newRefStore(t, root).PutHeld("app:v1", desc, desc, time.Unix(0, 0).UTC(), []string{ocilayout.PlatformString(&platform)}, "cfs-build-1"); err != nil {
+		t.Fatalf("PutHeld: %v", err)
+	}
+	putEngineBinding(t, root, imageRoot, platform, digest.SHA256.FromString("cfs-runtime"))
+
+	got, err := eng.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	want := Image{Ref: "app:v1", Digest: imageRoot.String(), Size: 123, Holder: "cfs-build-1"}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("List = %#v, want [%#v]", got, want)
+	}
+}

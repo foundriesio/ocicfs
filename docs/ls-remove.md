@@ -37,10 +37,27 @@ knarr ls --format json
 
 An empty store prints no text rows, or `[]` in JSON, and exits successfully.
 
-An image that no reference names but a hold keeps — one an embedder pulled
-with `WithHold`, the way a container runtime keeps the images it lists — is
-listed after the referenced images, with `-` in the reference column (an
-empty `"ref"` in JSON):
+A reference a runtime pull recorded — one made with `WithHold`, the way a
+container runtime keeps the images it lists — is a *runtime reference*: it
+names the image for the runtime's holder and pins nothing, so `gc` drops it,
+and the image, once that holder is released. It lists like any other row;
+in JSON it carries the holder:
+
+```sh
+knarr ls --format json
+# [
+#   {"ref":"docker.io/library/nginx:latest","digest":"sha256:...","size":481,"holder":"cfs-build-..."}
+# ]
+```
+
+`knarr remove` of such a reference declines while the holder stands, the
+same as for any held image. An agent that wants the image kept adopts it by
+pulling the name (`knarr pull nginx:latest`), which replaces the runtime
+reference with its own, or by holding it.
+
+An image that no reference names at all but a hold keeps is listed after the
+referenced images, with `-` in the reference column (an empty `"ref"` in
+JSON):
 
 ```text
 -	sha256:<digest>	481

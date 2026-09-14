@@ -222,13 +222,15 @@ func (b *build) finish(ctx context.Context) (*Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := b.want(built.RootDesc, built.Identity, built.Platform); err != nil {
+	holder, err := b.want(built.RootDesc, built.Identity, built.Platform)
+	if err != nil {
 		return nil, err
 	}
 	return &Image{
 		Ref:    b.ref,
 		Digest: built.Identity.Digest.String(),
 		Size:   built.Descriptor.Size,
+		Holder: holder,
 	}, nil
 }
 
@@ -247,33 +249,61 @@ func (b *build) finishCached(ctx context.Context) (*Image, error) {
 			return nil, err
 		}
 	}
-	if err := b.want(b.desc.Root, b.desc.Identity, b.cached.platform); err != nil {
+	holder, err := b.want(b.desc.Root, b.desc.Identity, b.cached.platform)
+	if err != nil {
 		return nil, err
 	}
 	return &Image{
 		Ref:    b.ref,
 		Digest: b.desc.Identity.Digest.String(),
 		Size:   b.cached.descriptor.Size,
+		Holder: holder,
 	}, nil
 }
 
-// want makes the finished image wanted: a reference record by default, or
-// a hold on its identity when the build was opened with one. Either way it
-// runs after the binding is written and while the store lock is still held,
-// so the image is never in the store without something that keeps gc off
-// it. The hold nests the per-digest hold lock inside the store lock, the
-// order every hold takes; a hold needs no presence check here, since the
-// binding this build just wrote is what a hold protects.
-func (b *build) want(root, identity ocispec.Descriptor, platform ocispec.Platform) error {
-	if b.hold == "" {
-		return b.e.recordRef(b.ref, root, identity, platform)
-	}
+// want makes the finished image wanted: a reference record by default, or,
+// when the build was opened with a holder, a runtime reference naming the
+// image for that holder and then the hold itself. It returns the holder the
+// image is named under, empty when it is not named: by default, or when an
+// agent's reference of the same name stood. Either way it runs after the
+// binding is written and while the store lock is still held, so the image
+// is never in the store without something that keeps gc off it.
+//
+// The whole step runs under the identity's hold lock, which a remove takes
+// too, so a remove of the image cannot interleave with it. First the binding
+// is checked to still be there: a remove of another reference to the same
+// image, landing since the build found or wrote the binding, deletes it as
+// unshared, and a reference or hold recorded over a missing binding is a
+// wanted image gc cannot enumerate, which aborts every collection — so the
+// pull fails instead, and a retry rebuilds the binding. Then the name goes
+// before the hold, so a failure between the two leaves only a runtime
+// reference whose holder never came to stand, which gc sweeps, never a hold
+// nothing names or releases. The hold lock nests inside the store lock, the
+// order every hold takes, and the record write's own lock nests inside the
+// hold lock; nothing takes the two in the other order.
+func (b *build) want(root, identity ocispec.Descriptor, platform ocispec.Platform) (string, error) {
 	unlock, err := b.e.holds.Lock(identity.Digest)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer unlock()
-	return b.e.holds.Hold(identity.Digest, b.hold)
+	if _, err := b.e.img.Get(identity.Digest, platform); err != nil {
+		return "", fmt.Errorf("image binding was removed while the pull ran; retry: %w", err)
+	}
+	if b.hold == "" {
+		return "", b.e.recordRef(b.ref, root, identity, platform)
+	}
+	named, err := b.e.recordRuntimeRef(b.ref, root, identity, platform, b.hold)
+	if err != nil {
+		return "", err
+	}
+	if err := b.e.holds.Hold(identity.Digest, b.hold); err != nil {
+		return "", err
+	}
+	if !named {
+		return "", nil
+	}
+	return b.hold, nil
 }
 
 // fail records err, wrapped with the pull's reference, as the build's sticky

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"runtime"
 	"strings"
 	"time"
@@ -45,6 +46,27 @@ func (e *engine) recordRef(ref string, root, identity ocispec.Descriptor, platfo
 		return err
 	}
 	return e.refs.Put(normalized, root, identity, time.Now(), []string{ocilayout.PlatformString(&platform)})
+}
+
+// recordRuntimeRef records ref, in its normalized form, as a runtime
+// reference naming the image for holder: a name for the image the hold keeps,
+// which pins nothing itself and goes when the holder does. It reports whether
+// the name was installed: a reference an agent's pull recorded is never
+// displaced — the image is then held but not named — while an agent's later
+// pull of the name displaces the runtime reference, adopting the image.
+func (e *engine) recordRuntimeRef(ref string, root, identity ocispec.Descriptor, platform ocispec.Platform, holder string) (bool, error) {
+	normalized, err := normalizeRef(ref)
+	if err != nil {
+		return false, err
+	}
+	named, err := e.refs.PutHeld(normalized, root, identity, time.Now(), []string{ocilayout.PlatformString(&platform)}, holder)
+	if err != nil {
+		return false, err
+	}
+	if !named {
+		slog.Debug("knarr: reference names an agent's image; the held image stays unnamed", "ref", normalized, "held", identity.Digest)
+	}
+	return named, nil
 }
 
 // pullSource picks where a pull reads its blobs from and the root digest it

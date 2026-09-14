@@ -10,6 +10,7 @@ seals every content object with it and refuses a store that cannot.
 ├── objects/sha256/<aa>/<rest>   # the content-addressed object store (CAS) — authoritative
 ├── objects/fsverity-sha256-12/<vv>/<rest>   # fs-verity view into the CAS — auxiliary
 ├── images/sha256/<aa>/<rest>/<os>-<arch>[-<variant>].json   # image bindings — auxiliary
+├── refs/.lock                   # record-write lock (flock), never removed
 ├── refs/sha256/<kk>/<rest>.json # reference records — auxiliary
 ├── holds/sha256/<aa>/<rest>/<holder>   # GC-protection holds — auxiliary
 ├── .lock                        # store-level lock coordinating gc with pull/hold/mount
@@ -143,9 +144,16 @@ trust anchor:
   "identity": { "mediaType": "application/vnd.oci.image.manifest.v1+json",
                 "digest": "sha256:…", "size": 481 },
   "pulledAt": "2026-07-01T11:47:00Z",
-  "platforms": ["linux/arm64"]
+  "platforms": ["linux/arm64"],
+  "holder": "cfs-build-…"
 }
 ```
+
+`holder` is present only on a *runtime reference*, written by a pull made
+under `WithHold`: the record names the image for that holder and pins
+nothing — `knarr gc` keeps the image through the hold, not the name, and
+deletes the record once the holder is released. A record without `holder` is
+an agent's, and keeps its image on its own.
 
 The two descriptors say different things. `resolved` is **provenance**: the
 document the reference itself landed on — an image index for the tag above, and
