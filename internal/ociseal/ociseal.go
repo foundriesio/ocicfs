@@ -1,8 +1,8 @@
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package ociseal computes and records composefs integrity annotations in OCI
-// image manifests.
+// Package ociseal computes composefs integrity annotations in OCI image
+// manifests.
 package ociseal
 
 import (
@@ -19,11 +19,6 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/google/go-containerregistry/pkg/authn"
-	"github.com/google/go-containerregistry/pkg/name"
-	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
-	"github.com/google/go-containerregistry/pkg/v1/remote"
-	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -32,7 +27,6 @@ import (
 	"github.com/foundriesio/knarr/internal/objectstore"
 	"github.com/foundriesio/knarr/internal/ocichain"
 	"github.com/foundriesio/knarr/internal/ocilayout"
-	"github.com/foundriesio/knarr/internal/ociremote"
 	"github.com/foundriesio/knarr/internal/rootfs"
 	"github.com/foundriesio/knarr/internal/verity"
 )
@@ -59,36 +53,25 @@ const (
 // value to seal. It is wrapped platform-qualified when returned.
 var ErrNotCanonical = errors.New("ociseal: construction is not upstream-canonical")
 
-// Options controls what Seal targets and which registry writes it performs.
-type Options struct {
-	// Platform selects which child of an image index to seal, as
-	// "os/arch[/variant]". Required when the reference names an index and
-	// rejected when it names an image manifest.
-	Platform string
-	Tag      string
-	DryRun   bool
-	// FromDir reads the image from a local OCI image layout directory
-	// instead of the registry. The reference still names the repository the
-	// sealed manifests are pushed to, and the registry accepts them only if
-	// it already holds the blobs they reference.
-	FromDir string
-	// AllowNonCanonical permits sealing a non-canonical construction: its
-	// deterministic fallback digest is recorded under the knarr fallback
-	// annotations instead of declining. A canonical construction is sealed
-	// under the standard annotations regardless of this option.
-	AllowNonCanonical bool
-}
-
-// Result describes the root produced by Seal.
+// Result describes a computed sealed root.
 type Result struct {
 	Original  digest.Digest
 	Sealed    digest.Digest
 	Platforms []PlatformResult
-	// Repository is the fully qualified repository the sealed manifests were
-	// pushed to, so a caller can render every digest here as a pullable
-	// reference. It is the input reference's repository: seal never writes
-	// outside it.
+	// Repository is the fully qualified repository associated with the
+	// result. Compute leaves it empty because a blob source carries no
+	// repository identity.
 	Repository string
+}
+
+// Manifest is an OCI manifest or index produced by Compute.
+type Manifest struct {
+	Raw       []byte
+	MediaType string
+	Digest    digest.Digest
+	// Changed reports whether the manifest must be pushed by digest. An
+	// unchanged manifest is returned only as the root that may be tagged.
+	Changed bool
 }
 
 // PlatformResult describes one sealed platform manifest. Original is the
@@ -102,58 +85,16 @@ type PlatformResult struct {
 	MergedFsverity string
 }
 
-// Seal computes integrity annotations for one image manifest — ref directly,
-// or the Options.Platform child of the index ref names — and pushes the
-// changed manifests in the same repository unless DryRun is set.
-func Seal(ctx context.Context, ref string, opts Options) (Result, error) {
+// Compute returns the manifests in push order, with the root last. It computes
+// integrity annotations for root directly, or for the child selected by want
+// when root is an image index.
+func Compute(ctx context.Context, src ocichain.BlobSource, root digest.Digest, want *ocispec.Platform, allowFallback bool) (Result, []Manifest, error) {
 	// Sealing builds the merged EROFS with mkcomposefs after reading every
 	// layer; check the binary up front so a missing one fails immediately.
 	if err := composefs.Preflight(); err != nil {
-		return Result{}, err
+		return Result{}, nil, err
 	}
-
-	input, err := name.NewDigest(ref)
-	if err != nil {
-		return Result{}, fmt.Errorf("ociseal: parse reference: %w", err)
-	}
-	var (
-		src  ocichain.BlobSource
-		root digest.Digest
-	)
-	if opts.FromDir != "" {
-		if err := ociremote.RequireSecureRegistry(input.Context()); err != nil {
-			return Result{}, err
-		}
-		root = digest.Digest(input.DigestStr())
-		if err := digestutil.ValidateSHA256(root); err != nil {
-			return Result{}, fmt.Errorf("ociseal: %w", err)
-		}
-		if src, err = ocilayout.Open(opts.FromDir); err != nil {
-			return Result{}, err
-		}
-	} else {
-		if src, root, err = ociremote.Open(ctx, ref); err != nil {
-			return Result{}, err
-		}
-	}
-	tag, err := outputTag(input.Context(), opts.Tag)
-	if err != nil {
-		return Result{}, err
-	}
-	var want *ocispec.Platform
-	if opts.Platform != "" {
-		parsed, err := ggcrv1.ParsePlatform(opts.Platform)
-		if err != nil {
-			return Result{}, fmt.Errorf("ociseal: parse platform: %w", err)
-		}
-		want = &ocispec.Platform{OS: parsed.OS, Architecture: parsed.Architecture, Variant: parsed.Variant}
-	}
-	result, err := seal(ctx, src, input.Context(), root, want, tag, opts.DryRun, opts.AllowNonCanonical)
-	if err != nil {
-		return Result{}, err
-	}
-	result.Repository = input.Context().String()
-	return result, nil
+	return seal(ctx, src, root, want, allowFallback)
 }
 
 // ParseAnnotation strictly converts a bare lowercase sha256 annotation value
@@ -185,11 +126,6 @@ func AnnotationValue(value string) (string, error) {
 }
 
 type (
-	rawManifest struct {
-		data      []byte
-		mediaType types.MediaType
-	}
-
 	sealedManifest struct {
 		raw            []byte
 		descriptor     ocispec.Descriptor
@@ -201,14 +137,6 @@ type (
 	hashSink struct{}
 )
 
-func (m rawManifest) RawManifest() ([]byte, error) {
-	return m.data, nil
-}
-
-func (m rawManifest) MediaType() (types.MediaType, error) {
-	return m.mediaType, nil
-}
-
 func (hashSink) WriteObject(ctx context.Context, r io.Reader) (digest.Digest, objectstore.Sealed, error) {
 	h := sha256.New()
 	fsv, err := verity.Digest(ctx, io.TeeReader(r, h))
@@ -218,42 +146,42 @@ func (hashSink) WriteObject(ctx context.Context, r io.Reader) (digest.Digest, ob
 	return digest.NewDigest(digest.SHA256, h), objectstore.Resolved(fsv), nil
 }
 
-func seal(ctx context.Context, src ocichain.BlobSource, repo name.Repository, root digest.Digest, want *ocispec.Platform, tag *name.Tag, dryRun, allowFallback bool) (Result, error) {
+func seal(ctx context.Context, src ocichain.BlobSource, root digest.Digest, want *ocispec.Platform, allowFallback bool) (Result, []Manifest, error) {
 	rootRaw, err := ocichain.ReadRootBlob(ctx, src, root)
 	if err != nil {
-		return Result{}, fmt.Errorf("ociseal: read root: %w", err)
+		return Result{}, nil, fmt.Errorf("ociseal: read root: %w", err)
 	}
 	isIndex, err := ocichain.IsIndex(rootRaw)
 	if err != nil {
-		return Result{}, fmt.Errorf("ociseal: parse root: %w", err)
+		return Result{}, nil, fmt.Errorf("ociseal: parse root: %w", err)
 	}
 	if isIndex {
 		if want == nil {
-			return Result{}, errors.New("ociseal: the reference names an image index; select one platform with --platform os/arch[/variant]")
+			return Result{}, nil, errors.New("ociseal: the reference names an image index; select one platform with --platform os/arch[/variant]")
 		}
-		return sealIndexPlatform(ctx, src, repo, root, rootRaw, *want, tag, dryRun, allowFallback)
+		return sealIndexPlatform(ctx, src, root, rootRaw, *want, allowFallback)
 	}
 	if want != nil {
-		return Result{}, errors.New("ociseal: the reference names an image manifest; --platform applies only to an index")
+		return Result{}, nil, errors.New("ociseal: the reference names an image manifest; --platform applies only to an index")
 	}
-	return sealSingle(ctx, src, repo, root, rootRaw, tag, dryRun, allowFallback)
+	return sealSingle(ctx, src, root, rootRaw, allowFallback)
 }
 
-func sealSingle(ctx context.Context, src ocichain.BlobSource, repo name.Repository, root digest.Digest, rootRaw []byte, tag *name.Tag, dryRun, allowFallback bool) (Result, error) {
+func sealSingle(ctx context.Context, src ocichain.BlobSource, root digest.Digest, rootRaw []byte, allowFallback bool) (Result, []Manifest, error) {
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(rootRaw, &manifest); err != nil {
-		return Result{}, fmt.Errorf("ociseal: parse root manifest: %w", err)
+		return Result{}, nil, fmt.Errorf("ociseal: parse root manifest: %w", err)
 	}
 	if !isImageManifest(manifest) {
-		return Result{}, errors.New("ociseal: root is not a container image manifest (no config, or layers that are not tar archives)")
+		return Result{}, nil, errors.New("ociseal: root is not a container image manifest (no config, or layers that are not tar archives)")
 	}
 	want, err := manifestPlatform(ctx, src, manifest.Config)
 	if err != nil {
-		return Result{}, err
+		return Result{}, nil, err
 	}
 	sealed, err := sealPlatform(ctx, src, root, want, allowFallback)
 	if err != nil {
-		return Result{}, err
+		return Result{}, nil, err
 	}
 	result := Result{
 		Original: root,
@@ -268,22 +196,12 @@ func sealSingle(ctx context.Context, src ocichain.BlobSource, repo name.Reposito
 	if !sealed.changed {
 		result.Sealed = root
 	}
-	if dryRun {
-		return result, nil
-	}
-	if sealed.changed {
-		if err := putManifest(ctx, repo.Digest(sealed.descriptor.Digest.String()), sealed.raw, sealed.descriptor.MediaType); err != nil {
-			return Result{}, fmt.Errorf("ociseal: push manifest: %w", err)
-		}
-	}
-	if tag != nil {
-		// An unchanged manifest is not re-pushed, but a requested tag still
-		// lands on it: sealed.raw carries the original bytes in that case.
-		if err := putManifest(ctx, *tag, sealed.raw, sealed.descriptor.MediaType); err != nil {
-			return Result{}, fmt.Errorf("ociseal: push tag: %w", err)
-		}
-	}
-	return result, nil
+	return result, []Manifest{{
+		Raw:       sealed.raw,
+		MediaType: sealed.descriptor.MediaType,
+		Digest:    result.Sealed,
+		Changed:   sealed.changed,
+	}}, nil
 }
 
 // sealIndexPlatform seals exactly one platform of an index: the child want
@@ -292,21 +210,21 @@ func sealSingle(ctx context.Context, src ocichain.BlobSource, repo name.Reposito
 // artifacts — is left byte-identical and never even fetched. The returned
 // sealed digest is the updated index's, so a multi-platform index is fully
 // sealed by chaining calls, each feeding the previous call's output digest.
-func sealIndexPlatform(ctx context.Context, src ocichain.BlobSource, repo name.Repository, root digest.Digest, rootRaw []byte, want ocispec.Platform, tag *name.Tag, dryRun, allowFallback bool) (Result, error) {
+func sealIndexPlatform(ctx context.Context, src ocichain.BlobSource, root digest.Digest, rootRaw []byte, want ocispec.Platform, allowFallback bool) (Result, []Manifest, error) {
 	var index ocispec.Index
 	if err := json.Unmarshal(rootRaw, &index); err != nil {
-		return Result{}, fmt.Errorf("ociseal: parse index: %w", err)
+		return Result{}, nil, fmt.Errorf("ociseal: parse index: %w", err)
 	}
 	// The generic document carries the members the typed index drops, so
 	// rewriting one child's descriptor in it leaves every other member — and
 	// every other child — as the publisher wrote it.
 	rootDoc, err := decodeDocument(rootRaw)
 	if err != nil {
-		return Result{}, fmt.Errorf("ociseal: parse root: %w", err)
+		return Result{}, nil, fmt.Errorf("ociseal: parse root: %w", err)
 	}
 	rawDescriptors, ok := rootDoc["manifests"].([]any)
 	if !ok || len(rawDescriptors) != len(index.Manifests) {
-		return Result{}, errors.New("ociseal: index manifests has invalid shape")
+		return Result{}, nil, errors.New("ociseal: index manifests has invalid shape")
 	}
 
 	// Selection is exact on os/arch/variant as the index descriptors declare
@@ -319,28 +237,28 @@ func sealIndexPlatform(ctx context.Context, src ocichain.BlobSource, repo name.R
 			continue
 		}
 		if child >= 0 {
-			return Result{}, fmt.Errorf("ociseal: platform %s matches more than one manifest in the index; qualify it (os/arch/variant)", scrubPlatform(&want))
+			return Result{}, nil, fmt.Errorf("ociseal: platform %s matches more than one manifest in the index; qualify it (os/arch/variant)", scrubPlatform(&want))
 		}
 		child = i
 	}
 	if child < 0 {
-		return Result{}, fmt.Errorf("ociseal: no manifest for platform %s in the index; it provides: %s", scrubPlatform(&want), indexPlatforms(index))
+		return Result{}, nil, fmt.Errorf("ociseal: no manifest for platform %s in the index; it provides: %s", scrubPlatform(&want), indexPlatforms(index))
 	}
 
 	childRaw, err := ocichain.ReadMetaBlob(ctx, src, index.Manifests[child])
 	if err != nil {
-		return Result{}, fmt.Errorf("ociseal: read manifest for platform %s: %w", scrubPlatform(&want), err)
+		return Result{}, nil, fmt.Errorf("ociseal: read manifest for platform %s: %w", scrubPlatform(&want), err)
 	}
 	nested, err := ocichain.IsIndex(childRaw)
 	if err != nil {
-		return Result{}, fmt.Errorf("ociseal: parse manifest for platform %s: %w", scrubPlatform(&want), err)
+		return Result{}, nil, fmt.Errorf("ociseal: parse manifest for platform %s: %w", scrubPlatform(&want), err)
 	}
 	if nested {
-		return Result{}, fmt.Errorf("ociseal: platform %s names a nested index: recursive sealing is not supported", scrubPlatform(&want))
+		return Result{}, nil, fmt.Errorf("ociseal: platform %s names a nested index: recursive sealing is not supported", scrubPlatform(&want))
 	}
 	manifest, err := sealPlatform(ctx, src, index.Manifests[child].Digest, want, allowFallback)
 	if err != nil {
-		return Result{}, err
+		return Result{}, nil, err
 	}
 
 	result := Result{Original: root, Sealed: root, Platforms: []PlatformResult{{
@@ -350,43 +268,39 @@ func sealIndexPlatform(ctx context.Context, src ocichain.BlobSource, repo name.R
 		MergedFsverity: manifest.mergedFsverity,
 	}}}
 	if !manifest.changed {
-		if !dryRun && tag != nil {
-			// The unchanged index is not re-pushed, but a requested tag still
-			// lands on the original bytes.
-			if err := putManifest(ctx, *tag, rootRaw, documentMediaType(rootDoc, ocispec.MediaTypeImageIndex)); err != nil {
-				return Result{}, fmt.Errorf("ociseal: push tag: %w", err)
-			}
-		}
-		return result, nil
+		return result, []Manifest{{
+			Raw:       rootRaw,
+			MediaType: documentMediaType(rootDoc, ocispec.MediaTypeImageIndex),
+			Digest:    root,
+		}}, nil
 	}
 
 	rawDesc, ok := rawDescriptors[child].(map[string]any)
 	if !ok {
-		return Result{}, fmt.Errorf("ociseal: index manifest %d has invalid shape", child)
+		return Result{}, nil, fmt.Errorf("ociseal: index manifest %d has invalid shape", child)
 	}
 	rawDesc["digest"] = manifest.descriptor.Digest.String()
 	rawDesc["size"] = json.Number(fmt.Sprint(manifest.descriptor.Size))
 	rewritten, err := json.Marshal(rootDoc)
 	if err != nil {
-		return Result{}, fmt.Errorf("ociseal: marshal index: %w", err)
+		return Result{}, nil, fmt.Errorf("ociseal: marshal index: %w", err)
 	}
 	result.Sealed = digest.FromBytes(rewritten)
-	if dryRun {
-		return result, nil
-	}
-	if err := putManifest(ctx, repo.Digest(manifest.descriptor.Digest.String()), manifest.raw, manifest.descriptor.MediaType); err != nil {
-		return Result{}, fmt.Errorf("ociseal: push platform %s: %w", scrubPlatform(&manifest.platform), err)
-	}
 	mediaType := documentMediaType(rootDoc, ocispec.MediaTypeImageIndex)
-	if err := putManifest(ctx, repo.Digest(result.Sealed.String()), rewritten, mediaType); err != nil {
-		return Result{}, fmt.Errorf("ociseal: push index: %w", err)
-	}
-	if tag != nil {
-		if err := putManifest(ctx, *tag, rewritten, mediaType); err != nil {
-			return Result{}, fmt.Errorf("ociseal: push tag: %w", err)
-		}
-	}
-	return result, nil
+	return result, []Manifest{
+		{
+			Raw:       manifest.raw,
+			MediaType: manifest.descriptor.MediaType,
+			Digest:    manifest.descriptor.Digest,
+			Changed:   true,
+		},
+		{
+			Raw:       rewritten,
+			MediaType: mediaType,
+			Digest:    result.Sealed,
+			Changed:   true,
+		},
+	}, nil
 }
 
 // platformsEqual reports whether two platforms name the same os/arch/variant.
@@ -675,25 +589,4 @@ func documentMediaType(doc map[string]any, fallback string) string {
 		return mediaType
 	}
 	return fallback
-}
-
-func putManifest(ctx context.Context, ref name.Reference, raw []byte, mediaType string) error {
-	return remote.Put(ref, rawManifest{data: raw, mediaType: types.MediaType(mediaType)},
-		remote.WithContext(ctx),
-		remote.WithAuthFromKeychain(authn.DefaultKeychain),
-	)
-}
-
-func outputTag(repo name.Repository, value string) (*name.Tag, error) {
-	if value == "" {
-		return nil, nil
-	}
-	if strings.ContainsAny(value, "/@") {
-		return nil, errors.New("ociseal: --tag must be a tag name in the input repository")
-	}
-	tag, err := name.NewTag(repo.Name() + ":" + value)
-	if err != nil {
-		return nil, fmt.Errorf("ociseal: parse --tag: %w", err)
-	}
-	return &tag, nil
 }

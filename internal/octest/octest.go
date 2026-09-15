@@ -237,6 +237,35 @@ func ThreeLayerImage(t testing.TB, platform ocispec.Platform) Layout {
 	return lay
 }
 
+// NonCanonicalLayout builds a single-layer image whose tree omits /usr, so
+// canonical construction must substitute default root metadata.
+func NonCanonicalLayout(t testing.TB, platform ocispec.Platform) Layout {
+	t.Helper()
+	lay, err := BuildSingleLayerGzip(t.TempDir(), platform,
+		File{Name: "etc/value", Mode: 0o644, Body: "value"},
+	)
+	if err != nil {
+		t.Fatalf("BuildSingleLayerGzip: %v", err)
+	}
+	return lay
+}
+
+// BuildIndexImage builds a canonical single-layer image used as an index
+// child.
+func BuildIndexImage(t testing.TB, platform ocispec.Platform, body string) Layout {
+	t.Helper()
+	lay, err := BuildSingleLayerGzip(t.TempDir(), platform,
+		File{Name: "usr", Dir: true},
+		File{Name: "etc", Dir: true},
+		File{Name: "empty", Mode: 0o644},
+		File{Name: "etc/platform", Mode: 0o644, Body: body},
+	)
+	if err != nil {
+		t.Fatalf("BuildSingleLayerGzip: %v", err)
+	}
+	return lay
+}
+
 // ObjectPath returns the CAS path a stored object with digest d lands at.
 func ObjectPath(root string, d digest.Digest) string {
 	return filepath.Join(root, "objects", "sha256", d.Hex()[:2], d.Hex()[2:])

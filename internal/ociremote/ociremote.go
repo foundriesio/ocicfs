@@ -1,7 +1,8 @@
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package ociremote fetches OCI image blobs from a registry.
+// Package ociremote fetches OCI image blobs from a registry and pushes sealed
+// manifests.
 package ociremote
 
 import (
@@ -17,14 +18,103 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
+	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
+	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/foundriesio/knarr/internal/digestutil"
 	"github.com/foundriesio/knarr/internal/ocichain"
+	"github.com/foundriesio/knarr/internal/ocilayout"
+	"github.com/foundriesio/knarr/internal/ociseal"
 )
+
+// Options controls what Seal targets and which registry writes it performs.
+type Options struct {
+	// Platform selects which child of an image index to seal, as
+	// "os/arch[/variant]". Required when the reference names an index and
+	// rejected when it names an image manifest.
+	Platform string
+	Tag      string
+	DryRun   bool
+	// FromDir reads the image from a local OCI image layout directory
+	// instead of the registry. The reference still names the repository the
+	// sealed manifests are pushed to, and the registry accepts them only if
+	// it already holds the blobs they reference.
+	FromDir string
+	// AllowNonCanonical permits sealing a non-canonical construction: its
+	// deterministic fallback digest is recorded under the knarr fallback
+	// annotations instead of declining. A canonical construction is sealed
+	// under the standard annotations regardless of this option.
+	AllowNonCanonical bool
+}
+
+// Seal computes integrity annotations for one image manifest — ref directly,
+// or the Options.Platform child of the index ref names — and pushes the
+// changed manifests in the same repository unless DryRun is set.
+func Seal(ctx context.Context, ref string, opts Options) (ociseal.Result, error) {
+	input, err := name.NewDigest(ref)
+	if err != nil {
+		return ociseal.Result{}, fmt.Errorf("ociremote: parse reference: %w", err)
+	}
+	var (
+		src  ocichain.BlobSource
+		root digest.Digest
+	)
+	if opts.FromDir != "" {
+		if err := RequireSecureRegistry(input.Context()); err != nil {
+			return ociseal.Result{}, err
+		}
+		root = digest.Digest(input.DigestStr())
+		if err := digestutil.ValidateSHA256(root); err != nil {
+			return ociseal.Result{}, fmt.Errorf("ociremote: %w", err)
+		}
+		if src, err = ocilayout.Open(opts.FromDir); err != nil {
+			return ociseal.Result{}, err
+		}
+	} else {
+		if src, root, err = Open(ctx, ref); err != nil {
+			return ociseal.Result{}, err
+		}
+	}
+	tag, err := outputTag(input.Context(), opts.Tag)
+	if err != nil {
+		return ociseal.Result{}, err
+	}
+	var want *ocispec.Platform
+	if opts.Platform != "" {
+		parsed, err := ggcrv1.ParsePlatform(opts.Platform)
+		if err != nil {
+			return ociseal.Result{}, fmt.Errorf("ociremote: parse platform: %w", err)
+		}
+		want = &ocispec.Platform{OS: parsed.OS, Architecture: parsed.Architecture, Variant: parsed.Variant}
+	}
+	result, manifests, err := ociseal.Compute(ctx, src, root, want, opts.AllowNonCanonical)
+	if err != nil {
+		return ociseal.Result{}, err
+	}
+	result.Repository = input.Context().String()
+	if opts.DryRun {
+		return result, nil
+	}
+	for _, manifest := range manifests {
+		if !manifest.Changed {
+			continue
+		}
+		if err := putManifest(ctx, input.Context().Digest(manifest.Digest.String()), manifest.Raw, manifest.MediaType); err != nil {
+			return ociseal.Result{}, fmt.Errorf("ociremote: push manifest %s: %w", manifest.Digest, err)
+		}
+	}
+	if tag != nil {
+		rootManifest := manifests[len(manifests)-1]
+		if err := putManifest(ctx, *tag, rootManifest.Raw, rootManifest.MediaType); err != nil {
+			return ociseal.Result{}, fmt.Errorf("ociremote: push tag: %w", err)
+		}
+	}
+	return result, nil
+}
 
 // Open builds a registry-backed BlobSource for ref and returns its root
 // digest. The reference must name a repository and either pin a sha256 digest
@@ -74,10 +164,37 @@ func Open(ctx context.Context, ref string) (ocichain.BlobSource, digest.Digest, 
 	return &source{repo: repo, root: root, puller: puller}, root, nil
 }
 
-type source struct {
-	repo   name.Repository
-	root   digest.Digest
-	puller *remote.Puller
+// RequireSecureRegistry rejects a repository whose registry would be contacted
+// over plain HTTP, unless it is a loopback address (localhost or a loopback
+// IP): content integrity comes from a pinned digest, not the channel, and a
+// loopback registry is standard tooling. Every path that talks to a registry
+// must apply this policy, whether it fetches or only pushes.
+func RequireSecureRegistry(repo name.Repository) error {
+	if repo.Scheme() != "https" && !isLoopback(repo.RegistryStr()) {
+		return fmt.Errorf("ociremote: registry %s does not use HTTPS", repo.RegistryStr())
+	}
+	return nil
+}
+
+type (
+	rawManifest struct {
+		data      []byte
+		mediaType types.MediaType
+	}
+
+	source struct {
+		repo   name.Repository
+		root   digest.Digest
+		puller *remote.Puller
+	}
+)
+
+func (m rawManifest) RawManifest() ([]byte, error) {
+	return m.data, nil
+}
+
+func (m rawManifest) MediaType() (types.MediaType, error) {
+	return m.mediaType, nil
 }
 
 // Open fetches desc's raw bytes from the registry. A manifest or index
@@ -122,16 +239,25 @@ func (s *source) DescribeMissingRoot(root digest.Digest, _ error) error {
 	return fmt.Errorf("ociremote: root %s is not present in registry %s; verify the pinned digest and that the image is pushed and pullable", root, s.repo.Name())
 }
 
-// RequireSecureRegistry rejects a repository whose registry would be contacted
-// over plain HTTP, unless it is a loopback address (localhost or a loopback
-// IP): content integrity comes from a pinned digest, not the channel, and a
-// loopback registry is standard tooling. Every path that talks to a registry
-// must apply this policy, whether it fetches or only pushes.
-func RequireSecureRegistry(repo name.Repository) error {
-	if repo.Scheme() != "https" && !isLoopback(repo.RegistryStr()) {
-		return fmt.Errorf("ociremote: registry %s does not use HTTPS", repo.RegistryStr())
+func putManifest(ctx context.Context, ref name.Reference, raw []byte, mediaType string) error {
+	return remote.Put(ref, rawManifest{data: raw, mediaType: types.MediaType(mediaType)},
+		remote.WithContext(ctx),
+		remote.WithAuthFromKeychain(authn.DefaultKeychain),
+	)
+}
+
+func outputTag(repo name.Repository, value string) (*name.Tag, error) {
+	if value == "" {
+		return nil, nil
 	}
-	return nil
+	if strings.ContainsAny(value, "/@") {
+		return nil, errors.New("ociremote: --tag must be a tag name in the input repository")
+	}
+	tag, err := name.NewTag(repo.Name() + ":" + value)
+	if err != nil {
+		return nil, fmt.Errorf("ociremote: parse --tag: %w", err)
+	}
+	return &tag, nil
 }
 
 // isLoopback reports whether registry (a host or host:port) is localhost or a

@@ -7,7 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/foundriesio/knarr/internal/cli"
-	"github.com/foundriesio/knarr/internal/ociseal"
+	"github.com/foundriesio/knarr/internal/ociremote"
 )
 
 func newSealCommand(*globalOptions) *cobra.Command {
@@ -25,7 +25,7 @@ func newSealCommand(*globalOptions) *cobra.Command {
 		Short: "add composefs integrity annotations to an image",
 		Args:  cli.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			result, err := ociseal.Seal(cmd.Context(), args[0], ociseal.Options{
+			result, err := ociremote.Seal(cmd.Context(), args[0], ociremote.Options{
 				Platform:          platform,
 				Tag:               tag,
 				DryRun:            dryRun,

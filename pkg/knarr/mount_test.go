@@ -20,6 +20,7 @@ import (
 	"github.com/foundriesio/knarr/internal/devtest"
 	"github.com/foundriesio/knarr/internal/imagestore"
 	"github.com/foundriesio/knarr/internal/objectstore"
+	"github.com/foundriesio/knarr/internal/ociremote"
 	"github.com/foundriesio/knarr/internal/ociseal"
 	"github.com/foundriesio/knarr/internal/octest"
 )
@@ -609,7 +610,7 @@ func TestMountSealedIgnoresTamperedBinding(t *testing.T) {
 
 	lay := buildCanonicalSealLayout(t, hostPlatform(), sealObjectBody)
 	pushLayoutImage(t, registry, "registry.example.com/team/sealed:input", lay)
-	sealed, err := ociseal.Seal(context.Background(), "registry.example.com/team/sealed@"+lay.Root.String(), ociseal.Options{})
+	sealed, err := ociremote.Seal(context.Background(), "registry.example.com/team/sealed@"+lay.Root.String(), ociremote.Options{})
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
@@ -667,7 +668,7 @@ func TestMountSealedRefusesRepointedBinding(t *testing.T) {
 
 	lay := buildCanonicalSealLayout(t, hostPlatform(), sealObjectBody)
 	pushLayoutImage(t, registry, "registry.example.com/team/sealed:input", lay)
-	sealed, err := ociseal.Seal(context.Background(), "registry.example.com/team/sealed@"+lay.Root.String(), ociseal.Options{})
+	sealed, err := ociremote.Seal(context.Background(), "registry.example.com/team/sealed@"+lay.Root.String(), ociremote.Options{})
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
@@ -740,7 +741,7 @@ func TestMountSealedFallbackIgnoresTamperedBinding(t *testing.T) {
 		t.Fatalf("BuildSingleLayerGzip: %v", err)
 	}
 	pushLayoutImage(t, registry, "registry.example.com/team/model:input", lay)
-	sealed, err := ociseal.Seal(context.Background(), "registry.example.com/team/model@"+lay.Root.String(), ociseal.Options{AllowNonCanonical: true})
+	sealed, err := ociremote.Seal(context.Background(), "registry.example.com/team/model@"+lay.Root.String(), ociremote.Options{AllowNonCanonical: true})
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}

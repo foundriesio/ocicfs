@@ -25,6 +25,7 @@ import (
 	"github.com/foundriesio/knarr/internal/devtest"
 	"github.com/foundriesio/knarr/internal/imagestore"
 	"github.com/foundriesio/knarr/internal/objectstore"
+	"github.com/foundriesio/knarr/internal/ociremote"
 	"github.com/foundriesio/knarr/internal/ociseal"
 	"github.com/foundriesio/knarr/internal/octest"
 )
@@ -50,7 +51,7 @@ func TestSealPullMountE2E(t *testing.T) {
 	pushLayoutImage(t, registry, "registry.example.com/team/sealed:input", lay)
 
 	input := "registry.example.com/team/sealed@" + lay.Root.String()
-	sealed, err := ociseal.Seal(context.Background(), input, ociseal.Options{})
+	sealed, err := ociremote.Seal(context.Background(), input, ociremote.Options{})
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
@@ -141,14 +142,14 @@ func TestSealTwiceDeterminismE2E(t *testing.T) {
 	lay := buildCanonicalSealLayout(t, hostPlatform(), sealObjectBody)
 	pushLayoutImage(t, registry, "registry.example.com/team/twice:input", lay)
 
-	first, err := ociseal.Seal(context.Background(), "registry.example.com/team/twice@"+lay.Root.String(), ociseal.Options{Tag: "sealed"})
+	first, err := ociremote.Seal(context.Background(), "registry.example.com/team/twice@"+lay.Root.String(), ociremote.Options{Tag: "sealed"})
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
 	if first.Sealed == first.Original {
 		t.Fatal("Seal did not change the root digest")
 	}
-	second, err := ociseal.Seal(context.Background(), "registry.example.com/team/twice@"+first.Sealed.String(), ociseal.Options{Tag: "resealed"})
+	second, err := ociremote.Seal(context.Background(), "registry.example.com/team/twice@"+first.Sealed.String(), ociremote.Options{Tag: "resealed"})
 	if err != nil {
 		t.Fatalf("Seal second pass: %v", err)
 	}
@@ -168,7 +169,7 @@ func TestSealedPullRejectsTamperedAnnotationsE2E(t *testing.T) {
 
 	lay := buildCanonicalSealLayout(t, hostPlatform(), sealObjectBody)
 	pushLayoutImage(t, registry, "registry.example.com/team/tamper:input", lay)
-	sealed, err := ociseal.Seal(context.Background(), "registry.example.com/team/tamper@"+lay.Root.String(), ociseal.Options{})
+	sealed, err := ociremote.Seal(context.Background(), "registry.example.com/team/tamper@"+lay.Root.String(), ociremote.Options{})
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
@@ -234,10 +235,10 @@ func TestSealFallbackE2E(t *testing.T) {
 	}
 	pushLayoutImage(t, registry, "registry.example.com/team/model:input", lay)
 
-	if _, err := ociseal.Seal(context.Background(), "registry.example.com/team/model@"+lay.Root.String(), ociseal.Options{}); !errors.Is(err, ociseal.ErrNotCanonical) {
+	if _, err := ociremote.Seal(context.Background(), "registry.example.com/team/model@"+lay.Root.String(), ociremote.Options{}); !errors.Is(err, ociseal.ErrNotCanonical) {
 		t.Fatalf("Seal without permission err = %v, want ErrNotCanonical", err)
 	}
-	sealed, err := ociseal.Seal(context.Background(), "registry.example.com/team/model@"+lay.Root.String(), ociseal.Options{AllowNonCanonical: true})
+	sealed, err := ociremote.Seal(context.Background(), "registry.example.com/team/model@"+lay.Root.String(), ociremote.Options{AllowNonCanonical: true})
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
@@ -406,14 +407,14 @@ func TestSealedIndexMultiArchPassthroughE2E(t *testing.T) {
 
 	// One platform per call: the host platform first, then the foreign one on
 	// the index digest the first call produced.
-	firstSeal, err := ociseal.Seal(context.Background(), repo+"@"+indexRoot.String(), ociseal.Options{Platform: "linux/" + host.Architecture})
+	firstSeal, err := ociremote.Seal(context.Background(), repo+"@"+indexRoot.String(), ociremote.Options{Platform: "linux/" + host.Architecture})
 	if err != nil {
 		t.Fatalf("Seal host platform: %v", err)
 	}
 	if len(firstSeal.Platforms) != 1 {
 		t.Fatalf("first seal platforms = %d, want 1", len(firstSeal.Platforms))
 	}
-	sealed, err := ociseal.Seal(context.Background(), repo+"@"+firstSeal.Sealed.String(), ociseal.Options{Platform: "linux/" + foreign.Architecture})
+	sealed, err := ociremote.Seal(context.Background(), repo+"@"+firstSeal.Sealed.String(), ociremote.Options{Platform: "linux/" + foreign.Architecture})
 	if err != nil {
 		t.Fatalf("Seal foreign platform: %v", err)
 	}
@@ -486,7 +487,7 @@ func TestSealDeclinesNonCanonicalE2E(t *testing.T) {
 	}
 	pushLayoutImage(t, registry, "registry.example.com/team/decline:input", lay)
 
-	_, err = ociseal.Seal(context.Background(), "registry.example.com/team/decline@"+lay.Root.String(), ociseal.Options{Tag: "sealed"})
+	_, err = ociremote.Seal(context.Background(), "registry.example.com/team/decline@"+lay.Root.String(), ociremote.Options{Tag: "sealed"})
 	if !errors.Is(err, ociseal.ErrNotCanonical) {
 		t.Fatalf("Seal err = %v, want ErrNotCanonical", err)
 	}
