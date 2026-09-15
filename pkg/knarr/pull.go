@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/distribution/reference"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -311,17 +311,31 @@ func (e *engine) resolveLocalRef(ctx context.Context, ref string) (digest.Digest
 // equivalent ref (a short name, a missing tag, a non-Docker-Hub host, or
 // name@digest) resolves to the same record. A bare digest is already
 // canonical and passes through unchanged; everything else is canonicalized
-// through the OCI reference grammar, which folds a short name like "ubuntu"
-// to its fully qualified form (e.g. "index.docker.io/library/ubuntu:latest").
+// through the OCI distribution reference grammar, which folds a short name
+// like "ubuntu" to its fully qualified form. Two spellings are fixed on top of
+// that grammar because stored keys depend on them: Docker Hub is spelled
+// "index.docker.io" (so "ubuntu" becomes
+// "index.docker.io/library/ubuntu:latest"), and a digest-pinned reference is
+// keyed as name@digest with any tag dropped, since the digest alone names the
+// content.
 func normalizeRef(ref string) (string, error) {
 	if looksLikeBareDigest(ref) {
 		return ref, nil
 	}
-	r, err := name.ParseReference(ref)
+	named, err := reference.ParseNormalizedNamed(ref)
 	if err != nil {
 		return "", fmt.Errorf("normalize ref %s: %w", ref, err)
 	}
-	return r.Name(), nil
+	var key string
+	if canonical, ok := named.(reference.Canonical); ok {
+		key = reference.TrimNamed(named).String() + "@" + canonical.Digest().String()
+	} else {
+		key = reference.TagNameOnly(named).String()
+	}
+	if rest, ok := strings.CutPrefix(key, "docker.io/"); ok {
+		key = "index.docker.io/" + rest
+	}
+	return key, nil
 }
 
 func parseDigestPinnedRef(ref string) (digest.Digest, error) {

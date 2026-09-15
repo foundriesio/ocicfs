@@ -3,6 +3,7 @@ module github.com/foundriesio/knarr
 go 1.26
 
 require (
+	github.com/distribution/reference v0.6.0
 	github.com/erofs/go-erofs v0.3.1
 	github.com/google/go-containerregistry v0.22.1
 	github.com/klauspost/compress v1.19.2

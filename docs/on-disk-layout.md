@@ -130,6 +130,12 @@ One JSON file per reference, keyed by `sha256(ref)` where `ref` is the engine's
 normalized form of whatever string the caller passed to `pull` (a bare digest
 passes through unchanged; anything else is canonicalized through the OCI
 reference grammar, e.g. `ubuntu` becomes `index.docker.io/library/ubuntu:latest`).
+Two spellings are fixed on top of that grammar: Docker Hub is spelled
+`index.docker.io` (so `docker.io/foo` and `foo` both key as
+`index.docker.io/library/foo:latest`), and a digest-pinned reference is keyed
+as `name@digest` with any tag dropped (`host/app:v1@sha256:…` keys as
+`host/app@sha256:…`). A name must satisfy the OCI distribution reference
+grammar; a malformed one is rejected rather than recorded.
 This lets a short or differently-formed alias and its fully qualified
 equivalent converge on the same record. It maps a human ref to what it
 resolved to, for `ls`, provenance, and tag→digest naming — it is **not** a

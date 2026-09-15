@@ -46,7 +46,7 @@ in JSON it carries the holder:
 ```sh
 knarr ls --format json
 # [
-#   {"ref":"docker.io/library/nginx:latest","digest":"sha256:...","size":481,"holder":"cfs-build-..."}
+#   {"ref":"index.docker.io/library/nginx:latest","digest":"sha256:...","size":481,"holder":"cfs-build-..."}
 # ]
 ```
 
