@@ -44,7 +44,7 @@ func gcEngine(t *testing.T, unique string) (Engine, string, octest.Layout) {
 		t.Skip("mkcomposefs not found in PATH")
 	}
 
-	eng, err := New(Config{Root: storeRoot})
+	eng, err := New(registryConfig(storeRoot))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

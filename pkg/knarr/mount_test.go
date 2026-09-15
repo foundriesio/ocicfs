@@ -616,7 +616,7 @@ func TestMountSealedIgnoresTamperedBinding(t *testing.T) {
 	}
 	ref := "registry.example.com/team/sealed@" + sealed.Sealed.String()
 
-	eng, err := New(Config{Root: storeRoot})
+	eng, err := New(registryConfig(storeRoot))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -674,7 +674,7 @@ func TestMountSealedRefusesRepointedBinding(t *testing.T) {
 	}
 	ref := "registry.example.com/team/sealed@" + sealed.Sealed.String()
 
-	eng, err := New(Config{Root: storeRoot})
+	eng, err := New(registryConfig(storeRoot))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -747,7 +747,7 @@ func TestMountSealedFallbackIgnoresTamperedBinding(t *testing.T) {
 	}
 	ref := "registry.example.com/team/model@" + sealed.Sealed.String()
 
-	eng, err := New(Config{Root: storeRoot})
+	eng, err := New(registryConfig(storeRoot))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

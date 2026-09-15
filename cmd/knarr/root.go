@@ -4,12 +4,15 @@
 package main
 
 import (
+	"context"
 	"io"
 	"log/slog"
 
+	"github.com/opencontainers/go-digest"
 	"github.com/spf13/cobra"
 
 	"github.com/foundriesio/knarr/internal/cli"
+	"github.com/foundriesio/knarr/internal/ociremote"
 	"github.com/foundriesio/knarr/pkg/knarr"
 	"github.com/foundriesio/knarr/pkg/version"
 )
@@ -34,7 +37,13 @@ type globalOptions struct {
 // options; a subcommand with settings of its own adds them before
 // constructing the engine.
 func (g *globalOptions) config() knarr.Config {
-	return knarr.Config{Root: g.root, OverlayRoot: g.overlayRoot}
+	return knarr.Config{
+		Root:        g.root,
+		OverlayRoot: g.overlayRoot,
+		RegistrySource: func(ctx context.Context, ref string) (knarr.BlobSource, digest.Digest, error) {
+			return ociremote.Open(ctx, ref)
+		},
+	}
 }
 
 // engine constructs the knarr engine from the resolved global options.

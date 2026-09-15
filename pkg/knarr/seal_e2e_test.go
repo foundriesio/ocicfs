@@ -57,7 +57,7 @@ func TestSealPullMountE2E(t *testing.T) {
 	}
 	ref := "registry.example.com/team/sealed@" + sealed.Sealed.String()
 
-	eng, err := New(Config{Root: storeRoot})
+	eng, err := New(registryConfig(storeRoot))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -197,7 +197,7 @@ func TestSealedPullRejectsTamperedAnnotationsE2E(t *testing.T) {
 			ref := "registry.example.com/team/tamper@" + root.String()
 			pushRawManifest(t, registry, ref, raw, ocispec.MediaTypeImageManifest)
 
-			eng, err := New(Config{Root: storeRoot})
+			eng, err := New(registryConfig(storeRoot))
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -244,7 +244,7 @@ func TestSealFallbackE2E(t *testing.T) {
 	}
 
 	ref := "registry.example.com/team/model@" + sealed.Sealed.String()
-	eng, err := New(Config{Root: storeRoot})
+	eng, err := New(registryConfig(storeRoot))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -423,7 +423,7 @@ func TestSealedIndexMultiArchPassthroughE2E(t *testing.T) {
 	}
 
 	ref := repo + "@" + sealed.Sealed.String()
-	eng, err := New(Config{Root: storeRoot})
+	eng, err := New(registryConfig(storeRoot))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -533,7 +533,7 @@ func TestSealedNonCanonicalPullFailsClosedE2E(t *testing.T) {
 	ref := "registry.example.com/team/uncanon@" + root.String()
 	pushRawManifest(t, registry, ref, raw, ocispec.MediaTypeImageManifest)
 
-	eng, err := New(Config{Root: storeRoot})
+	eng, err := New(registryConfig(storeRoot))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

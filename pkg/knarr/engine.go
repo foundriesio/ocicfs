@@ -151,19 +151,21 @@ type Build interface {
 // PullOptions is the resolved configuration a Pull acts on. Callers pass the
 // With* options to Pull, which apply to a zero PullOptions. Exactly one
 // source feeds a pull: FromDir, BlobSource, or — when neither is set — the
-// registry the reference names; setting both is an error.
+// engine's configured RegistrySource; setting both options is an error.
 type PullOptions struct {
 	// FromDir sources content from an OCI image layout directory instead of a
-	// registry (air-gapped sideload). Empty means pull from a registry.
+	// registry (air-gapped sideload). Empty leaves source selection to the
+	// other options or the engine's RegistrySource.
 	FromDir string
 	// BlobSource sources every blob from the caller instead of a registry or a
-	// layout directory. Nil means the reference is pulled from its own source.
+	// layout directory. Nil leaves source selection to FromDir or the engine's
+	// RegistrySource.
 	BlobSource BlobSource
 	// ResolvedRoot is the root digest the pull anchors on, for a caller that
 	// has already resolved the reference. Empty means no caller-supplied
 	// resolution, like the zero value of every other field here: a pinned
-	// reference then carries its digest, and a registry pull resolves a tag
-	// itself.
+	// reference then carries its digest, and a configured RegistrySource
+	// resolves a tag itself.
 	ResolvedRoot digest.Digest
 	// Hold names a holder the pull records on the image's identity digest
 	// instead of a reference record for ref. Empty means the reference is
@@ -174,16 +176,16 @@ type PullOptions struct {
 // PullOption opts a Pull into a particular behaviour.
 type PullOption func(*PullOptions)
 
-// WithFromDir sources content from an OCI image layout directory instead of a
-// registry (air-gapped sideload).
+// WithFromDir sources content from an OCI image layout directory instead of
+// the engine's RegistrySource (air-gapped sideload).
 func WithFromDir(dir string) PullOption {
 	return func(o *PullOptions) { o.FromDir = dir }
 }
 
 // WithBlobSource reads every blob of the pull — root, manifest, config, and
-// layers — from src instead of fetching them from a registry. The reference
-// must pin the root digest unless WithResolvedRoot supplies it. It cannot be
-// combined with WithFromDir.
+// layers — from src instead of the engine's RegistrySource. The reference must
+// pin the root digest unless WithResolvedRoot supplies it. It cannot be combined
+// with WithFromDir.
 func WithBlobSource(src BlobSource) PullOption {
 	return func(o *PullOptions) { o.BlobSource = src }
 }
@@ -191,7 +193,7 @@ func WithBlobSource(src BlobSource) PullOption {
 // WithResolvedRoot anchors the pull on a root digest the caller resolved
 // itself, so a reference that pins no digest — a tag — can still be pulled.
 // The reference is then recorded only as an alias for that digest, exactly as
-// a registry tag resolution records it, so a later local lookup of the
+// a RegistrySource tag resolution records it, so a later local lookup of the
 // reference finds the image. The digest need not be the one the reference
 // pins: a caller may pull a platform manifest out of an index-pinned
 // reference, and doing so stores the same image, under the same identity, as
@@ -349,11 +351,12 @@ type Engine interface {
 	// it to dest.
 	Publish(ctx context.Context, dir, dest string) error
 	// Pull fetches ref into the local store, transferring only content the
-	// store does not already hold, and returns the stored image. A registry
-	// ref may be digest-pinned (the digest is the trust anchor) or tagged, in
-	// which case the tag is resolved to the digest the registry currently
-	// serves and recorded only as a reference alias; a sideload ref must be
-	// digest-pinned. A reference landing on an image index is descended, inside
+	// store does not already hold, and returns the stored image. Registry
+	// resolution requires Config.RegistrySource. A registry ref may be
+	// digest-pinned (the digest is the trust anchor) or tagged, in which case
+	// the tag is resolved to the digest the registry currently serves and
+	// recorded only as a reference alias; a sideload ref must be digest-pinned.
+	// A reference landing on an image index is descended, inside
 	// the index's own verified bytes, to the manifest it offers for the host
 	// platform: that manifest is the image's identity and the digest the
 	// returned Image reports, so pulling one image by its index and by its
@@ -364,7 +367,8 @@ type Engine interface {
 	// and verifies the metadata chain up front, and returns a Build to feed
 	// layers to; Pull is NewBuild followed by Finish. The store is held
 	// against gc from NewBuild until the build's Finish or Close, so gc
-	// reports ErrStoreBusy for the build's whole lifetime.
+	// reports ErrStoreBusy for the build's whole lifetime. Registry resolution
+	// requires Config.RegistrySource.
 	NewBuild(ctx context.Context, ref string, opts ...PullOption) (Build, error)
 	// Mount mounts ref at target: a single read-only composefs mount by
 	// default, a writable overlay over that composefs base when a writable
@@ -457,6 +461,11 @@ type Engine interface {
 type Config struct {
 	// Root is the knarr data directory holding the content-addressed store.
 	Root string
+	// RegistrySource opens a registry reference for Pull and NewBuild when the
+	// caller gives no blob source or layout directory. Nil means the engine has
+	// no registry: such a pull fails with ErrNoRegistry. The knarr CLI sets it;
+	// an embedder that feeds blobs itself leaves it nil.
+	RegistrySource func(ctx context.Context, ref string) (BlobSource, digest.Digest, error)
 	// OverlayRoot is the default base directory under which a writable mount's
 	// per-mount upperdir and workdir are allocated. Empty defaults to a
 	// directory under Root. A per-mount WithOverlayRoot overrides it.
@@ -473,13 +482,14 @@ const DefaultIngestWorkers = 2
 
 // engine is the default Engine backed by a local knarr data root.
 type engine struct {
-	root        string
-	overlayRoot string
-	obj         *objectstore.Store
-	img         *imagestore.Store
-	refs        *refstore.Store
-	holds       *holdstore.Store
-	slots       chan struct{} // caps the layer scans running at once across all builds
+	root           string
+	registrySource func(context.Context, string) (BlobSource, digest.Digest, error)
+	overlayRoot    string
+	obj            *objectstore.Store
+	img            *imagestore.Store
+	refs           *refstore.Store
+	holds          *holdstore.Store
+	slots          chan struct{} // caps the layer scans running at once across all builds
 }
 
 // New returns an Engine backed by the store under cfg.Root, creating the
@@ -512,7 +522,8 @@ func New(cfg Config) (Engine, error) {
 		return nil, fmt.Errorf("knarr: open hold store: %w", err)
 	}
 	return &engine{
-		root: cfg.Root, overlayRoot: cfg.OverlayRoot, obj: obj, img: img, refs: refs, holds: holds,
+		root: cfg.Root, registrySource: cfg.RegistrySource, overlayRoot: cfg.OverlayRoot,
+		obj: obj, img: img, refs: refs, holds: holds,
 		slots: make(chan struct{}, workers),
 	}, nil
 }

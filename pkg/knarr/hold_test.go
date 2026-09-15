@@ -269,7 +269,7 @@ func seedHeldImage(t *testing.T, root string) (Engine, digest.Digest, string) {
 	lay := seedChainImage(t, root, "registry.example.com/app@%s", []octest.LayerSpec{
 		{Files: []octest.File{{Name: "a", Mode: 0o644, Body: "one"}}},
 	}, nil)
-	eng, err := New(Config{Root: root})
+	eng, err := New(registryConfig(root))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

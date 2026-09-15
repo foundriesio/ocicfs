@@ -9,6 +9,10 @@ import "errors"
 // implemented.
 var ErrNotImplemented = errors.New("not implemented")
 
+// ErrNoRegistry reports that a pull requiring registry resolution has no
+// RegistrySource configured on the engine.
+var ErrNoRegistry = errors.New("no registry source configured")
+
 // ErrNotFound reports that an image is not present in the local store for the
 // requested platform.
 var ErrNotFound = errors.New("image not found in local store")

@@ -731,7 +731,7 @@ func storedBindings(t *testing.T, storeRoot string) []digest.Digest {
 // newEngine returns an engine over storeRoot.
 func newEngine(t *testing.T, storeRoot string) Engine {
 	t.Helper()
-	eng, err := New(Config{Root: storeRoot})
+	eng, err := New(registryConfig(storeRoot))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

@@ -30,6 +30,7 @@ import (
 	"github.com/foundriesio/knarr/internal/imagestore"
 	"github.com/foundriesio/knarr/internal/objectstore"
 	"github.com/foundriesio/knarr/internal/ocilayout"
+	"github.com/foundriesio/knarr/internal/ociremote"
 	"github.com/foundriesio/knarr/internal/ociseal"
 	"github.com/foundriesio/knarr/internal/octest"
 	"github.com/foundriesio/knarr/internal/rootfs"
@@ -69,6 +70,45 @@ func TestParseDigestPinnedRef(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Fatalf("digest = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPullSourceValidatesRegistryResult(t *testing.T) {
+	root := digest.SHA256.FromString("root")
+	other := digest.SHA256.FromString("other")
+	ref := "registry.example.com/team/app@" + root.String()
+	src := &memBlobSource{}
+	tests := []struct {
+		name           string
+		registrySource func(context.Context, string) (BlobSource, digest.Digest, error)
+		wantErr        string
+	}{
+		{
+			"nil source",
+			func(context.Context, string) (BlobSource, digest.Digest, error) { return nil, root, nil },
+			"nil blob source",
+		},
+		{
+			"malformed root",
+			func(context.Context, string) (BlobSource, digest.Digest, error) { return src, "sha256:bad", nil },
+			"invalid digest",
+		},
+		{
+			"mismatched pin",
+			func(context.Context, string) (BlobSource, digest.Digest, error) { return src, other, nil },
+			"want pinned digest " + root.String(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotSource, gotRoot, err := pullSource(context.Background(), ref, PullOptions{}, tt.registrySource)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("pullSource error = %v, want it to contain %q", err, tt.wantErr)
+			}
+			if gotSource != nil || gotRoot != "" {
+				t.Fatalf("pullSource = (%v, %s), want rejected zero result", gotSource, gotRoot)
 			}
 		})
 	}
@@ -161,7 +201,7 @@ func TestPullInspectRemoveDifferentAliasE2E(t *testing.T) {
 	remoteImage, _ := registryHostImage(t, 1)
 	root := pushRegistryImage(t, "index.docker.io", "library/app", remoteImage, tr)
 
-	eng, err := New(Config{Root: storeRoot})
+	eng, err := New(registryConfig(storeRoot))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -199,7 +239,7 @@ func TestPullInspectRemoveDifferentAliasE2E(t *testing.T) {
 }
 
 func TestPullRegistryRejectsBareDigestAndMalformedRef(t *testing.T) {
-	eng, err := New(Config{Root: t.TempDir()})
+	eng, err := New(registryConfig(t.TempDir()))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -223,6 +263,17 @@ func TestPullRegistryRejectsBareDigestAndMalformedRef(t *testing.T) {
 	}
 }
 
+func TestPullWithoutRegistrySource(t *testing.T) {
+	eng, err := New(Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = eng.Pull(context.Background(), "registry.example.com/team/app:latest")
+	if !errors.Is(err, ErrNoRegistry) {
+		t.Fatalf("Pull error = %v, want ErrNoRegistry", err)
+	}
+}
+
 func TestPullRegistryMissingRootNotLocalNotFound(t *testing.T) {
 	storeRoot, cleanup, err := devtest.VerityRoot()
 	if errors.Is(err, devtest.ErrNoVerity) {
@@ -237,7 +288,7 @@ func TestPullRegistryMissingRootNotLocalNotFound(t *testing.T) {
 	t.Cleanup(reg.Close)
 	useRemoteDefaultTransport(t, reg.Transport())
 
-	eng, err := New(Config{Root: storeRoot})
+	eng, err := New(registryConfig(storeRoot))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -374,7 +425,7 @@ func TestPullRegistryE2ESkipsExistingImage(t *testing.T) {
 	ref := "registry.example.com/team/app@" + root.String()
 	aliasRef := "registry.example.com/team/alias@" + root.String()
 
-	eng, err := New(Config{Root: storeRoot})
+	eng, err := New(registryConfig(storeRoot))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -959,6 +1010,17 @@ type (
 		Size      int64         `json:"size"`
 	}
 )
+
+// registryConfig returns an engine Config over root whose registry source is
+// ociremote.Open.
+func registryConfig(root string) Config {
+	return Config{
+		Root: root,
+		RegistrySource: func(ctx context.Context, ref string) (BlobSource, digest.Digest, error) {
+			return ociremote.Open(ctx, ref)
+		},
+	}
+}
 
 func useRemoteDefaultTransport(t *testing.T, tr http.RoundTripper) {
 	t.Helper()

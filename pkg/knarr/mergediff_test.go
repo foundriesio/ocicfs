@@ -103,7 +103,7 @@ func TestMountMatchesFlattenedImageE2E(t *testing.T) {
 	root := pushRegistryImage(t, "registry.example.com", "team/diff", img, reg.Transport())
 	ref := "registry.example.com/team/diff@" + root.String()
 
-	eng, err := New(Config{Root: storeRoot})
+	eng, err := New(registryConfig(storeRoot))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

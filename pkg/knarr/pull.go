@@ -21,7 +21,6 @@ import (
 	"github.com/foundriesio/knarr/internal/objectstore"
 	"github.com/foundriesio/knarr/internal/ocichain"
 	"github.com/foundriesio/knarr/internal/ocilayout"
-	"github.com/foundriesio/knarr/internal/ociremote"
 	"github.com/foundriesio/knarr/internal/ociseal"
 	"github.com/foundriesio/knarr/internal/refstore"
 )
@@ -70,13 +69,13 @@ func (e *engine) recordRuntimeRef(ref string, root, identity ocispec.Descriptor,
 }
 
 // pullSource picks where a pull reads its blobs from and the root digest it
-// anchors on: a registry, which resolves a tag to the digest it currently
-// serves; a local OCI image layout directory; or a source the caller supplied.
-// The latter two fetch nothing and so cannot resolve a tag, which is why the
-// reference must pin the root digest — unless the caller resolved it and passed
-// it in, in which case that digest is the anchor and the reference is left to
-// the ref store as an alias for it.
-func pullSource(ctx context.Context, ref string, cfg PullOptions) (ocichain.BlobSource, digest.Digest, error) {
+// anchors on: the engine's registry source, which may resolve a tag to the
+// digest it currently serves; a local OCI image layout directory; or a source
+// the caller supplied. The latter two fetch nothing and so cannot resolve a tag,
+// which is why the reference must pin the root digest — unless the caller
+// resolved it and passed it in, in which case that digest is the anchor and the
+// reference is left to the ref store as an alias for it.
+func pullSource(ctx context.Context, ref string, cfg PullOptions, registrySource func(context.Context, string) (BlobSource, digest.Digest, error)) (ocichain.BlobSource, digest.Digest, error) {
 	switch {
 	case cfg.BlobSource != nil && cfg.FromDir != "":
 		return nil, "", errors.New("a blob source and a layout directory are mutually exclusive")
@@ -105,7 +104,29 @@ func pullSource(ctx context.Context, ref string, cfg PullOptions) (ocichain.Blob
 		return src, root, nil
 
 	default:
-		return ociremote.Open(ctx, ref)
+		if registrySource == nil {
+			return nil, "", ErrNoRegistry
+		}
+		src, root, err := registrySource(ctx, ref)
+		if err != nil {
+			return nil, "", err
+		}
+		if src == nil {
+			return nil, "", errors.New("registry source returned a nil blob source")
+		}
+		if err := digestutil.ValidateSHA256(root); err != nil {
+			return nil, "", fmt.Errorf("registry source returned an invalid root: %w", err)
+		}
+		if strings.Contains(ref, "@") {
+			pinned, err := parseDigestPinnedRef(ref)
+			if err != nil {
+				return nil, "", err
+			}
+			if root != pinned {
+				return nil, "", fmt.Errorf("registry source resolved %s to %s, want pinned digest %s", ref, root, pinned)
+			}
+		}
+		return src, root, nil
 	}
 }
 

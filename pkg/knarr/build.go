@@ -95,7 +95,7 @@ func (e *engine) newBuild(ctx context.Context, ref string, opts ...PullOption) (
 		return nil, err
 	}
 
-	src, root, err := pullSource(ctx, ref, cfg)
+	src, root, err := pullSource(ctx, ref, cfg, e.registrySource)
 	if err != nil {
 		return nil, err
 	}
