@@ -475,14 +475,44 @@ func scanLayer(ctx context.Context, sink ObjectSink, layer io.Reader, diffID dig
 	return l, nil
 }
 
-// scanHeader converts one tar entry into a record: a whiteout or opaque marker
-// by its base name, otherwise by type — a regular file of at most
-// composefs.InlineContentMax bytes has its bytes read inline, a larger one
-// streams from tr into the object sink (recording its content digest and
-// pending fs-verity digest), a hardlink keeps its normalized target, and the
-// remaining types become metadata-only nodes. Every node carries the tar
-// entry's modification time.
+// scanHeader converts one tar entry into a record, capturing a regular file's
+// content: a file of at most composefs.InlineContentMax bytes has its bytes
+// read inline, a larger one streams from tr into the object sink (recording
+// its content digest and pending fs-verity digest).
 func scanHeader(ctx context.Context, sink ObjectSink, tr *tar.Reader, hdr *tar.Header, name string, idx int) (record, error) {
+	return recordFromHeader(hdr, name, idx, func(n *node) error {
+		if hdr.Size <= composefs.InlineContentMax {
+			// A small file is inlined into the EROFS metadata: read its bytes (the
+			// tar reader caps the read at the entry size) and skip the object store.
+			content, err := io.ReadAll(tr)
+			if err != nil {
+				return fmt.Errorf("read inline content for %s: %w", name, err)
+			}
+			n.content = content
+			n.size = int64(len(content))
+			return nil
+		}
+		if sink == nil {
+			return errors.New("regular file requires object sink")
+		}
+		d, sealed, err := sink.WriteObject(ctx, tr)
+		if err != nil {
+			return fmt.Errorf("write object for %s: %w", name, err)
+		}
+		n.digest = d
+		n.sealed = sealed
+		n.size = hdr.Size
+		return nil
+	})
+}
+
+// recordFromHeader converts one layer entry, described by its tar header and
+// normalized name, into a record: a whiteout or opaque marker by its base
+// name, otherwise by type — a regular file's node has its payload filled in by
+// payload, a hardlink keeps its normalized target, and the remaining types
+// become metadata-only nodes. Every node carries the entry's modification
+// time.
+func recordFromHeader(hdr *tar.Header, name string, idx int, payload func(*node) error) (record, error) {
 	dir, base := splitPath(name)
 	switch {
 	case base == ".wh..wh..opq":
@@ -499,27 +529,9 @@ func scanHeader(ctx context.Context, sink ObjectSink, tr *tar.Reader, hdr *tar.H
 	switch hdr.Typeflag {
 	case tar.TypeReg, '\x00': // '\x00' is the legacy regular-file flag (formerly tar.TypeRegA)
 		rec.n = nodeFromHeader(hdr, 0, idx)
-		if hdr.Size <= composefs.InlineContentMax {
-			// A small file is inlined into the EROFS metadata: read its bytes (the
-			// tar reader caps the read at the entry size) and skip the object store.
-			content, err := io.ReadAll(tr)
-			if err != nil {
-				return record{}, fmt.Errorf("read inline content for %s: %w", name, err)
-			}
-			rec.n.content = content
-			rec.n.size = int64(len(content))
-			return rec, nil
+		if err := payload(rec.n); err != nil {
+			return record{}, err
 		}
-		if sink == nil {
-			return record{}, errors.New("regular file requires object sink")
-		}
-		d, sealed, err := sink.WriteObject(ctx, tr)
-		if err != nil {
-			return record{}, fmt.Errorf("write object for %s: %w", name, err)
-		}
-		rec.n.digest = d
-		rec.n.sealed = sealed
-		rec.n.size = hdr.Size
 	case tar.TypeLink:
 		target, err := normalizeName(hdr.Linkname)
 		if err != nil {

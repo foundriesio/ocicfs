@@ -184,6 +184,8 @@ CASES = {
     "dir-replaced-by-file": [[d("./"), d("usr/"), d("dir/"), reg("dir/x", BIG)], [reg("dir", BIG + b"file\n")]],
     # Names that need normalization.
     "normalize": [[d("./"), d("usr/"), d("./a/"), reg("./a//b", BIG), reg("a/./c", BIG + b"c\n")]],
+    # An extended attribute with an empty value is kept, in the tar and in the TOC.
+    "empty-xattr": [[d("./"), d("usr/"), reg("usr/f", BIG, xattrs={"security.capability": ""})]],
     # No /usr and a /run that is a file: both canonical divergences.
     "noncanonical": [[d("./"), reg("run", BIG), reg("f", BIG)]],
 }
