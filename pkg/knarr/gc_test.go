@@ -229,6 +229,7 @@ func TestGCInUseTransitiveProtection(t *testing.T) {
 		t.Fatalf("Unmount: %v", err)
 	}
 	mounted = false
+	waitImageLockFree(t, storeRoot, image)
 
 	report, err = eng.GC(ctx)
 	if err != nil {
