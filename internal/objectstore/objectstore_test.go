@@ -707,3 +707,131 @@ func TestWriteObjectSymlinkAtObjectPath(t *testing.T) {
 		t.Fatal("expected resolveExisting to refuse a symlink at the object path")
 	}
 }
+
+// TestResolveObject asserts a present object resolves to its measured
+// fs-verity digest without being written again, and that resolving repairs the
+// crash state "object committed, view link missing".
+func TestResolveObject(t *testing.T) {
+	s := newVerityStore(t)
+	d, fsv, err := writeObject(t, s, context.Background(), strings.NewReader("resolve me in place"))
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("WriteObject: %v", err)
+	}
+	viewPath := s.viewPath(strings.TrimPrefix(fsv, "sha256:"))
+	if err := os.Remove(viewPath); err != nil {
+		t.Fatalf("remove view name: %v", err)
+	}
+
+	got, size, err := s.ResolveObject(d)
+	if err != nil {
+		t.Fatalf("ResolveObject: %v", err)
+	}
+	if got != fsv {
+		t.Fatalf("ResolveObject = %q, want %q", got, fsv)
+	}
+	if want := int64(len("resolve me in place")); size != want {
+		t.Fatalf("ResolveObject size = %d, want %d", size, want)
+	}
+	sameInode(t, s.objectPath(d.Hex()), viewPath)
+	tempDirEmpty(t, s)
+}
+
+// TestResolveObjectAbsent asserts an absent object is told apart from a broken
+// one, so a caller knows to fetch it.
+func TestResolveObjectAbsent(t *testing.T) {
+	s := newTestStore(t)
+	if _, _, err := s.ResolveObject(digest.FromString("never written")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ResolveObject(absent) = %v, want os.ErrNotExist", err)
+	}
+	if _, _, err := s.ResolveObject("sha256:short"); err == nil || errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ResolveObject(malformed digest) = %v, want a validation error", err)
+	}
+}
+
+// TestResolveObjectRejectsNonRegular asserts a directory or a symlink at the
+// object path is store corruption, not an absent object, and that no view link
+// is made through the symlink even when it points at sealed bytes.
+func TestResolveObjectRejectsNonRegular(t *testing.T) {
+	s := newVerityStore(t)
+	d, fsv, err := writeObject(t, s, context.Background(), strings.NewReader("object behind a symlink"))
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("WriteObject: %v", err)
+	}
+	objPath := s.objectPath(d.Hex())
+	viewPath := s.viewPath(strings.TrimPrefix(fsv, "sha256:"))
+	if err := os.Remove(viewPath); err != nil {
+		t.Fatalf("remove view link: %v", err)
+	}
+	if err := os.Rename(objPath, objPath+".real"); err != nil {
+		t.Fatalf("move object aside: %v", err)
+	}
+	if err := os.Symlink(objPath+".real", objPath); err != nil {
+		t.Fatalf("symlink object path: %v", err)
+	}
+	if _, _, err := s.ResolveObject(d); err == nil || errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ResolveObject(symlink) = %v, want a non-ErrNotExist error", err)
+	}
+	if _, err := os.Lstat(viewPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("view link must not be made through a symlink: lstat err = %v", err)
+	}
+
+	dirDigest := digest.FromString("a directory sits here")
+	if err := os.MkdirAll(s.objectPath(dirDigest.Hex()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.ResolveObject(dirDigest); err == nil || errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ResolveObject(directory) = %v, want a non-ErrNotExist error", err)
+	}
+}
+
+// TestResolveOrWriteConverges races several pulls at one absent object, each
+// resolving it if present and writing it if not: all must end with the same
+// fs-verity digest, one object, its view link, and no temp left.
+func TestResolveOrWriteConverges(t *testing.T) {
+	s := newVerityStore(t)
+	ctx := context.Background()
+	_, _, err := s.WriteObject(ctx, bytes.NewReader([]byte("verity probe")))
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("WriteObject prime: %v", err)
+	}
+
+	content := []byte("content several pulls want at once")
+	d := digest.FromBytes(content)
+	const pulls = 8
+	errs := make([]error, pulls)
+	fsvs := make([]string, pulls)
+	var wg sync.WaitGroup
+	wg.Add(pulls)
+	for i := range pulls {
+		go func(i int) {
+			defer wg.Done()
+			fsvs[i], _, errs[i] = s.ResolveObject(d)
+			if !errors.Is(errs[i], os.ErrNotExist) {
+				return
+			}
+			w := s.NewWriter(ctx)
+			sealed, err := w.WriteExpected(ctx, d, bytes.NewReader(content))
+			if closeErr := w.Close(); err == nil {
+				err = closeErr
+			}
+			if err == nil {
+				fsvs[i], err = sealed()
+			}
+			errs[i] = err
+		}(i)
+	}
+	wg.Wait()
+	for i := range pulls {
+		if errs[i] != nil {
+			t.Fatalf("pull %d: %v", i, errs[i])
+		}
+		if fsvs[i] != fsvs[0] {
+			t.Fatalf("pull %d fs-verity = %q, pull 0 has %q", i, fsvs[i], fsvs[0])
+		}
+	}
+	sameInode(t, s.objectPath(d.Hex()), s.viewPath(strings.TrimPrefix(fsvs[0], "sha256:")))
+	tempDirEmpty(t, s)
+}

@@ -415,27 +415,12 @@ func (s *Store) WriteObject(ctx context.Context, r io.Reader) (digest.Digest, Se
 // root over the file's content, so a match proves byte-for-byte content
 // identity and that the existing object was sealed with the same fs-verity
 // parameters; an O(1) metadata read replaces a full re-hash of the existing
-// bytes. The path is opened without following symlinks and must be a regular
-// file: a view link made through anything else would put mutable indirection
-// under the fs-verity view. Ensuring the view link repairs an object a crash
-// left committed but unlinked.
+// bytes. Ensuring the view link repairs an object a crash left committed but
+// unlinked.
 func (s *Store) resolveExisting(path string, stagedFsv string) (string, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0) // #nosec G304 -- digest-derived object-store path
+	fsv, _, err := measureExisting(path)
 	if err != nil {
-		return "", fmt.Errorf("objectstore: open existing %s: %w", path, err)
-	}
-	defer func() { _ = f.Close() }()
-	fi, err := f.Stat()
-	if err != nil {
-		return "", fmt.Errorf("objectstore: stat existing %s: %w", path, err)
-	}
-	if !fi.Mode().IsRegular() {
-		return "", fmt.Errorf("objectstore: existing %s is not a regular file", path)
-	}
-
-	fsv, err := verity.Measure(f)
-	if err != nil {
-		return "", fmt.Errorf("objectstore: cannot measure fs-verity for %s: %w", path, err)
+		return "", err
 	}
 	if fsv != stagedFsv {
 		return "", fmt.Errorf("objectstore: collision at %s but fs-verity digest mismatch: existing %s, staged %s", path, fsv, stagedFsv)
@@ -444,6 +429,31 @@ func (s *Store) resolveExisting(path string, stagedFsv string) (string, error) {
 		return "", err
 	}
 	return fsv, nil
+}
+
+// measureExisting returns the measured fs-verity digest and the size of the
+// object already at path. The path is opened without following symlinks and
+// must be a regular file: a view link made through anything else would put
+// mutable indirection under the fs-verity view. A missing path surfaces as an
+// error satisfying errors.Is(err, os.ErrNotExist).
+func measureExisting(path string) (string, int64, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0) // #nosec G304 -- digest-derived object-store path
+	if err != nil {
+		return "", 0, fmt.Errorf("objectstore: open existing %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		return "", 0, fmt.Errorf("objectstore: stat existing %s: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return "", 0, fmt.Errorf("objectstore: existing %s is not a regular file", path)
+	}
+	fsv, err := verity.Measure(f)
+	if err != nil {
+		return "", 0, fmt.Errorf("objectstore: cannot measure fs-verity for %s: %w", path, err)
+	}
+	return fsv, fi.Size(), nil
 }
 
 // WriteBlob commits a metadata blob whose bytes must hash to expected, sealing it
@@ -499,6 +509,27 @@ func (s *Store) VerityDigest(d digest.Digest) (string, error) {
 	defer func() { _ = f.Close() }()
 
 	return verity.Measure(f)
+}
+
+// ResolveObject returns the measured fs-verity digest and the size of the
+// stored object d and ensures its view link, so an object the store already
+// holds can be referenced without staging its bytes again. Ensuring the link
+// repairs an object a crash left committed but unlinked. The object path is
+// opened without following symlinks and must be a regular file. An absent
+// object surfaces as an error satisfying errors.Is(err, os.ErrNotExist).
+func (s *Store) ResolveObject(d digest.Digest) (string, int64, error) {
+	path, err := s.ObjectPath(d)
+	if err != nil {
+		return "", 0, err
+	}
+	fsv, size, err := measureExisting(path)
+	if err != nil {
+		return "", 0, err
+	}
+	if err := s.linkView(path, fsv); err != nil {
+		return "", 0, err
+	}
+	return fsv, size, nil
 }
 
 // Sync flushes the store's filesystem with a single syncfs so every object
