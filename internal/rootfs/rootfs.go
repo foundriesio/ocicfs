@@ -50,14 +50,31 @@ type ObjectSink interface {
 }
 
 // Builder assembles one composefs image from layers handed to it one at a
-// time. Between layers it holds only the merged tree: every stored object of a
-// layer is sealed and its fs-verity digest resolved before the Scan that
-// produced it returns, so nothing the caller's context owns outlives the call.
+// time. A scanned layer arrives complete: every stored object of it is sealed
+// and its fs-verity digest resolved before the Scan that produced it returns.
+// A layer made from a table of contents arrives with its payloads pending;
+// once every layer is merged, Missing resolves the payloads the store already
+// holds and names the rest, and Supply takes their bytes. From Missing until
+// Finish or Close the builder owns a sealing writer bound to the context
+// Missing was given. Merge, Missing, Supply and Finish are called from one
+// goroutine, in that order.
 type Builder struct {
 	store *objectstore.Store
 	m     *merge
 	next  int  // index of the next layer Merge expects
 	spent bool // Finish or Close has run, or a Merge failed
+
+	w       *objectstore.Writer       // seals supplied payloads; open from Missing until Finish or Close
+	cancel  context.CancelFunc        // cancels w's context
+	pending map[digest.Digest][]*node // the payloads Missing returned that Supply has not seen yet
+}
+
+// Payload is a regular file the merged tree references and the store lacks.
+// One of at most composefs.InlineContentMax bytes is inlined into the image;
+// a larger one is stored as an object.
+type Payload struct {
+	Digest digest.Digest
+	Size   int64
 }
 
 // errBuilderSpent reports a call on a Builder that has finished, been closed,
@@ -75,8 +92,9 @@ func NewBuilder(store *objectstore.Store) *Builder {
 // writer opened for this call and closed before it returns. Scan is
 // independent of the builder's lifetime: it touches no builder state but the
 // store, so scans of different layers may run concurrently, and one may run
-// after Close or Finish, when its Layer can no longer be merged; only Merge,
-// which applies layers in index order, and Finish refuse a spent builder.
+// after Close or Finish, when its Layer can no longer be merged; Merge, which
+// applies layers in index order, Missing, Supply and Finish refuse a spent
+// builder.
 func (b *Builder) Scan(ctx context.Context, layer io.Reader, diffID digest.Digest, idx int) (_ *Layer, err error) {
 	// Objects are sealed on the writer's background worker while the layer walk
 	// goes on producing them. Defers run last-in first-out: on an error return
@@ -118,6 +136,9 @@ func (b *Builder) Merge(l *Layer) error {
 	if b.spent {
 		return errBuilderSpent
 	}
+	if b.w != nil {
+		return errors.New("rootfs: Merge called after Missing")
+	}
 	if l.idx != b.next {
 		b.spent = true
 		return fmt.Errorf("rootfs: merge layer %d, expected layer %d", l.idx, b.next)
@@ -130,14 +151,150 @@ func (b *Builder) Merge(l *Layer) error {
 	return nil
 }
 
+// Missing resolves every pending stored payload the store already holds and
+// returns the rest, one per unique digest, in path order of the merged tree.
+// Only payloads that survived the merge are considered. An inline payload is
+// always returned, never resolved from the store: its bytes belong in the
+// image, and the same bytes held as some object do not put them there.
+// Resolving a held object also ensures its view link. Missing is called once,
+// after the last Merge; it opens the writer that seals supplied payloads under
+// ctx.
+func (b *Builder) Missing(ctx context.Context) ([]Payload, error) {
+	if b.spent {
+		return nil, errBuilderSpent
+	}
+	if b.w != nil {
+		return nil, errors.New("rootfs: Missing called twice")
+	}
+	paths := make([]string, 0, len(b.m.tree))
+	for p := range b.m.tree {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	// A payload node is reached through every name of its inode, and may have
+	// lost its own name to a whiteout, so nodes are deduplicated by identity.
+	seen := make(map[*node]bool)
+	pending := make(map[digest.Digest][]*node)
+	var order []Payload
+	for _, p := range paths {
+		n := b.m.tree[p]
+		if n.link != nil {
+			n = n.link
+		}
+		if seen[n] || n.digest == "" || n.verity != "" {
+			continue
+		}
+		seen[n] = true
+		if nodes := pending[n.digest]; len(nodes) == 0 {
+			order = append(order, Payload{Digest: n.digest, Size: n.size})
+		} else if nodes[0].size != n.size {
+			return nil, fmt.Errorf("rootfs: payload %s is listed with sizes %d and %d", n.digest, nodes[0].size, n.size)
+		}
+		pending[n.digest] = append(pending[n.digest], n)
+	}
+
+	var missing []Payload
+	for _, p := range order {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("rootfs: %w", err)
+		}
+		if p.Size <= composefs.InlineContentMax {
+			missing = append(missing, p)
+			continue
+		}
+		fsv, size, err := b.store.ResolveObject(p.Digest)
+		if errors.Is(err, os.ErrNotExist) {
+			missing = append(missing, p)
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("rootfs: resolve payload %s: %w", p.Digest, err)
+		}
+		// The size goes into the image, so it must be the object's.
+		if size != p.Size {
+			return nil, fmt.Errorf("rootfs: payload %s is listed with %d bytes but the stored object has %d", p.Digest, p.Size, size)
+		}
+		verity, err := digestutil.ParseSHA256(fsv)
+		if err != nil {
+			return nil, fmt.Errorf("rootfs: parse fs-verity digest for %s: %w", p.Digest, err)
+		}
+		for _, n := range pending[p.Digest] {
+			n.verity = verity
+		}
+		delete(pending, p.Digest)
+	}
+
+	wctx, cancel := context.WithCancel(ctx)
+	b.w, b.cancel, b.pending = b.store.NewWriter(wctx), cancel, pending
+	return missing, nil
+}
+
+// Supply hands the builder the uncompressed bytes of p, a payload Missing
+// returned. The bytes must hash to p.Digest. A stored payload is staged on the
+// calling goroutine and sealed in the background; an inline payload must be
+// exactly p.Size bytes and becomes the content of every file that names it. A
+// stored payload of another size is refused as well, though the store keeps
+// its object, which is the one its digest names. A failed Supply leaves p
+// missing, so it may be supplied again, unless sealing failed: that fails every
+// later Supply of a stored payload, and Finish.
+func (b *Builder) Supply(ctx context.Context, p Payload, r io.Reader) error {
+	if b.spent {
+		return errBuilderSpent
+	}
+	nodes := b.pending[p.Digest]
+	if len(nodes) == 0 || nodes[0].size != p.Size {
+		return fmt.Errorf("rootfs: payload %s of %d bytes is not missing", p.Digest, p.Size)
+	}
+	if p.Size <= composefs.InlineContentMax {
+		// One byte past the size tells a longer stream from an exact one.
+		content, err := io.ReadAll(io.LimitReader(&ctxReader{ctx: ctx, r: r}, p.Size+1))
+		if err != nil {
+			return fmt.Errorf("rootfs: read inline payload %s: %w", p.Digest, err)
+		}
+		if int64(len(content)) != p.Size {
+			return fmt.Errorf("rootfs: inline payload %s is not the expected %d bytes", p.Digest, p.Size)
+		}
+		if got := digest.FromBytes(content); got != p.Digest {
+			return fmt.Errorf("rootfs: inline payload digest mismatch: expected %s, got %s", p.Digest, got)
+		}
+		for _, n := range nodes {
+			n.content = content
+			n.digest = ""
+		}
+	} else {
+		counted := &countReader{r: &ctxReader{ctx: ctx, r: r}}
+		sealed, err := b.w.WriteExpected(ctx, p.Digest, counted)
+		if err != nil {
+			return fmt.Errorf("rootfs: write payload %s: %w", p.Digest, err)
+		}
+		// The bytes are the object the digest names, so the store keeps it, but
+		// the size that would go into the image is not the object's.
+		if counted.n != p.Size {
+			return fmt.Errorf("rootfs: payload %s is listed with %d bytes but has %d", p.Digest, p.Size, counted.n)
+		}
+		for _, n := range nodes {
+			n.sealed = sealed
+		}
+	}
+	delete(b.pending, p.Digest)
+	return nil
+}
+
 // Finish assembles the merged entries, writes the composefs image, stores it
-// in CAS, and returns its descriptor plus measured fs-verity digest. The
-// builder is spent afterwards.
+// in CAS, and returns its descriptor plus measured fs-verity digest. It first
+// waits for every supplied payload to be sealed; a pending payload that was
+// never supplied is an error. The builder is spent afterwards.
 func (b *Builder) Finish(ctx context.Context) (Image, error) {
 	if b.spent {
 		return Image{}, errBuilderSpent
 	}
 	b.spent = true
+	if err := b.closeWriter(); err != nil {
+		return Image{}, err
+	}
+	if err := b.m.resolve(); err != nil {
+		return Image{}, err
+	}
 	entries, canonical, err := b.m.entries()
 	if err != nil {
 		return Image{}, err
@@ -145,11 +302,34 @@ func (b *Builder) Finish(ctx context.Context) (Image, error) {
 	return storeImage(ctx, b.store, entries, canonical)
 }
 
-// Close marks a build that will not finish as spent: Merge and Finish refuse
-// it from then on; Scan does not depend on it. There is nothing to cancel: no
-// goroutine outlives a Scan. Idempotent; a no-op after Finish.
+// Close marks a build that will not finish as spent: Merge, Missing, Supply
+// and Finish refuse it from then on; Scan does not depend on it. If Missing
+// opened the sealing writer, Close cancels it, so payloads still queued are
+// discarded rather than sealed, and waits for its worker to stop: no goroutine
+// and no staged temp outlives Close. Idempotent; a no-op after Finish.
 func (b *Builder) Close() {
 	b.spent = true
+	if b.w == nil {
+		return
+	}
+	b.cancel()
+	err := b.closeWriter()
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		slog.Warn("rootfs: abandoned build failed to seal a payload", "err", err)
+	}
+}
+
+// closeWriter closes the sealing writer, if Missing opened one and it is still
+// open, waiting for every queued payload to be sealed or discarded, and
+// returns the first error the batch hit.
+func (b *Builder) closeWriter() error {
+	if b.w == nil {
+		return nil
+	}
+	err := b.w.Close()
+	b.cancel()
+	b.w = nil
+	return err
 }
 
 // Assemble merges decompressed layer tar streams, writes regular files larger
@@ -356,10 +536,30 @@ func (m *merge) mergeRecord(rec record, idx int) error {
 	return err
 }
 
+// resolve waits for every payload in the tree that is still being sealed and
+// records its fs-verity digest. A payload with neither content nor an
+// fs-verity digest afterwards was never supplied, which is an error.
+func (m *merge) resolve() error {
+	for name, n := range m.tree {
+		if n.link != nil {
+			n = n.link
+		}
+		if n.sealed != nil {
+			if err := resolveNode(name, n); err != nil {
+				return err
+			}
+		}
+		if n.digest != "" && n.verity == "" {
+			return fmt.Errorf("rootfs: payload %s of %s was never supplied", n.digest, name)
+		}
+	}
+	return nil
+}
+
 // entries synthesises any missing parent directories, applies the canonical
 // tree transforms, and returns the merged composefs inventory. The bool
 // reports whether the tree was built without any divergence. Every stored
-// payload's sealed digest is resolved before its layer is merged.
+// payload's fs-verity digest is resolved by then.
 func (m *merge) entries() ([]composefs.Entry, bool, error) {
 	synthesized, err := ensureParents(m.tree)
 	if err != nil {
@@ -996,6 +1196,18 @@ func cloneXattrs(in map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// countReader counts the bytes read through it.
+type countReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // ctxReader aborts an in-progress read once ctx is cancelled, so a large layer
