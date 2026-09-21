@@ -5,6 +5,7 @@ package objectstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -85,26 +86,18 @@ func (s *Store) NewWriter(ctx context.Context) *Writer {
 // confirms the existing object's measured fs-verity digest matches the staged
 // one, as the synchronous path does, and Sealed reports that object's digest.
 func (w *Writer) WriteObject(ctx context.Context, r io.Reader) (digest.Digest, Sealed, error) {
-	if err := w.ctx.Err(); err != nil {
-		return "", nil, w.firstErrOr(fmt.Errorf("objectstore: %w", err))
+	return w.write(ctx, "", r)
+}
+
+// WriteExpected is WriteObject for content whose digest is known in advance:
+// r's bytes must hash to expect. On a mismatch the staged temp is discarded
+// before it is queued, so nothing is sealed or committed.
+func (w *Writer) WriteExpected(ctx context.Context, expect digest.Digest, r io.Reader) (Sealed, error) {
+	if expect == "" {
+		return nil, errors.New("objectstore: WriteExpected needs the expected digest")
 	}
-	tempPath, d, err := w.s.stage(w.ctx, ".object-*", "", r)
-	if err != nil {
-		return "", nil, w.firstErrOr(err)
-	}
-	job := &sealJob{temp: tempPath, d: d, done: make(chan struct{})}
-	// The temp is the caller's until the send succeeds and the worker's after;
-	// exactly one select arm wins, so exactly one side removes it.
-	select {
-	case w.jobs <- job:
-	case <-w.ctx.Done():
-		removeTemp(tempPath)
-		return "", nil, w.firstErrOr(fmt.Errorf("objectstore: %w", w.ctx.Err()))
-	case <-ctx.Done():
-		removeTemp(tempPath)
-		return "", nil, w.firstErrOr(fmt.Errorf("objectstore: %w", ctx.Err()))
-	}
-	return d, w.sealed(job), nil
+	_, sealed, err := w.write(ctx, expect, r)
+	return sealed, err
 }
 
 // Close stops accepting objects, waits for every queued one to be sealed or
@@ -123,6 +116,31 @@ func (w *Writer) Close() error {
 		w.cancel()
 	})
 	return w.firstErr()
+}
+
+// write stages r's bytes, which must hash to expect when it is non-empty, and
+// queues the temp for sealing.
+func (w *Writer) write(ctx context.Context, expect digest.Digest, r io.Reader) (digest.Digest, Sealed, error) {
+	if err := w.ctx.Err(); err != nil {
+		return "", nil, w.firstErrOr(fmt.Errorf("objectstore: %w", err))
+	}
+	tempPath, d, err := w.s.stage(w.ctx, ".object-*", expect, r)
+	if err != nil {
+		return "", nil, w.firstErrOr(err)
+	}
+	job := &sealJob{temp: tempPath, d: d, done: make(chan struct{})}
+	// The temp is the caller's until the send succeeds and the worker's after;
+	// exactly one select arm wins, so exactly one side removes it.
+	select {
+	case w.jobs <- job:
+	case <-w.ctx.Done():
+		removeTemp(tempPath)
+		return "", nil, w.firstErrOr(fmt.Errorf("objectstore: %w", w.ctx.Err()))
+	case <-ctx.Done():
+		removeTemp(tempPath)
+		return "", nil, w.firstErrOr(fmt.Errorf("objectstore: %w", ctx.Err()))
+	}
+	return d, w.sealed(job), nil
 }
 
 // run is the worker: it seals queued temps in order until the queue is closed.

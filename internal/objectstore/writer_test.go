@@ -244,3 +244,55 @@ func TestWriterCancelDiscardsQueue(t *testing.T) {
 		}
 	}
 }
+
+// TestWriterWriteExpected asserts content hashing to the expected digest is
+// stored exactly as WriteObject would store it, and that content hashing to
+// anything else is rejected while staged: no temp, no object, and the writer
+// stays usable.
+func TestWriterWriteExpected(t *testing.T) {
+	s := newVerityStore(t)
+	ctx := context.Background()
+	_, _, err := s.WriteObject(ctx, bytes.NewReader([]byte("probe")))
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("WriteObject probe: %v", err)
+	}
+
+	w := s.NewWriter(ctx)
+	defer func() { _ = w.Close() }()
+	if _, err := w.WriteExpected(ctx, "", bytes.NewReader(nil)); err == nil {
+		t.Fatal("WriteExpected accepted an empty expected digest")
+	}
+
+	wrong := []byte("not the expected content")
+	expected := []byte("the expected content")
+	d := digest.FromBytes(expected)
+	if _, err := w.WriteExpected(ctx, d, bytes.NewReader(wrong)); err == nil {
+		t.Fatal("WriteExpected accepted content with another digest")
+	}
+	tempDirEmpty(t, s)
+
+	sealed, err := w.WriteExpected(ctx, d, bytes.NewReader(expected))
+	if err != nil {
+		t.Fatalf("WriteExpected: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	tempDirEmpty(t, s)
+	fsv, err := sealed()
+	if err != nil {
+		t.Fatalf("Sealed: %v", err)
+	}
+	measured, err := s.VerityDigest(d)
+	if err != nil {
+		t.Fatalf("VerityDigest: %v", err)
+	}
+	if fsv == "" || fsv != measured {
+		t.Fatalf("fs-verity = %q, measured %q", fsv, measured)
+	}
+	sameInode(t, s.objectPath(d.Hex()), s.viewPath(fsv[len("sha256:"):]))
+	if ok, err := s.Has(digest.FromBytes(wrong)); err != nil || ok {
+		t.Fatalf("Has(rejected content) = %v, %v; want false", ok, err)
+	}
+}
