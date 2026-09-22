@@ -64,6 +64,7 @@ REGDIR=""
 IMGDIR=""
 EXPORTDIR=""
 GCOVL=""
+DSTORE=""
 
 cleanup() {
 	set +e
@@ -83,6 +84,7 @@ cleanup() {
 	[ -n "$STORE" ] && rm -rf "$STORE"
 	[ -n "$MNT" ] && rm -rf "$MNT"
 	[ -n "$EXPORTDIR" ] && rm -rf "$EXPORTDIR"
+	[ -n "$DSTORE" ] && rm -rf "$DSTORE"
 }
 trap cleanup EXIT
 
@@ -500,4 +502,71 @@ printf '%s\n' "$out"
 [ "$(printf '%s' "$out" | jq -r .objectsRemoved)" -gt 0 ] || fail "gc after plain unmount reclaimed nothing"
 [ -z "$(find "$STORE/objects/sha256" -type f)" ] || fail "objects remain in an empty store"
 
-echo "SMOKE OK: purpose-built image sealed, cross-checked four ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding, and a gc round (unwanted reclaimed, in-use survives until unmount on both mount paths, empty store fully reclaimed down to its shard directories) (checks passed)"
+echo "==== delta: pull N, hold it, pull N+1 by ranges, compare, release, remove, gc ===="
+# Two releases sharing their base layer, published zstd:chunked: N+1 changes
+# one inline file, removes one file and adds one, so its delta is a couple of
+# ranges. The fixtures are linux/amd64 images; a host of another
+# architecture cannot pull them.
+if [ "$(go env GOARCH)" = amd64 ]; then
+	fixtures=internal/zstdchunked/testdata
+	crane push "$fixtures/release-n" "127.0.0.1:$port/release:n"
+	crane push "$fixtures/release-n1" "127.0.0.1:$port/release:n1"
+	ndigest="$(jq -r '.manifests[0].digest' "$fixtures/release-n/index.json")"
+	n1digest="$(jq -r '.manifests[0].digest' "$fixtures/release-n1/index.json")"
+	nref="127.0.0.1:$port/release@$ndigest"
+	n1ref="127.0.0.1:$port/release@$n1digest"
+	# app/old is the one file only N carries; its object must go with N.
+	oldhex="$(printf 'this file is bigger than sixty-four bytes so it is stored as an object.\nold\n' | sha256sum | cut -d' ' -f1)"
+	oldobj="$STORE/objects/sha256/${oldhex:0:2}/${oldhex:2}"
+
+	echo "== pull --delta N into the empty store, hold it as delta-base =="
+	"${KN[@]}" pull --delta "$nref"
+	[ -f "$oldobj" ] || fail "N's app/old object is not in the store after the delta pull"
+	"${KN[@]}" hold --holder delta-base "$nref"
+
+	echo "== pull --delta N+1 (expect every layer by ranges, fewer bytes than the layers) =="
+	dlog="$(mktemp)"
+	"${KN[@]}" pull --delta "$n1ref" 2>"$dlog"
+	cat "$dlog"
+	applayer="$(jq -r '.layers[1].digest' "$fixtures/release-n1/blobs/sha256/${n1digest#sha256:}")"
+	grep -E "msg=\"delta: layer\" layer=$applayer .* requests=[1-9][0-9]* .* fallback=none" "$dlog" >/dev/null \
+		|| fail "the app layer was not fetched by ranges"
+	[ "$(grep -c 'msg="delta: layer"' "$dlog")" -eq 2 ] || fail "expected one delta log line per layer"
+	if grep 'msg="delta: layer"' "$dlog" | grep -qv 'fallback=none'; then fail "a layer fell back to a whole fetch"; fi
+	summary="$(grep 'msg="delta: pull"' "$dlog")"
+	[ -n "$summary" ] || fail "no delta summary line logged"
+	fetched="$(sed -n 's/.* fetched=\([0-9]*\).*/\1/p' <<<"$summary")"
+	size="$(sed -n 's/.* size=\([0-9]*\).*/\1/p' <<<"$summary")"
+	[ "$fetched" -gt 0 ] && [ "$fetched" -lt "$size" ] || fail "delta pull fetched $fetched of $size layer bytes"
+	rm -f "$dlog"
+
+	echo "== plain pull of N+1 into a second store (expect the same composefs image) =="
+	DSTORE="$(mktemp -d /var/lib/knarr/smoke-delta-XXXXXX)"
+	bin/knarr --root "$DSTORE" pull "$n1ref"
+	dinspect="$("${KN[@]}" inspect --format json "$n1ref")"
+	pinspect="$(bin/knarr --root "$DSTORE" inspect --format json "$n1ref")"
+	[ "$(jq -r .composefs.digest <<<"$dinspect")" = "$(jq -r .composefs.digest <<<"$pinspect")" ] \
+		|| fail "the delta pull built a different composefs image than the plain pull"
+	[ "$(jq -r .fsverity <<<"$dinspect")" = "$(jq -r .fsverity <<<"$pinspect")" ] \
+		|| fail "the delta pull's fsverity digest differs from the plain pull's"
+	rm -rf "$DSTORE"
+	DSTORE=""
+
+	echo "== release delta-base, remove N, gc (expect N's own object gone, N+1 intact) =="
+	"${KN[@]}" release --holder delta-base "$nref"
+	"${KN[@]}" remove "$nref"
+	out="$("${KN[@]}" gc --format json)"
+	printf '%s\n' "$out"
+	[ "$(printf '%s' "$out" | jq -r .objectsRemoved)" -gt 0 ] || fail "gc reclaimed nothing of N"
+	[ ! -e "$oldobj" ] || fail "N's app/old object survived gc"
+	"${KN[@]}" mount "$n1ref" "$MNT"
+	[ "$(cat "$MNT/app/config")" = "v=2" ] || fail "N+1's app/config is not the delta-fetched content"
+	cat "$MNT/app/new" >/dev/null || fail "reading N+1's app/new after gc failed"
+	[ ! -e "$MNT/app/old" ] || fail "N+1 still shows app/old"
+	"${KN[@]}" unmount "$MNT"
+	"${KN[@]}" remove "$n1ref"
+else
+	echo "== skipped: the delta fixtures are linux/amd64 images =="
+fi
+
+echo "SMOKE OK: purpose-built image sealed, cross-checked four ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding, a gc round (unwanted reclaimed, in-use survives until unmount on both mount paths, empty store fully reclaimed down to its shard directories), and a delta round (N+1 pulled by ranges over a held N, identical to a plain pull, N reclaimed once released and removed) (checks passed)"
