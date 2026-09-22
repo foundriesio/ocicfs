@@ -30,6 +30,20 @@ type BlobSource interface {
 	Open(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error)
 }
 
+// RangeSource serves n bytes of a blob starting at offset off. The caller
+// passes off >= 0, n >= 0 and off+n <= desc.Size; a source rejects anything
+// else. A source that answers a range request with the whole blob reports
+// whole=true and the entire stream verified against desc, which the caller
+// consumes instead of the range. Either reader aborts once ctx is cancelled.
+//
+// No verification of a range's bytes is possible at this layer: a range is
+// authenticated by what is built from it (a table of contents by its own
+// checksum, a file by the digest that table records), never by the blob
+// digest, which only covers the whole blob.
+type RangeSource interface {
+	OpenRange(ctx context.Context, desc ocispec.Descriptor, off, n int64) (r io.ReadCloser, whole bool, err error)
+}
+
 // Resolved is the verified descriptor chain and authenticated metadata.
 type Resolved struct {
 	RootDesc      ocispec.Descriptor
@@ -98,27 +112,32 @@ func Resolve(ctx context.Context, src BlobSource, root digest.Digest, want ocisp
 // Only the compressed descriptor digest is verified here; the diff_id and any
 // per-file checks belong to the step that materializes the layer.
 func OpenLayer(ctx context.Context, src BlobSource, desc ocispec.Descriptor) (io.ReadCloser, error) {
-	if src == nil {
-		return nil, errors.New("ocichain: nil blob source")
-	}
-	if err := ctx.Err(); err != nil {
+	br, err := openVerifiedBlob(ctx, src, desc)
+	if err != nil {
 		return nil, err
 	}
-
-	r, err := src.Open(ctx, desc)
-	if err != nil {
-		return nil, fmt.Errorf("ocichain: OpenLayer open source: %w", err)
-	}
-
-	// ctxReader makes a long read abort promptly on cancellation.
-	rc, err := newVerifyingLayerReader(&ctxReader{ctx: ctx, r: r}, desc, r)
-	if err != nil {
-		if closeErr := r.Close(); closeErr != nil {
+	if err := br.decompress(); err != nil {
+		if closeErr := br.Close(); closeErr != nil {
 			return nil, errors.Join(err, fmt.Errorf("ocichain: OpenLayer close source: %w", closeErr))
 		}
 		return nil, err
 	}
-	return rc, nil
+	return br, nil
+}
+
+// OpenBlob opens the blob named by desc and returns a streaming reader over its
+// raw bytes, as stored: a compressed layer is not decompressed. The reader
+// verifies the blob's digest and size against desc at end of stream, exactly as
+// OpenLayer does: a mismatch surfaces as a read error in place of a clean
+// io.EOF, so a caller that consumes to EOF is forced to observe a corrupt or
+// truncated blob. The caller must Close the returned reader, which releases the
+// source.
+func OpenBlob(ctx context.Context, src BlobSource, desc ocispec.Descriptor) (io.ReadCloser, error) {
+	br, err := openVerifiedBlob(ctx, src, desc)
+	if err != nil {
+		return nil, err
+	}
+	return br, nil
 }
 
 // ReadRootBlob reads, bounds, and digest-verifies the pinned root metadata blob
@@ -214,16 +233,16 @@ type (
 		DescribeMissingRoot(root digest.Digest, cause error) error
 	}
 
-	// verifyingLayerReader streams decompressed layer bytes and, when the
-	// underlying stream ends, drains and verifies the whole compressed blob
-	// against its descriptor.
-	verifyingLayerReader struct {
+	// verifyingBlobReader streams a blob's bytes — raw, or decompressed once
+	// decompress has installed a decoder — and, when the stream it serves
+	// ends, drains and verifies the whole raw blob against its descriptor.
+	verifyingBlobReader struct {
 		desc        ocispec.Descriptor
-		decomp      io.Reader // decompressed-content reader (the bounded source itself when uncompressed)
-		drain       io.Reader // the buffered tee over the source; draining it pushes trailing compressed bytes through the hasher
+		decomp      io.Reader     // what Read serves: the decoder, or the buffered raw blob itself when none is installed
+		drain       *bufio.Reader // the buffered tee over the source; draining it pushes trailing raw bytes through the hasher
 		hasher      hash.Hash
 		counter     *byteCounter
-		closeDecomp func() error // nil when the stream is uncompressed
+		closeDecomp func() error // nil when no decoder is installed
 		closers     []io.Closer
 		verified    bool
 		verifyErr   error
@@ -286,58 +305,77 @@ func resolveFromManifest(ctx context.Context, src BlobSource, rootDesc, manifest
 	}, nil
 }
 
-// newVerifyingLayerReader wraps a raw compressed layer stream r and returns a
-// reader over its decompressed contents that verifies the layer's compressed
-// digest and size against desc when the stream ends. r is read at most
-// desc.Size+1 bytes; every byte consumed is hashed and counted. At end of stream
-// the remaining compressed bytes are drained through the hasher — load-bearing
-// for a zstd:chunked layer, whose per-file TOC sits in a trailing skippable frame
-// the zstd decoder need not consume — and then the count and digest are checked.
-// A size or digest mismatch is surfaced as a read error in place of io.EOF, so a
-// consumer that reads to completion cannot miss a corrupt or truncated layer.
-//
-// r is source-agnostic: a local file or a remote response body work identically.
-// The returned reader's Close releases the decompressor and the supplied closers.
-func newVerifyingLayerReader(r io.Reader, desc ocispec.Descriptor, closers ...io.Closer) (io.ReadCloser, error) {
+// openVerifiedBlob opens desc from src and wraps the stream in a
+// verifyingBlobReader over its raw bytes.
+func openVerifiedBlob(ctx context.Context, src BlobSource, desc ocispec.Descriptor) (*verifyingBlobReader, error) {
+	if src == nil {
+		return nil, errors.New("ocichain: nil blob source")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if desc.Size < 0 {
-		return nil, fmt.Errorf("ocichain: layer descriptor has negative size %d", desc.Size)
+		return nil, fmt.Errorf("ocichain: blob descriptor has negative size %d", desc.Size)
 	}
 
+	r, err := src.Open(ctx, desc)
+	if err != nil {
+		return nil, fmt.Errorf("ocichain: open source: %w", err)
+	}
+	// ctxReader makes a long read abort promptly on cancellation.
+	return newVerifyingBlobReader(&ctxReader{ctx: ctx, r: r}, desc, r), nil
+}
+
+// newVerifyingBlobReader wraps a raw blob stream r in a reader over the same
+// bytes that verifies the blob's digest and size against desc when the stream
+// ends. r is read at most desc.Size+1 bytes; every byte consumed is hashed and
+// counted. A size or digest mismatch is surfaced as a read error in place of
+// io.EOF, so a consumer that reads to completion cannot miss a corrupt or
+// truncated blob.
+//
+// r is source-agnostic: a local file or a remote response body work identically.
+// The returned reader's Close releases the supplied closers.
+func newVerifyingBlobReader(r io.Reader, desc ocispec.Descriptor, closers ...io.Closer) *verifyingBlobReader {
 	h := sha256.New()
 	counter := &byteCounter{}
-	// Bound the compressed input to desc.Size+1 (so an oversized source is caught)
-	// and tee every consumed byte into the hasher and the counter.
+	// Bound the raw input to desc.Size+1 (so an oversized source is caught) and
+	// tee every consumed byte into the hasher and the counter.
 	teed := io.TeeReader(io.LimitReader(r, desc.Size+1), io.MultiWriter(h, counter))
 	br := bufio.NewReader(teed)
+	return &verifyingBlobReader{desc: desc, decomp: br, drain: br, hasher: h, counter: counter, closers: closers}
+}
 
+// decompress installs a decoder over the raw stream (gzip, zstd, or none,
+// auto-detected from the magic) so that Read serves decompressed bytes. At end
+// of the decoded stream the remaining raw bytes are drained through the hasher
+// — load-bearing for a zstd:chunked layer, whose per-file TOC sits in a
+// trailing skippable frame the zstd decoder need not consume — before the count
+// and digest are checked.
+func (lr *verifyingBlobReader) decompress() error {
 	// Peek the magic without consuming it; a stream shorter than 4 bytes peeks
 	// fewer and simply falls through to the uncompressed branch.
-	header, _ := br.Peek(4)
-
-	lr := &verifyingLayerReader{desc: desc, drain: br, hasher: h, counter: counter, closers: closers}
+	header, _ := lr.drain.Peek(4)
 	switch {
 	case len(header) >= 2 && header[0] == 0x1f && header[1] == 0x8b:
-		gr, err := gzip.NewReader(br)
+		gr, err := gzip.NewReader(lr.drain)
 		if err != nil {
-			return nil, fmt.Errorf("ocichain: OpenLayer gzip: %w", err)
+			return fmt.Errorf("ocichain: OpenLayer gzip: %w", err)
 		}
 		lr.decomp = gr
 		lr.closeDecomp = gr.Close
 	case len(header) >= 4 && header[0] == 0x28 && header[1] == 0xb5 && header[2] == 0x2f && header[3] == 0xfd:
-		zr, err := zstd.NewReader(br)
+		zr, err := zstd.NewReader(lr.drain)
 		if err != nil {
-			return nil, fmt.Errorf("ocichain: OpenLayer zstd: %w", err)
+			return fmt.Errorf("ocichain: OpenLayer zstd: %w", err)
 		}
 		lr.decomp = zr
 		// zstd.Decoder.Close releases its worker goroutines and returns nothing.
 		lr.closeDecomp = func() error { zr.Close(); return nil }
-	default:
-		lr.decomp = br
 	}
-	return lr, nil
+	return nil
 }
 
-func (lr *verifyingLayerReader) Read(p []byte) (int, error) {
+func (lr *verifyingBlobReader) Read(p []byte) (int, error) {
 	n, err := lr.decomp.Read(p)
 	if errors.Is(err, io.EOF) {
 		if vErr := lr.finish(); vErr != nil {
@@ -350,7 +388,7 @@ func (lr *verifyingLayerReader) Read(p []byte) (int, error) {
 // finish drains any trailing compressed bytes through the hasher, then checks the
 // accumulated size and digest against the descriptor. It runs once; later calls
 // return the same verdict so repeated reads at EOF are stable.
-func (lr *verifyingLayerReader) finish() error {
+func (lr *verifyingBlobReader) finish() error {
 	if lr.verified {
 		return lr.verifyErr
 	}
@@ -358,24 +396,24 @@ func (lr *verifyingLayerReader) finish() error {
 	// Drain remaining compressed input so the hash and count cover the whole blob
 	// (e.g. a zstd:chunked layer's trailing skippable TOC frame).
 	if _, err := io.Copy(io.Discard, lr.drain); err != nil {
-		lr.verifyErr = fmt.Errorf("ocichain: OpenLayer drain: %w", err)
+		lr.verifyErr = fmt.Errorf("ocichain: drain blob: %w", err)
 		return lr.verifyErr
 	}
 	switch {
 	case lr.counter.n > lr.desc.Size:
-		lr.verifyErr = fmt.Errorf("ocichain: layer source larger than descriptor size %d", lr.desc.Size)
+		lr.verifyErr = fmt.Errorf("ocichain: blob source larger than descriptor size %d", lr.desc.Size)
 	case lr.counter.n != lr.desc.Size:
-		lr.verifyErr = fmt.Errorf("ocichain: layer size mismatch: expected %d, got %d", lr.desc.Size, lr.counter.n)
+		lr.verifyErr = fmt.Errorf("ocichain: blob size mismatch: expected %d, got %d", lr.desc.Size, lr.counter.n)
 	default:
 		// NewDigest formats the hasher's accumulated sum; it does not re-hash.
 		if computed := digest.NewDigest(digest.SHA256, lr.hasher); computed.String() != lr.desc.Digest.String() {
-			lr.verifyErr = fmt.Errorf("ocichain: layer digest mismatch: expected %s, got %s", lr.desc.Digest, computed)
+			lr.verifyErr = fmt.Errorf("ocichain: blob digest mismatch: expected %s, got %s", lr.desc.Digest, computed)
 		}
 	}
 	return lr.verifyErr
 }
 
-func (lr *verifyingLayerReader) Close() error {
+func (lr *verifyingBlobReader) Close() error {
 	var err error
 	if lr.closeDecomp != nil {
 		err = errors.Join(err, lr.closeDecomp())

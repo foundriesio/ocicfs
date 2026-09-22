@@ -758,7 +758,7 @@ func TestVerifyingLayerReaderDrainsTrailingBytes(t *testing.T) {
 	teed := io.TeeReader(io.LimitReader(bytes.NewReader(src), desc.Size+1), io.MultiWriter(h, counter))
 	br := bufio.NewReader(teed)
 
-	lr := &verifyingLayerReader{
+	lr := &verifyingBlobReader{
 		desc:    desc,
 		decomp:  io.LimitReader(br, 5), // "decompressor" stops after 5 bytes, leaving the rest
 		drain:   br,
@@ -775,6 +775,74 @@ func TestVerifyingLayerReaderDrainsTrailingBytes(t *testing.T) {
 	}
 	if counter.n != int64(len(src)) {
 		t.Fatalf("hashed %d bytes, want the whole blob (%d) — drain did not cover the tail", counter.n, len(src))
+	}
+}
+
+// --- OpenBlob: raw bytes + verify-at-EOF ---
+
+// TestOpenBlobServesRawVerifiedBytes reads a gzip blob through OpenBlob and
+// gets the compressed bytes back untouched: OpenBlob never decompresses.
+func TestOpenBlobServesRawVerifiedBytes(t *testing.T) {
+	f := newFixture(t)
+	raw := gzipBytes(t, []byte("payload behind gzip"))
+	desc := f.writeBlob(raw, ocispec.MediaTypeImageLayerGzip)
+
+	rc, err := OpenBlob(context.Background(), f, desc)
+	if err != nil {
+		t.Fatalf("OpenBlob: %v", err)
+	}
+	defer closeReader(t, rc)
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, raw) {
+		t.Fatalf("OpenBlob served %d bytes, want the %d raw bytes", len(got), len(raw))
+	}
+}
+
+// TestOpenBlobMismatchSurfacesAsReadError covers the three ways a blob can
+// disagree with its descriptor: each opens fine, fails the read that reaches
+// end of stream, and closes cleanly (verification is never deferred to Close).
+func TestOpenBlobMismatchSurfacesAsReadError(t *testing.T) {
+	data := []byte("the real blob bytes")
+	tests := []struct {
+		name    string
+		served  []byte
+		size    int64
+		wantErr string
+	}{
+		{name: "short", served: data[:len(data)-3], size: int64(len(data)), wantErr: "size mismatch"},
+		{name: "long", served: append(append([]byte(nil), data...), "EXTRA"...), size: int64(len(data)), wantErr: "larger than descriptor"},
+		{name: "wrong digest", served: []byte("the fake blob bytes"), size: int64(len(data)), wantErr: "digest mismatch"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t)
+			desc := f.writeBlob(data, ocispec.MediaTypeImageLayer)
+			f.setBlob(desc.Digest, tt.served)
+			desc.Size = tt.size
+
+			rc, err := OpenBlob(context.Background(), f, desc)
+			if err != nil {
+				t.Fatalf("OpenBlob (open must succeed; verification is at EOF): %v", err)
+			}
+			if _, err := io.ReadAll(rc); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("read error = %v, want %q", err, tt.wantErr)
+			}
+			if err := rc.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+		})
+	}
+}
+
+func TestOpenBlobNegativeSizeRejected(t *testing.T) {
+	f := newFixture(t)
+	desc := f.writeBlob([]byte("content"), ocispec.MediaTypeImageLayer)
+	desc.Size = -1
+	if _, err := OpenBlob(context.Background(), f, desc); err == nil || !strings.Contains(err.Error(), "negative size") {
+		t.Fatalf("error = %v, want negative-size rejection", err)
 	}
 }
 
