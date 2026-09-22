@@ -171,6 +171,12 @@ type PullOptions struct {
 	// instead of a reference record for ref. Empty means the reference is
 	// recorded, as every plain pull does.
 	Hold string
+	// Delta fetches, of every zstd:chunked layer, only its table of contents
+	// and the files the store lacks, as byte ranges. It needs a source that
+	// serves ranges: the registry source and a layout directory do, a
+	// caller's BlobSource only when its type also implements OpenRange. It
+	// is available through Pull only.
+	Delta bool
 }
 
 // PullOption opts a Pull into a particular behaviour.
@@ -215,6 +221,20 @@ func WithResolvedRoot(root digest.Digest) PullOption {
 // image once nothing holds or names it.
 func WithHold(holder string) PullOption {
 	return func(o *PullOptions) { o.Hold = holder }
+}
+
+// WithDelta makes the pull fetch, of every zstd:chunked layer, only its
+// table of contents and the files the store lacks, as byte ranges, so an
+// update costs the bytes that changed rather than every layer whose digest
+// did. The saving depends on the previous release's files still being in
+// the store: hold that release before pulling, and release it once the new
+// one is in place. A layer without a table, or whose table cannot be read,
+// is fetched whole, as is one whose missing files would take too many or
+// too large ranges; the image built is the same either way. The pull source
+// must serve byte ranges, or the pull fails with ErrNoRangeSource; the
+// option is not available through NewBuild.
+func WithDelta() PullOption {
+	return func(o *PullOptions) { o.Delta = true }
 }
 
 // MountOptions is the resolved configuration a Mount acts on. Callers do not

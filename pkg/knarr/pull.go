@@ -18,6 +18,7 @@ import (
 
 	"github.com/foundriesio/knarr/internal/digestutil"
 	"github.com/foundriesio/knarr/internal/imagestore"
+	"github.com/foundriesio/knarr/internal/materialize"
 	"github.com/foundriesio/knarr/internal/objectstore"
 	"github.com/foundriesio/knarr/internal/ocichain"
 	"github.com/foundriesio/knarr/internal/ocilayout"
@@ -27,14 +28,43 @@ import (
 
 // Pull fetches ref into the local store and returns the stored image. It is
 // NewBuild followed by Finish: the whole-image pull and the layer-at-a-time
-// build are one path.
+// build are one path. A delta pull takes its own path from the same pieces.
 func (e *engine) Pull(ctx context.Context, ref string, opts ...PullOption) (*Image, error) {
-	b, err := e.NewBuild(ctx, ref, opts...)
+	cfg := pullOptions(opts)
+	if cfg.Delta {
+		img, err := e.pullDelta(ctx, ref, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("pull %s: %w", ref, err)
+		}
+		return img, nil
+	}
+	b, err := e.newBuild(ctx, ref, cfg)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("pull %s: %w", ref, err)
 	}
 	defer b.Close()
 	return b.Finish(ctx)
+}
+
+// pullDelta pulls ref fetching only what the store lacks of its zstd:chunked
+// layers. It opens the pull as NewBuild does, so the store is held against
+// gc from before the source is opened until the image is recorded, and
+// records the image as Finish does.
+func (e *engine) pullDelta(ctx context.Context, ref string, cfg PullOptions) (*Image, error) {
+	b, src, root, err := e.openBuild(ctx, ref, cfg)
+	if err != nil {
+		return nil, err
+	}
+	defer b.release()
+	ranges := src.(ocichain.RangeSource) // openBuild refused any other source
+	if b.cached != nil {
+		return b.finishCached(ctx)
+	}
+	built, err := materialize.Delta(ctx, e.obj, e.img, src, ranges, root, b.platform, e.slots)
+	if err != nil {
+		return nil, err
+	}
+	return b.record(built)
 }
 
 // recordRef records ref, in its normalized form, as resolving to root and

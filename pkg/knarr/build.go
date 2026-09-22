@@ -10,11 +10,13 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/foundriesio/knarr/internal/composefs"
 	"github.com/foundriesio/knarr/internal/holdstore"
 	"github.com/foundriesio/knarr/internal/materialize"
+	"github.com/foundriesio/knarr/internal/ocichain"
 )
 
 // build is the Build an engine hands out: the state of one pull between
@@ -55,24 +57,41 @@ var errBuildClosed = errors.New("build is closed")
 
 // NewBuild starts a pull whose layers are ingested on the caller's cue.
 func (e *engine) NewBuild(ctx context.Context, ref string, opts ...PullOption) (Build, error) {
-	b, err := e.newBuild(ctx, ref, opts...)
+	b, err := e.newBuild(ctx, ref, pullOptions(opts))
 	if err != nil {
 		return nil, fmt.Errorf("pull %s: %w", ref, err)
 	}
 	return b, nil
 }
 
-func (e *engine) newBuild(ctx context.Context, ref string, opts ...PullOption) (b *build, err error) {
-	var cfg PullOptions
-	for _, opt := range opts {
-		opt(&cfg)
+func (e *engine) newBuild(ctx context.Context, ref string, cfg PullOptions) (*build, error) {
+	if cfg.Delta {
+		return nil, errors.New("delta pull is not available through NewBuild")
 	}
+	b, src, root, err := e.openBuild(ctx, ref, cfg)
+	if err != nil || b.cached != nil {
+		return b, err
+	}
+	mat, err := materialize.Begin(ctx, e.obj, e.img, src, root, b.platform, e.slots)
+	if err != nil {
+		b.release()
+		return nil, err
+	}
+	b.mat = mat
+	return b, nil
+}
 
+// openBuild does what every pull does before its layers: takes the store
+// lock, picks the source and root, descends the root to the image identity,
+// and finds the image already in the store or checks the tools that build
+// it. It returns the source and root the layers come from, and the build
+// holding the lock, which the caller releases; a failure releases it here.
+func (e *engine) openBuild(ctx context.Context, ref string, cfg PullOptions) (b *build, src ocichain.BlobSource, root digest.Digest, err error) {
 	// A holder name the hold store would reject fails here, before any lock
 	// is taken or byte fetched, rather than at the end of the download.
 	if cfg.Hold != "" {
 		if err := holdstore.ValidateHolder(cfg.Hold); err != nil {
-			return nil, err
+			return nil, nil, "", err
 		}
 	}
 
@@ -84,7 +103,7 @@ func (e *engine) newBuild(ctx context.Context, ref string, opts ...PullOption) (
 	// a handle to close releases the lock here, since nothing else can.
 	unlock, err := e.lockStoreShared()
 	if err != nil {
-		return nil, err
+		return nil, nil, "", err
 	}
 	defer func() {
 		if err != nil {
@@ -92,12 +111,16 @@ func (e *engine) newBuild(ctx context.Context, ref string, opts ...PullOption) (
 		}
 	}()
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, "", err
 	}
 
-	src, root, err := pullSource(ctx, ref, cfg, e.registrySource)
+	src, root, err = pullSource(ctx, ref, cfg, e.registrySource)
 	if err != nil {
-		return nil, err
+		return nil, nil, "", err
+	}
+	// A source that cannot serve the delta fails before a byte is fetched.
+	if _, ok := src.(ocichain.RangeSource); cfg.Delta && !ok {
+		return nil, nil, "", ErrNoRangeSource
 	}
 
 	platform := hostPlatform()
@@ -106,17 +129,17 @@ func (e *engine) newBuild(ctx context.Context, ref string, opts ...PullOption) (
 	// image converge on one key.
 	desc, fetched, err := e.pullDescent(ctx, src, root, platform)
 	if err != nil {
-		return nil, err
+		return nil, nil, "", err
 	}
 	b = &build{e: e, ref: ref, desc: desc, fetched: fetched, platform: platform, hold: cfg.Hold, unlock: unlock}
 
 	cached, ok, err := verifiedPulledImage(ctx, e.obj, e.img, desc.Identity, platform)
 	if err != nil {
-		return nil, err
+		return nil, nil, "", err
 	}
 	if ok {
 		b.cached = &cached
-		return b, nil
+		return b, src, root, nil
 	}
 
 	// Finish only reaches mkcomposefs after every layer is downloaded and
@@ -124,14 +147,18 @@ func (e *engine) newBuild(ctx context.Context, ref string, opts ...PullOption) (
 	// the whole download. The cached path above never builds an image and
 	// deliberately stays usable without mkcomposefs.
 	if err := composefs.Preflight(); err != nil {
-		return nil, err
+		return nil, nil, "", err
 	}
-	mat, err := materialize.Begin(ctx, e.obj, e.img, src, root, platform, e.slots)
-	if err != nil {
-		return nil, err
+	return b, src, root, nil
+}
+
+// pullOptions applies opts to a zero PullOptions.
+func pullOptions(opts []PullOption) PullOptions {
+	var cfg PullOptions
+	for _, opt := range opts {
+		opt(&cfg)
 	}
-	b.mat = mat
-	return b, nil
+	return cfg
 }
 
 // Ingest blocks until every layer up to and including i is materialized; a
@@ -222,6 +249,12 @@ func (b *build) finish(ctx context.Context) (*Image, error) {
 	if err != nil {
 		return nil, err
 	}
+	return b.record(built)
+}
+
+// record makes a built image wanted, by its reference or hold, and returns
+// it.
+func (b *build) record(built materialize.Built) (*Image, error) {
 	holder, err := b.want(built.RootDesc, built.Identity, built.Platform)
 	if err != nil {
 		return nil, err

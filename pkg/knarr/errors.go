@@ -27,3 +27,7 @@ var ErrAlreadyMounted = errors.New("target is already mounted")
 // ErrStoreBusy reports that gc could not take the exclusive store lock
 // because a pull, hold, or mount is in progress; the caller retries.
 var ErrStoreBusy = errors.New("store busy")
+
+// ErrNoRangeSource reports that a delta pull was asked of a source that
+// cannot serve byte ranges of a blob.
+var ErrNoRangeSource = errors.New("the pull source cannot serve byte ranges")
