@@ -90,27 +90,8 @@ const retryAbsentLayer = 250 * time.Millisecond
 // slots caps the layer scans running at once across every build sharing it.
 // The caller must Finish or Close the build.
 func Begin(ctx context.Context, store *objectstore.Store, img *imagestore.Store, src ocichain.BlobSource, root digest.Digest, platform ocispec.Platform, slots chan struct{}) (*Build, error) {
-	if store == nil {
-		return nil, errors.New("materialize: nil object store")
-	}
-	if img == nil {
-		return nil, errors.New("materialize: nil image store")
-	}
-	if src == nil {
-		return nil, errors.New("materialize: nil blob source")
-	}
-	if cap(slots) == 0 {
-		return nil, errors.New("materialize: scan limiter must have a positive capacity")
-	}
-	if err := store.CheckVerity(); err != nil {
-		return nil, err
-	}
-
-	res, err := ocichain.Resolve(ctx, src, root, platform)
+	res, err := prepare(ctx, store, img, src, root, platform, slots)
 	if err != nil {
-		return nil, err
-	}
-	if err := writeMetadataBlobs(ctx, store, res); err != nil {
 		return nil, err
 	}
 	bctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
@@ -187,34 +168,7 @@ func (b *Build) Finish(ctx context.Context) (Built, error) {
 	if closed {
 		return Built{}, ErrClosed
 	}
-	built, err := b.b.Finish(ctx)
-	if err != nil {
-		return Built{}, err
-	}
-	if err := ociseal.VerifyAnnotations(ctx, b.store, b.res, built.FsverityDigest, built.Canonical); err != nil {
-		return Built{}, fmt.Errorf("materialize: verify sealing annotations: %w", err)
-	}
-
-	if err := b.store.Sync(); err != nil {
-		return Built{}, err
-	}
-	if err := b.img.Put(b.res.ManifestDesc.Digest, b.res.Platform, imagestore.Binding{
-		Descriptor:     built.Descriptor,
-		FsverityDigest: built.FsverityDigest,
-		RootfsSize:     built.RootfsSize,
-		Canonical:      built.Canonical,
-	}); err != nil {
-		return Built{}, err
-	}
-
-	return Built{
-		Root:           b.root,
-		Platform:       b.res.Platform,
-		Descriptor:     built.Descriptor,
-		FsverityDigest: built.FsverityDigest,
-		RootDesc:       b.res.RootDesc,
-		Identity:       b.res.ManifestDesc,
-	}, nil
+	return finishImage(ctx, b.store, b.img, b.root, b.res, b.b)
 }
 
 // Close abandons a build that will not finish: it stops every scan, waits for
@@ -452,6 +406,70 @@ func Materialize(ctx context.Context, store *objectstore.Store, img *imagestore.
 	}
 	defer b.Close() //nolint:errcheck // Finish reported any failure already
 	return b.Finish(ctx)
+}
+
+// prepare does what every materialization does before its first layer:
+// verifies the store can enable fs-verity, resolves root from src for
+// platform, and writes the metadata blobs.
+func prepare(ctx context.Context, store *objectstore.Store, img *imagestore.Store, src ocichain.BlobSource, root digest.Digest, platform ocispec.Platform, slots chan struct{}) (ocichain.Resolved, error) {
+	if store == nil {
+		return ocichain.Resolved{}, errors.New("materialize: nil object store")
+	}
+	if img == nil {
+		return ocichain.Resolved{}, errors.New("materialize: nil image store")
+	}
+	if src == nil {
+		return ocichain.Resolved{}, errors.New("materialize: nil blob source")
+	}
+	if cap(slots) == 0 {
+		return ocichain.Resolved{}, errors.New("materialize: scan limiter must have a positive capacity")
+	}
+	if err := store.CheckVerity(); err != nil {
+		return ocichain.Resolved{}, err
+	}
+
+	res, err := ocichain.Resolve(ctx, src, root, platform)
+	if err != nil {
+		return ocichain.Resolved{}, err
+	}
+	if err := writeMetadataBlobs(ctx, store, res); err != nil {
+		return ocichain.Resolved{}, err
+	}
+	return res, nil
+}
+
+// finishImage finishes the rootfs build, verifies the sealing annotations,
+// syncs the store, and records the binding under the resolved platform
+// manifest.
+func finishImage(ctx context.Context, store *objectstore.Store, img *imagestore.Store, root digest.Digest, res ocichain.Resolved, b *rootfs.Builder) (Built, error) {
+	built, err := b.Finish(ctx)
+	if err != nil {
+		return Built{}, err
+	}
+	if err := ociseal.VerifyAnnotations(ctx, store, res, built.FsverityDigest, built.Canonical); err != nil {
+		return Built{}, fmt.Errorf("materialize: verify sealing annotations: %w", err)
+	}
+
+	if err := store.Sync(); err != nil {
+		return Built{}, err
+	}
+	if err := img.Put(res.ManifestDesc.Digest, res.Platform, imagestore.Binding{
+		Descriptor:     built.Descriptor,
+		FsverityDigest: built.FsverityDigest,
+		RootfsSize:     built.RootfsSize,
+		Canonical:      built.Canonical,
+	}); err != nil {
+		return Built{}, err
+	}
+
+	return Built{
+		Root:           root,
+		Platform:       res.Platform,
+		Descriptor:     built.Descriptor,
+		FsverityDigest: built.FsverityDigest,
+		RootDesc:       res.RootDesc,
+		Identity:       res.ManifestDesc,
+	}, nil
 }
 
 func writeMetadataBlobs(ctx context.Context, store *objectstore.Store, res ocichain.Resolved) error {
