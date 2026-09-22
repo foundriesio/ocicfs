@@ -12,11 +12,12 @@ import (
 
 func newPullCommand(g *globalOptions) *cobra.Command {
 	var fromDir string
+	var delta bool
 	var ingestWorkers int
 	format := cli.FormatText
 
 	cmd := &cobra.Command{
-		Use:   "pull [--from-dir <dir>] [--ingest-workers <n>] <ref>",
+		Use:   "pull [--from-dir <dir>] [--delta] [--ingest-workers <n>] <ref>",
 		Short: "fetch an image into the local store",
 		Args:  cli.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -30,6 +31,9 @@ func newPullCommand(g *globalOptions) *cobra.Command {
 			if fromDir != "" {
 				opts = append(opts, knarr.WithFromDir(fromDir))
 			}
+			if delta {
+				opts = append(opts, knarr.WithDelta())
+			}
 			img, err := eng.Pull(cmd.Context(), args[0], opts...)
 			if err != nil {
 				return err
@@ -39,6 +43,7 @@ func newPullCommand(g *globalOptions) *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&fromDir, "from-dir", "", "sideload from an OCI image layout directory instead of a registry")
+	cmd.Flags().BoolVar(&delta, "delta", false, "fetch only the files the store lacks from zstd:chunked layers; hold the previous release first (see docs/pull.md)")
 	cmd.Flags().IntVar(&ingestWorkers, "ingest-workers", knarr.DefaultIngestWorkers, "layers scanned (and, from a registry, downloaded) concurrently; more than the default helps only on fast storage")
 	cli.AddFormatFlag(cmd, &format)
 	return cmd
