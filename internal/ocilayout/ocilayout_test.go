@@ -135,6 +135,82 @@ func TestSourceOpenCtxCancelledBeforeOpen(t *testing.T) {
 	}
 }
 
+func TestSourceOpenRangeServesSection(t *testing.T) {
+	f := newFixture(t)
+	blob := []byte("0123456789abcdefghij")
+	desc := f.writeBlob(blob, ocispec.MediaTypeImageLayer)
+	src := openSource(t, f.dir).(ocichain.RangeSource)
+
+	for _, r := range []struct{ off, n int64 }{{3, 5}, {0, 20}, {19, 1}, {7, 0}, {20, 0}} {
+		rc, whole, err := src.OpenRange(context.Background(), desc, r.off, r.n)
+		if err != nil {
+			t.Fatalf("OpenRange(%d, %d): %v", r.off, r.n, err)
+		}
+		if whole {
+			t.Errorf("OpenRange(%d, %d) reported whole", r.off, r.n)
+		}
+		got, err := io.ReadAll(rc)
+		closeReader(t, rc)
+		if err != nil {
+			t.Fatalf("read range (%d, %d): %v", r.off, r.n, err)
+		}
+		if want := blob[r.off : r.off+r.n]; !bytes.Equal(got, want) {
+			t.Errorf("OpenRange(%d, %d) = %q, want %q", r.off, r.n, got, want)
+		}
+	}
+}
+
+func TestSourceOpenRangeRejectsOutOfBounds(t *testing.T) {
+	f := newFixture(t)
+	desc := f.writeBlob([]byte("0123456789"), ocispec.MediaTypeImageLayer)
+	src := openSource(t, f.dir).(ocichain.RangeSource)
+
+	for _, r := range []struct{ off, n int64 }{{8, 3}, {11, 0}, {0, 11}, {-1, 2}, {2, -1}, {1, 1<<63 - 1}} {
+		if _, _, err := src.OpenRange(context.Background(), desc, r.off, r.n); err == nil {
+			t.Errorf("OpenRange(%d, %d) = nil error, want rejection", r.off, r.n)
+		}
+	}
+
+	// The descriptor bounds the range, not the file: a file longer than its
+	// descriptor does not serve bytes past the descriptor's size, and a
+	// descriptor longer than its file does not serve bytes the file lacks.
+	short := desc
+	short.Size = 4
+	if _, _, err := src.OpenRange(context.Background(), short, 5, 1); err == nil {
+		t.Error("OpenRange past the descriptor size succeeded")
+	}
+	long := desc
+	long.Size = 20
+	if _, _, err := src.OpenRange(context.Background(), long, 15, 1); err == nil {
+		t.Error("OpenRange past the file end succeeded")
+	}
+	negative := desc
+	negative.Size = -1
+	if _, _, err := src.OpenRange(context.Background(), negative, 0, 0); err == nil {
+		t.Error("OpenRange of a negative-size descriptor succeeded")
+	}
+}
+
+func TestSourceOpenRangeCtxCancelled(t *testing.T) {
+	f := newFixture(t)
+	desc := f.writeBlob([]byte("0123456789"), ocispec.MediaTypeImageLayer)
+	src := openSource(t, f.dir).(ocichain.RangeSource)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rc, _, err := src.OpenRange(ctx, desc, 2, 6)
+	if err != nil {
+		t.Fatalf("OpenRange: %v", err)
+	}
+	defer closeReader(t, rc)
+	cancel()
+	if _, err := io.ReadAll(rc); !errors.Is(err, context.Canceled) {
+		t.Fatalf("read error = %v, want context.Canceled", err)
+	}
+	if _, _, err := src.OpenRange(ctx, desc, 2, 6); !errors.Is(err, context.Canceled) {
+		t.Fatalf("OpenRange error = %v, want context.Canceled at open", err)
+	}
+}
+
 // TestResolveMissingRootListsIndex covers the common single-platform-export
 // case where the pinned digest is absent but index.json points at a platform
 // manifest present in the layout.
