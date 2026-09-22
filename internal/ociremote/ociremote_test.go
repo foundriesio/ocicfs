@@ -261,7 +261,7 @@ func testSource(t *testing.T, host, repo string, root digest.Digest, tr http.Rou
 	if err != nil {
 		t.Fatalf("puller: %v", err)
 	}
-	return &source{repo: r, root: root, puller: puller}
+	return &source{repo: r, root: root, puller: puller, transport: tr}
 }
 
 func hostPlatform() ocispec.Platform {

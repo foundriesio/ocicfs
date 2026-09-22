@@ -13,8 +13,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -161,7 +165,7 @@ func Open(ctx context.Context, ref string) (ocichain.BlobSource, digest.Digest, 
 	if err := digestutil.ValidateSHA256(root); err != nil {
 		return nil, "", fmt.Errorf("ociremote: %w", err)
 	}
-	return &source{repo: repo, root: root, puller: puller}, root, nil
+	return &source{repo: repo, root: root, puller: puller, transport: remote.DefaultTransport}, root, nil
 }
 
 // RequireSecureRegistry rejects a repository whose registry would be contacted
@@ -183,9 +187,18 @@ type (
 	}
 
 	source struct {
-		repo   name.Repository
-		root   digest.Digest
-		puller *remote.Puller
+		repo      name.Repository
+		root      digest.Digest
+		puller    *remote.Puller
+		transport http.RoundTripper // the base transport range requests are built on
+
+		mu      sync.Mutex
+		rangeTr http.RoundTripper // the authenticated transport range requests go through, built on first use
+	}
+
+	// bodySource hands an already fetched response body to OpenBlob's verifier.
+	bodySource struct {
+		body io.ReadCloser
 	}
 )
 
@@ -233,10 +246,265 @@ func (s *source) Open(ctx context.Context, desc ocispec.Descriptor) (io.ReadClos
 	return rc, nil
 }
 
+// OpenRange fetches n bytes of desc's blob starting at off with one HTTP Range
+// request to the blobs endpoint. A registry that ignores the Range header
+// answers 200 with the whole blob; that stream is returned verified against
+// desc, with whole=true. A 206 answer must cover exactly the requested span of
+// a blob of desc.Size, and a redirect to blob storage carries the Range header
+// along, but not to a private or link-local address literal. Any other answer
+// is an error.
+func (s *source) OpenRange(ctx context.Context, desc ocispec.Descriptor, off, n int64) (io.ReadCloser, bool, error) {
+	if err := digestutil.ValidateSHA256(desc.Digest); err != nil {
+		return nil, false, fmt.Errorf("ociremote: blob digest: %w", err)
+	}
+	if off < 0 || n < 0 || off > desc.Size || n > desc.Size-off {
+		return nil, false, fmt.Errorf("ociremote: range %d+%d exceeds blob %s of size %d", off, n, desc.Digest, desc.Size)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if n == 0 {
+		// A Range header cannot express an empty span; there is nothing to fetch.
+		return io.NopCloser(bytes.NewReader(nil)), false, nil
+	}
+
+	tr, err := s.rangeTransport(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("ociremote: range transport for %s: %w", s.repo.Name(), err)
+	}
+	u := fmt.Sprintf("%s://%s/v2/%s/blobs/%s", s.repo.Scheme(), s.repo.RegistryStr(), s.repo.RepositoryStr(), desc.Digest)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("ociremote: range request for %s: %w", desc.Digest, err)
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, off+n-1))
+	resp, err := (&http.Client{Transport: tr, CheckRedirect: checkRedirect}).Do(req)
+	if err != nil {
+		return nil, false, fmt.Errorf("ociremote: fetch range of %s: %w", desc.Digest, redactURL(err))
+	}
+
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		if err := checkPartialContent(resp, off, n, desc.Size); err != nil {
+			return nil, false, closeBody(resp.Body, fmt.Errorf("ociremote: range of %s: %w", desc.Digest, err))
+		}
+		return &exactReader{body: resp.Body, remaining: n}, false, nil
+	case http.StatusOK:
+		rc, err := ocichain.OpenBlob(ctx, bodySource{body: resp.Body}, desc)
+		if err != nil {
+			return nil, false, closeBody(resp.Body, err)
+		}
+		return rc, true, nil
+	default:
+		err := transport.CheckError(resp, http.StatusPartialContent, http.StatusOK)
+		return nil, false, closeBody(resp.Body, notFoundOr(fmt.Errorf("ociremote: fetch range of %s: %w", desc.Digest, err), err, desc.Digest))
+	}
+}
+
 // DescribeMissingRoot renders an actionable error for a pinned root digest the
 // registry does not serve.
 func (s *source) DescribeMissingRoot(root digest.Digest, _ error) error {
 	return fmt.Errorf("ociremote: root %s is not present in registry %s; verify the pinned digest and that the image is pushed and pullable", root, s.repo.Name())
+}
+
+// rangeTransport returns the authenticated transport range requests go through,
+// building it on first use: the constructor pings the registry and performs the
+// token exchange, so it runs once per source rather than once per range. A
+// failed build is not remembered; the next call tries again.
+func (s *source) rangeTransport(ctx context.Context) (http.RoundTripper, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rangeTr != nil {
+		return s.rangeTr, nil
+	}
+	auth, err := authn.Resolve(ctx, authn.DefaultKeychain, s.repo)
+	if err != nil {
+		return nil, err
+	}
+	tr, err := transport.NewWithContext(ctx, s.repo.Registry, auth, s.transport, []string{s.repo.Scope(transport.PullScope)})
+	if err != nil {
+		return nil, err
+	}
+	s.rangeTr = transport.NewRetry(tr, transport.WithRetryStatusCodes(retryStatusCodes...))
+	return s.rangeTr, nil
+}
+
+// retryStatusCodes are the answers a range request is retried on: the
+// registry is momentarily unavailable or rate-limiting, and the request has
+// no body to replay.
+var retryStatusCodes = []int{
+	http.StatusRequestTimeout,
+	http.StatusTooManyRequests,
+	http.StatusInternalServerError,
+	http.StatusBadGateway,
+	http.StatusServiceUnavailable,
+	http.StatusGatewayTimeout,
+}
+
+// checkRedirect refuses a redirect from one host to a private, loopback or
+// link-local IP address: a registry must not be able to send a blob request to
+// a service inside the device's own network. Same-host redirects and host
+// names are allowed, as is the client's default hop limit.
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	dest := req.URL.Hostname()
+	if dest == via[0].URL.Hostname() {
+		return nil
+	}
+	addr, ok := parseAddr(dest)
+	if !ok {
+		return nil
+	}
+	if addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsUnspecified() {
+		return fmt.Errorf("redirect to %s refused", dest)
+	}
+	return nil
+}
+
+// parseAddr parses a host as the IP address the dialer would connect to: a
+// zone suffix is dropped, an IPv4-mapped IPv6 address is the IPv4 address it
+// maps, and the legacy IPv4 spellings the resolver still accepts (fewer than
+// four parts, hex or octal parts, e.g. 127.1 or 0x7f000001) are expanded.
+func parseAddr(host string) (netip.Addr, bool) {
+	host, _, _ = strings.Cut(host, "%")
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return addr.Unmap(), true
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) > 4 {
+		return netip.Addr{}, false
+	}
+	var b [4]byte
+	for i, part := range parts[:len(parts)-1] {
+		v, err := strconv.ParseUint(part, 0, 8)
+		if err != nil {
+			return netip.Addr{}, false
+		}
+		b[i] = byte(v)
+	}
+	// The last part fills the remaining bytes: 127.1 is 127.0.0.1.
+	last, err := strconv.ParseUint(parts[len(parts)-1], 0, 8*(5-len(parts)))
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	for i := len(parts) - 1; i < 4; i++ {
+		b[i] = byte(last >> (8 * (3 - i)) & 0xff)
+	}
+	return netip.AddrFrom4(b), true
+}
+
+// redactURL strips the query of the URL a request error carries, which after
+// a redirect to blob storage holds the storage's signed credentials. A
+// Location the client could not parse is quoted whole in the error it
+// returns, so that message is replaced.
+func redactURL(err error) error {
+	var uerr *url.Error
+	if !errors.As(err, &uerr) {
+		return err
+	}
+	inner := uerr.Err
+	if strings.Contains(inner.Error(), "Location header") {
+		inner = errors.New("failed to parse Location header (redacted)")
+	}
+	u, perr := url.Parse(uerr.URL)
+	if perr != nil {
+		return &url.Error{Op: uerr.Op, URL: "REDACTED", Err: inner}
+	}
+	if u.RawQuery != "" {
+		u.RawQuery = "REDACTED"
+	}
+	u.User = nil
+	return &url.Error{Op: uerr.Op, URL: u.String(), Err: inner}
+}
+
+func (b bodySource) Open(context.Context, ocispec.Descriptor) (io.ReadCloser, error) {
+	return b.body, nil
+}
+
+// checkPartialContent verifies that a 206 answer covers exactly the n bytes
+// requested at off of a blob of the given size. The body's length is checked
+// when the answer states it; a chunked answer states none, and exactReader
+// checks that the bytes arrive.
+func checkPartialContent(resp *http.Response, off, n, size int64) error {
+	contentRange := resp.Header.Get("Content-Range")
+	first, last, total, err := parseContentRange(contentRange)
+	if err != nil {
+		return fmt.Errorf("malformed Content-Range %q: %w", contentRange, err)
+	}
+	if first != off || last != off+n-1 || total != size {
+		return fmt.Errorf("Content-Range %q does not match the requested bytes %d-%d/%d", contentRange, off, off+n-1, size)
+	}
+	if resp.ContentLength >= 0 && resp.ContentLength != n {
+		return fmt.Errorf("Content-Length %d does not match the requested %d bytes", resp.ContentLength, n)
+	}
+	return nil
+}
+
+// parseContentRange parses "bytes first-last/total". The unit is compared
+// without regard to case and the numbers are unsigned decimals; anything else
+// in the value is an error.
+func parseContentRange(value string) (first, last, total int64, err error) {
+	unit, rest, ok := strings.Cut(value, " ")
+	if !ok || !strings.EqualFold(unit, "bytes") {
+		return 0, 0, 0, errors.New("not a byte range")
+	}
+	span, totalText, ok := strings.Cut(rest, "/")
+	if !ok {
+		return 0, 0, 0, errors.New("no total length")
+	}
+	firstText, lastText, ok := strings.Cut(span, "-")
+	if !ok {
+		return 0, 0, 0, errors.New("no span")
+	}
+	for _, field := range []struct {
+		text string
+		into *int64
+	}{{firstText, &first}, {lastText, &last}, {totalText, &total}} {
+		v, err := strconv.ParseUint(field.text, 10, 63)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		*field.into = int64(v)
+	}
+	return first, last, total, nil
+}
+
+// exactReader reads the requested bytes of a 206 body and fails, instead of
+// returning io.EOF, when the body ends before them. Bytes past them are not
+// read: the caller authenticates what it reads.
+type exactReader struct {
+	body      io.ReadCloser
+	remaining int64
+}
+
+func (e *exactReader) Read(p []byte) (int, error) {
+	if e.remaining == 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > e.remaining {
+		p = p[:e.remaining]
+	}
+	n, err := e.body.Read(p)
+	e.remaining -= int64(n)
+	if errors.Is(err, io.EOF) && e.remaining > 0 {
+		return n, fmt.Errorf("ociremote: range body %d bytes short: %w", e.remaining, io.ErrUnexpectedEOF)
+	}
+	return n, err
+}
+
+func (e *exactReader) Close() error {
+	return e.body.Close()
+}
+
+// closeBody closes a response body that is not handed to the caller and joins
+// a close failure onto err.
+func closeBody(body io.Closer, err error) error {
+	if closeErr := body.Close(); closeErr != nil {
+		return errors.Join(err, fmt.Errorf("ociremote: close response body: %w", closeErr))
+	}
+	return err
 }
 
 func putManifest(ctx context.Context, ref name.Reference, raw []byte, mediaType string) error {
