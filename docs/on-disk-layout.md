@@ -58,7 +58,11 @@ never trusted, only verified against it. The indexes are still the only local
 map from a pinned root to its composefs image — losing them loses no content,
 and a re-pull regenerates them while deduplicating against the objects already
 present. The compressed wire form of a layer is **never** persisted — only its
-decompressed per-file content.
+decompressed per-file content. A `pull --delta` changes what crosses the wire,
+not what lands here: the objects it writes are a subset of a plain pull's,
+under the same names (a layer built from its table stores only the files
+the image needs), and a whole layer it had to spool lives in `tmp/` only for
+the pull's duration.
 
 ## Image identity — the digest everything is keyed by
 

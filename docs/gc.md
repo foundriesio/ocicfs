@@ -26,10 +26,18 @@ Some garbage is expected immediately after a pull: the pull streams each
 layer and materializes every file it carries, so a file a later layer
 overwrites or deletes is unreferenced by the merged image from the start —
 for Debian-based images the shadowed package-database generations alone can
-add up to a few MiB. The first collection reclaims them. A pull that knows
-every layer's file table up front — the zstd:chunked case the planned
-chunk-delta support builds on — can skip materializing shadowed files
-instead of leaving them to gc.
+add up to a few MiB. The first collection reclaims them. `knarr pull
+--delta` knows every zstd:chunked layer's file table up front and skips
+materializing shadowed files instead of leaving them to gc.
+
+A delta pull saves bytes only while the previous release's objects are
+still in the store, and gc reclaims an image nothing wants, so the agent
+holds release N−1 under a holder of its own — `delta-base`, say — before
+pulling N with `--delta`, and releases it once N is activated. The release
+alone reclaims nothing: N−1 stays wanted by its own reference until the
+agent removes that too, and the next gc then reclaims what N−1 alone
+referenced. knarr adds no keep-previous policy of its own. See
+[pull.md](pull.md).
 
 ## Usage
 

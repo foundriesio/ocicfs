@@ -6,7 +6,9 @@ chain into the fs-verity-sealed object store, builds the composefs image, and
 records the image binding and reference.
 
 By default, knarr pulls from an OCI registry. `--from-dir` sideloads from a local
-OCI image layout directory instead, for air-gapped or test workflows.
+OCI image layout directory instead, for air-gapped or test workflows. `--delta`
+fetches only the files the store lacks from zstd:chunked layers, for updates
+(see [Delta Pull](#delta-pull)).
 
 ## Prerequisites
 
@@ -115,6 +117,86 @@ prints that identity.
 
 `--ingest-workers N` applies to a sideload exactly as to a registry pull: the
 layers are read from the layout directory and scanned N at a time (default 2).
+
+## Delta Pull
+
+An update usually changes a few files of an image, but every layer whose
+digest changed is fetched whole, which for a rebuilt image is all of them.
+`--delta` fetches, of every layer published in **zstd:chunked** format, only
+its table of contents and the files the store does not already hold, as byte
+ranges of the layer blob:
+
+```sh
+knarr hold --holder delta-base "ghcr.io/example/app@$previous"
+knarr pull --delta "ghcr.io/example/app@$next"
+# ... switch the workload over to $next ...
+knarr release --holder delta-base "ghcr.io/example/app@$previous"
+knarr remove "ghcr.io/example/app@$previous"
+knarr gc
+```
+
+The hold is the point: a delta saves bytes only while the previous release's
+files are still in the store, and `gc` reclaims an image nothing wants. The
+agent driving knarr holds release N−1 under a holder of its own — `delta-base`
+above — before pulling N, so that whatever else it does meanwhile (repointing
+a tag, removing the old reference to make room) cannot cost the base, and
+releases it once N is in place; a plain `remove` declines while the hold
+stands, so the release comes first. knarr adds no keep-previous policy of its
+own. The same sequence works with `--from-dir` against a layout directory.
+
+What the image needs: zstd:chunked layers, as `skopeo copy
+--dest-compress-format zstd:chunked` writes them. Such a layer is a
+standard `tar+zstd` blob whose descriptor carries the
+`io.github.containers.zstd-chunked.manifest-position` and `manifest-checksum`
+annotations. The table is fetched as one range, authenticated by that
+checksum, and every file by the digest the table records for it; the manifest
+chain, sealing annotations and the composefs image are verified exactly as by
+a plain pull, and the image built is bit-identical to a plain pull's — a
+delta pull and a plain pull of the same image reference the same objects
+and record the same binding. A plain pull also stores the files a later
+layer shadows, which gc reclaims; a layer built from its table stores only
+the files the image needs, though a layer that fell back to the tar stream
+stores every file it carries, and a whole-blob read transfers the shadowed
+bytes even if it does not store them. For a layer built from its table the `diff_id` is reported by `inspect` and the
+chain IDs as before but no longer verified: nothing decompresses the whole
+tar stream to hash it. A layer that fell back to the tar stream is verified
+as a plain pull verifies it.
+
+What falls back, and why, is reported by one log line per layer on stderr:
+
+```text
+level=INFO msg="delta: layer" layer=sha256:… size=1452 toc_bytes=381 toc_ms=3 entries=5 missing=2 planned=369 requests=1 fetched=750 fallback=none
+```
+
+`missing` counts the files the store lacked, `planned` and `requests` the
+bytes and ranges the pull decided to fetch, `fetched` the bytes it actually
+read for the layer, table included, and `fallback` why the layer was not
+fetched by ranges:
+
+- `no-toc` — a layer without a table (a plain `tar+gzip` layer, for example)
+  is streamed and unpacked as a plain pull does.
+- `toc-error` — the table could not be read or did not verify: the layer is
+  streamed and unpacked as a plain pull does, after a warning naming the
+  cause. The whole blob is verified against the manifest on that path, so a
+  bad table can cost bandwidth but never integrity.
+- `requests` or `fraction` — the missing files would take more than 256
+  ranges, or more than half the blob: the blob is read once, in one request,
+  and only the missing files are unpacked from it. A rebuilt base image
+  trips this rule before the first request.
+- `whole-answer` — the registry answered a range request with the whole blob
+  (no `Range` support): the rest of the layer is read from that answer.
+
+A closing line per pull sums the same figures. Once the tables are read and
+the layers without a usable table are unpacked, and before the remaining
+missing files are fetched, the pull checks that the store's filesystem has
+room for those files' bytes and refuses when it does not; that figure is a
+lower bound, since the fs-verity trees and the composefs image come on top.
+
+`--delta` needs a source that serves byte ranges: a registry and a layout
+directory do; an embedder's own `BlobSource` only when its type also
+implements `OpenRange`, and the pull fails with `ErrNoRangeSource` otherwise
+rather than silently fetching whole layers. It is a `Pull` option only:
+`NewBuild` refuses it.
 
 ## Inspect What Landed
 
@@ -248,3 +330,13 @@ Rules the build enforces:
   sealing cost only for files that are new.
 - **Mount is separate.** Pull only materializes content into the store; mounting
   it is a distinct step with `knarr mount`.
+- **The delta-base contract.** `--delta` saves bytes only while the previous
+  release's objects are in the store. The agent holds release N−1 under a
+  holder such as `delta-base` before pulling N, and releases it after N is
+  activated; knarr adds no keep-previous policy of its own, and a `gc` that
+  finds N−1 unwanted reclaims it like any other image. A delta pull of an
+  image the store already holds is a cache hit, as any pull is. For a
+  zstd:chunked layer the `diff_id` is reported (`inspect`, the chain IDs,
+  JSON) but no longer verified by a delta pull; the layer's files are
+  verified by the digests its table of contents records, the table by the
+  checksum the manifest carries.
