@@ -144,6 +144,18 @@ releases it once N is in place; a plain `remove` declines while the hold
 stands, so the release comes first. knarr adds no keep-previous policy of its
 own. The same sequence works with `--from-dir` against a layout directory.
 
+What a delta can save is bounded by the share of file bytes the two releases
+have in common (how much of that bound a pull realises then depends on the
+compression, the coalescing of ranges and the fallback thresholds), and that
+share is the publisher's to control. A rebuild that
+regenerates files — compiled artifacts, gzip-compressed documentation,
+package updates — changes their digests even when nothing meaningful
+changed: two official `python` builds a month apart shared 7 % of their file
+bytes, so `--delta` saved nothing between them, while a fleet's own images
+rebuilt over a stable base shared about 69 %. A build pipeline that keeps
+unchanged files byte-identical from one release to the next is what makes
+`--delta` pay.
+
 What the image needs: zstd:chunked layers, as `skopeo copy
 --dest-compress-format zstd:chunked` writes them. Such a layer is a
 standard `tar+zstd` blob whose descriptor carries the
