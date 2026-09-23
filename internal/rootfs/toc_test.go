@@ -247,6 +247,58 @@ func TestTOCPathReusesStoredPayloads(t *testing.T) {
 	}
 }
 
+// TestSupplyConcurrently asserts payloads supplied from several goroutines at
+// once build the image a sequential supply builds.
+func TestSupplyConcurrently(t *testing.T) {
+	img := loadFixtureImage(t, fixtureLayouts[2], "n1")
+	ctx := context.Background()
+
+	seqBuilder := NewBuilder(newVerityStore(t))
+	defer seqBuilder.Close()
+	want, _, err := buildFromTOC(t, seqBuilder, img)
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("sequential supply: %v", err)
+	}
+
+	store := newVerityStore(t)
+	b := NewBuilder(store)
+	defer b.Close()
+	sources, err := mergeFromTOC(t, b, img)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	missing, err := b.Missing(ctx)
+	if err != nil {
+		t.Fatalf("Missing: %v", err)
+	}
+	if len(missing) < 2 {
+		t.Fatalf("Missing returned %d payloads, want at least 2 to supply concurrently", len(missing))
+	}
+	errs := make(chan error, len(missing))
+	for _, p := range missing {
+		go func() { errs <- supplyFromBlob(b, sources, p) }()
+	}
+	// Every supplier is joined before the builder can be closed on a failure.
+	var failed error
+	for range missing {
+		if err := <-errs; err != nil && failed == nil {
+			failed = err
+		}
+	}
+	if failed != nil {
+		t.Fatalf("concurrent Supply: %v", failed)
+	}
+	got, err := b.Finish(ctx)
+	if err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("image = %+v, want %+v", got, want)
+	}
+	referencedObjects(t, store, got)
+}
+
 // TestMissingSkipsDroppedPayloads asserts a payload the merge removed is not
 // asked for: the upper layer of the fixture whites out the lower layer's only
 // stored file that is not also kept under another name.
@@ -627,53 +679,75 @@ func buildFromTar(t *testing.T, b *Builder, img fixtureImage) (Image, error) {
 func buildFromTOC(t *testing.T, b *Builder, img fixtureImage) (Image, []Payload, error) {
 	t.Helper()
 	ctx := context.Background()
-	type source struct {
-		blob  []byte
-		entry zstdchunked.Entry
-	}
-	sources := make(map[digest.Digest]source)
-	for i := range img.layers {
-		toc, ok := img.toc(t, i)
-		if !ok {
-			if err := scanMerge(ctx, b, img.open(t, i), img.diffIDs[i]); err != nil {
-				return Image{}, nil, err
-			}
-			continue
-		}
-		for _, e := range toc.Entries {
-			if e.Digest != "" {
-				sources[e.Digest] = source{blob: img.blobs[i], entry: e}
-			}
-		}
-		l, err := LayerFromTOC(toc, i)
-		if err != nil {
-			return Image{}, nil, err
-		}
-		if err := b.Merge(l); err != nil {
-			return Image{}, nil, err
-		}
+	sources, err := mergeFromTOC(t, b, img)
+	if err != nil {
+		return Image{}, nil, err
 	}
 	missing, err := b.Missing(ctx)
 	if err != nil {
 		return Image{}, nil, err
 	}
 	for _, p := range missing {
-		src, ok := sources[p.Digest]
-		if !ok {
-			t.Fatalf("Missing returned %s, which no table of contents lists", p.Digest)
-		}
-		r, err := zstdchunked.Reconstruct(src.entry, bytes.NewReader(src.blob[src.entry.Offset:src.entry.EndOffset]))
-		if err != nil {
-			return Image{}, nil, err
-		}
-		err = b.Supply(ctx, p, r)
-		_ = r.Close()
-		if err != nil {
+		if err := supplyFromBlob(b, sources, p); err != nil {
 			return Image{}, nil, err
 		}
 	}
 	built, err := b.Finish(ctx)
 	return built, missing, err
+}
+
+// payloadSource is the layer blob and entry a table of contents lists a
+// payload under.
+type payloadSource struct {
+	blob  []byte
+	entry zstdchunked.Entry
+}
+
+// mergeFromTOC merges every layer of img into b, from its table when it has
+// one and by scanning its tar stream otherwise, and returns where the tables
+// list every payload.
+func mergeFromTOC(t *testing.T, b *Builder, img fixtureImage) (map[digest.Digest]payloadSource, error) {
+	t.Helper()
+	ctx := context.Background()
+	sources := make(map[digest.Digest]payloadSource)
+	for i := range img.layers {
+		toc, ok := img.toc(t, i)
+		if !ok {
+			if err := scanMerge(ctx, b, img.open(t, i), img.diffIDs[i]); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		for _, e := range toc.Entries {
+			if e.Digest != "" {
+				sources[e.Digest] = payloadSource{blob: img.blobs[i], entry: e}
+			}
+		}
+		l, err := LayerFromTOC(toc, i)
+		if err != nil {
+			return nil, err
+		}
+		if err := b.Merge(l); err != nil {
+			return nil, err
+		}
+	}
+	return sources, nil
+}
+
+// supplyFromBlob supplies p to b, reconstructed from the byte range of the
+// layer blob its entry names.
+func supplyFromBlob(b *Builder, sources map[digest.Digest]payloadSource, p Payload) error {
+	src, ok := sources[p.Digest]
+	if !ok {
+		return fmt.Errorf("Missing returned %s, which no table of contents lists", p.Digest)
+	}
+	r, err := zstdchunked.Reconstruct(src.entry, bytes.NewReader(src.blob[src.entry.Offset:src.entry.EndOffset]))
+	if err != nil {
+		return err
+	}
+	err = b.Supply(context.Background(), p, r)
+	_ = r.Close()
+	return err
 }
 
 // mergeTOC merges one hand-made table-of-contents layer into b.

@@ -43,11 +43,13 @@ func Resolved(fsv string) Sealed {
 // caller's goroutine and returns as soon as the object is queued; the returned
 // Sealed yields its fs-verity digest once the worker has committed it.
 //
-// A Writer serves one producer goroutine for the lifetime of one batch:
-// NewWriter starts the worker, Close waits for it. WriteObject after Close is
-// a contract violation, not a guarded case. The first error the worker hits
-// cancels the writer, and that error — not the resulting context
-// cancellation — is what every later WriteObject, Sealed and Close reports.
+// A Writer serves one batch: NewWriter starts the worker, Close waits for it.
+// WriteObject and WriteExpected may be called from several goroutines at
+// once; each stages on its caller's goroutine and queues through the one
+// channel. A write after or during Close is a contract violation, not a
+// guarded case. The first error the worker hits cancels the writer, and that
+// error — not the resulting context cancellation — is what every later
+// WriteObject, Sealed and Close reports.
 type Writer struct {
 	s      *Store
 	ctx    context.Context

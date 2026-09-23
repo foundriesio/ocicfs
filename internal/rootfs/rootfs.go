@@ -16,6 +16,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -56,16 +57,20 @@ type ObjectSink interface {
 // once every layer is merged, Missing resolves the payloads the store already
 // holds and names the rest, and Supply takes their bytes. From Missing until
 // Finish or Close the builder owns a sealing writer bound to the context
-// Missing was given. Merge, Missing, Supply and Finish are called from one
-// goroutine, in that order.
+// Missing was given. Merge, Missing, Finish and Close are called from one
+// goroutine, in that order, and none of them overlaps a Supply; Supply may be
+// called from several goroutines at once between Missing and Finish, each
+// payload from one of them.
 type Builder struct {
 	store *objectstore.Store
 	m     *merge
 	next  int  // index of the next layer Merge expects
 	spent bool // Finish or Close has run, or a Merge failed
 
-	w       *objectstore.Writer       // seals supplied payloads; open from Missing until Finish or Close
-	cancel  context.CancelFunc        // cancels w's context
+	w      *objectstore.Writer // seals supplied payloads; open from Missing until Finish or Close
+	cancel context.CancelFunc  // cancels w's context
+
+	mu      sync.Mutex                // guards pending against concurrent Supply calls
 	pending map[digest.Digest][]*node // the payloads Missing returned that Supply has not seen yet
 }
 
@@ -236,12 +241,15 @@ func (b *Builder) Missing(ctx context.Context) ([]Payload, error) {
 // stored payload of another size is refused as well, though the store keeps
 // its object, which is the one its digest names. A failed Supply leaves p
 // missing, so it may be supplied again, unless sealing failed: that fails every
-// later Supply of a stored payload, and Finish.
+// later Supply of a stored payload, and Finish. Supplies of distinct payloads
+// may run concurrently: each touches only its own payload's nodes.
 func (b *Builder) Supply(ctx context.Context, p Payload, r io.Reader) error {
 	if b.spent {
 		return errBuilderSpent
 	}
+	b.mu.Lock()
 	nodes := b.pending[p.Digest]
+	b.mu.Unlock()
 	if len(nodes) == 0 || nodes[0].size != p.Size {
 		return fmt.Errorf("rootfs: payload %s of %d bytes is not missing", p.Digest, p.Size)
 	}
@@ -276,7 +284,9 @@ func (b *Builder) Supply(ctx context.Context, p Payload, r io.Reader) error {
 			n.sealed = sealed
 		}
 	}
+	b.mu.Lock()
 	delete(b.pending, p.Digest)
+	b.mu.Unlock()
 	return nil
 }
 
