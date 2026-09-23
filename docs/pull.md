@@ -169,9 +169,10 @@ level=INFO msg="delta: layer" layer=sha256:… size=1452 toc_bytes=381 toc_ms=3 
 ```
 
 `missing` counts the files the store lacked, `planned` and `requests` the
-bytes and ranges the pull decided to fetch, `fetched` the bytes it actually
-read for the layer, table included, and `fallback` why the layer was not
-fetched by ranges:
+bytes and ranges those files would take as ranges (a layer served from a
+whole answer to its table request asks for none and reports `requests=0`),
+`fetched` the bytes the pull actually read for the layer, table included, and
+`fallback` why the layer was not fetched by ranges:
 
 - `no-toc` — a layer without a table (a plain `tar+gzip` layer, for example)
   is streamed and unpacked as a plain pull does.

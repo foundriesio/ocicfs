@@ -200,12 +200,12 @@ func Delta(ctx context.Context, store *objectstore.Store, img *imagestore.Store,
 	for _, l := range layers {
 		slog.Info("delta: layer", "layer", l.desc.Digest, "size", l.desc.Size,
 			"toc_bytes", l.tocBytes, "toc_ms", l.tocLatency.Milliseconds(), "entries", len(l.entries()),
-			"missing", len(l.files), "planned", l.planned, "requests", len(l.requests),
+			"missing", len(l.files), "planned", l.planned, "requests", l.requested(),
 			"fetched", l.fetched, "fallback", l.reason)
 		size += l.desc.Size
 		tocBytes += l.tocBytes
 		planned += l.planned
-		requests += int64(len(l.requests))
+		requests += int64(l.requested())
 		fetched += l.fetched
 	}
 	slog.Info("delta: pull", "layers", len(layers), "size", size, "toc_bytes", tocBytes,
@@ -234,6 +234,15 @@ func (l *deltaLayer) entries() []zstdchunked.Entry {
 		return nil
 	}
 	return l.toc.Entries
+}
+
+// requested is the number of range requests the layer's files take: none
+// for a layer read out of its spool, whose ranges were never asked for.
+func (l *deltaLayer) requested() int {
+	if l.spool != nil {
+		return 0
+	}
+	return len(l.requests)
 }
 
 // readLayer reads l's table of contents and, when that leaves the layer to

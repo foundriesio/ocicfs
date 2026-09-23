@@ -408,8 +408,9 @@ func TestDeltaCancelledMidFetch(t *testing.T) {
 
 // TestDeltaWholeAnswer asserts a source that answers a range request with
 // the whole blob serves the layer from that one stream: spooled when it
-// answers the table of contents request, sliced sequentially when it answers
-// a file request, with no further range asked for either way.
+// answers the table of contents request, and then reported as taking no
+// range request, or sliced sequentially when it answers a file request, with
+// no further range asked for either way.
 func TestDeltaWholeAnswer(t *testing.T) {
 	requireTools(t)
 	for _, c := range []struct {
@@ -445,6 +446,9 @@ func TestDeltaWholeAnswer(t *testing.T) {
 
 			if base := len(rec.rangesOf(layers[0].Digest)); base != c.wantRanges {
 				t.Fatalf("base layer took %d range requests, want %d", base, c.wantRanges)
+			}
+			if got := loggedField(t, logs.String(), layers[0].Digest, "requests"); c.wholeFrom == 0 && got != 0 {
+				t.Fatalf("the spooled layer logged requests=%d, want 0", got)
 			}
 			if !strings.Contains(logs.String(), "fallback=whole-answer") {
 				t.Fatalf("no whole-answer fallback logged:\n%s", logs)
@@ -582,21 +586,21 @@ func assertTOCFallbackMatches(t *testing.T, dir string, root digest.Digest) {
 	if pos, ok, err := zstdchunked.Position(layers[1].Annotations, layers[1].Size); err == nil && ok {
 		tocBytes = pos.CompressedLen
 	}
-	if got, want := loggedFetched(t, logs.String(), layers[1].Digest), layers[1].Size+tocBytes; got != want {
+	if got, want := loggedField(t, logs.String(), layers[1].Digest, "fetched"), layers[1].Size+tocBytes; got != want {
 		t.Fatalf("the fallen-back layer logged fetched=%d, want %d (blob %d + table attempt %d)", got, want, layers[1].Size, tocBytes)
 	}
 }
 
-// loggedFetched returns the fetched figure of the layer's log line.
-func loggedFetched(t *testing.T, logs string, layer digest.Digest) int64 {
+// loggedField returns the named figure of the layer's log line.
+func loggedField(t *testing.T, logs string, layer digest.Digest, field string) int64 {
 	t.Helper()
-	m := regexp.MustCompile(`msg="delta: layer" layer=` + regexp.QuoteMeta(layer.String()) + ` .* fetched=(\d+)`).FindStringSubmatch(logs)
+	m := regexp.MustCompile(`msg="delta: layer" layer=` + regexp.QuoteMeta(layer.String()) + ` .* ` + field + `=(\d+)`).FindStringSubmatch(logs)
 	if m == nil {
 		t.Fatalf("no log line for layer %s:\n%s", layer, logs)
 	}
 	n, err := strconv.ParseInt(m[1], 10, 64)
 	if err != nil {
-		t.Fatalf("fetched figure %q: %v", m[1], err)
+		t.Fatalf("%s figure %q: %v", field, m[1], err)
 	}
 	return n
 }
