@@ -58,8 +58,10 @@ const (
 type deltaLayer struct {
 	idx  int
 	desc ocispec.Descriptor
-	// toc is nil for a layer scanned from its tar stream.
-	toc *zstdchunked.TOC
+	// toc is nil for a layer scanned from its tar stream, which scanned then
+	// holds.
+	toc     *zstdchunked.TOC
+	scanned *rootfs.Layer
 	// spool holds the whole verified blob when the source answered the table
 	// of contents request with it; files are read out of the spool.
 	spool *os.File
@@ -90,11 +92,12 @@ type byteRange struct {
 // Delta materializes an image as Materialize does but fetches, of every
 // layer with a zstd:chunked table of contents, only the table and the files
 // the store lacks, as byte ranges served by ranges. Every layer's table is
-// fetched under the slots limiter; the files are fetched layer by layer on
-// the calling goroutine. A layer whose table cannot be read is scanned from
-// its tar stream, as is a layer without one, and a layer whose missing files
-// would take too many or too large ranges is read whole instead; either way
-// the image built is the one Materialize builds.
+// fetched under the slots limiter, and a layer whose table cannot be read,
+// or that has none, is scanned from its tar stream in the same turn. A layer
+// whose missing files would take too many or too large ranges is read whole
+// instead, under the limiter too, while the layers fetched by range take
+// their ranges one at a time on the calling goroutine, under the limiter as
+// well; either way the image built is the one Materialize builds.
 func Delta(ctx context.Context, store *objectstore.Store, img *imagestore.Store, src ocichain.BlobSource, ranges ocichain.RangeSource, root digest.Digest, platform ocispec.Platform, slots chan struct{}) (Built, error) {
 	if ranges == nil {
 		return Built{}, errors.New("materialize: nil range source")
@@ -106,30 +109,57 @@ func Delta(ctx context.Context, store *objectstore.Store, img *imagestore.Store,
 	b := rootfs.NewBuilder(store)
 	defer b.Close()
 
-	layers := make([]*deltaLayer, len(res.Manifest.Layers))
+	// The layers are read under one cancellation: the first failure stops the
+	// rest, and every goroutine is joined before Delta returns.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var failed error
+	fail := func(err error) {
+		mu.Lock()
+		if failed == nil {
+			failed = err
+		}
+		mu.Unlock()
+		cancel()
+	}
+	// under runs fn on l under a slot, unless the pull was cancelled first,
+	// and records its failure. A cancellation is recorded like any error: the
+	// first failure recorded is the one reported, so a cancellation that a
+	// failure caused never replaces it, and one the source raised on its own
+	// is not lost.
+	under := func(l *deltaLayer, fn func(*deltaLayer) error) {
+		defer wg.Done()
+		if err := withSlot(ctx, slots, func() error { return fn(l) }); err != nil {
+			fail(err)
+		}
+	}
+	// wait joins every goroutine and returns the first failure, or the
+	// cancellation that stopped them.
+	wait := func() error {
+		wg.Wait()
+		mu.Lock()
+		defer mu.Unlock()
+		if failed != nil {
+			return failed
+		}
+		return ctx.Err()
+	}
+
+	layers := make([]*deltaLayer, len(res.Manifest.Layers))
 	for j, desc := range res.Manifest.Layers {
 		layers[j] = &deltaLayer{idx: j, desc: desc}
 		wg.Add(1)
-		go func(l *deltaLayer) {
-			defer wg.Done()
-			select {
-			case slots <- struct{}{}:
-			case <-ctx.Done():
-				return
-			}
-			defer func() { <-slots }()
-			readTOC(ctx, ranges, store, l)
-		}(layers[j])
+		go under(layers[j], func(l *deltaLayer) error { return readLayer(ctx, b, src, ranges, store, res, l) })
 	}
-	wg.Wait()
 	defer removeSpools(layers)
-	if err := ctx.Err(); err != nil {
+	if err := wait(); err != nil {
 		return Built{}, err
 	}
 
 	for _, l := range layers {
-		if err := mergeLayer(ctx, b, src, res, l, slots); err != nil {
+		if err := mergeLayer(b, l); err != nil {
 			return Built{}, err
 		}
 	}
@@ -144,11 +174,30 @@ func Delta(ctx context.Context, store *objectstore.Store, img *imagestore.Store,
 		return Built{}, err
 	}
 
+	for _, l := range layers {
+		if l.reason == fallbackNone || len(l.files) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go under(l, func(l *deltaLayer) error { return fetchLayer(ctx, b, src, ranges, l) })
+	}
+	// The ranged layers take their turns under the same limiter, one at a
+	// time on this goroutine.
+	for _, l := range layers {
+		if l.reason != fallbackNone {
+			continue
+		}
+		if err := withSlot(ctx, slots, func() error { return fetchLayer(ctx, b, src, ranges, l) }); err != nil {
+			fail(err)
+			break
+		}
+	}
+	if err := wait(); err != nil {
+		return Built{}, err
+	}
+
 	var size, tocBytes, planned, requests, fetched int64
 	for _, l := range layers {
-		if err := fetchLayer(ctx, b, src, ranges, l); err != nil {
-			return Built{}, err
-		}
 		slog.Info("delta: layer", "layer", l.desc.Digest, "size", l.desc.Size,
 			"toc_bytes", l.tocBytes, "toc_ms", l.tocLatency.Milliseconds(), "entries", len(l.entries()),
 			"missing", len(l.files), "planned", l.planned, "requests", len(l.requests),
@@ -165,6 +214,19 @@ func Delta(ctx context.Context, store *objectstore.Store, img *imagestore.Store,
 	return finishImage(ctx, store, img, root, res, b)
 }
 
+// withSlot runs fn once a slot is free and gives the slot back when fn
+// returns; a pull cancelled while waiting for one returns the cancellation
+// instead of running fn.
+func withSlot(ctx context.Context, slots chan struct{}, fn func() error) error {
+	select {
+	case slots <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-slots }()
+	return fn()
+}
+
 // entries returns the layer's table of contents entries, none for a layer
 // without a table.
 func (l *deltaLayer) entries() []zstdchunked.Entry {
@@ -172,6 +234,33 @@ func (l *deltaLayer) entries() []zstdchunked.Entry {
 		return nil
 	}
 	return l.toc.Entries
+}
+
+// readLayer reads l's table of contents and, when that leaves the layer to
+// its tar stream, opens and scans the stream right away, every file stored
+// on the way.
+func readLayer(ctx context.Context, b *rootfs.Builder, src ocichain.BlobSource, ranges ocichain.RangeSource, store *objectstore.Store, res ocichain.Resolved, l *deltaLayer) error {
+	readTOC(ctx, ranges, store, l)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if l.toc != nil {
+		return nil
+	}
+	stream, err := ocichain.OpenLayer(ctx, src, l.desc)
+	if err != nil {
+		return fmt.Errorf("materialize: open layer %d: %w", l.idx, err)
+	}
+	layer, err := b.Scan(ctx, stream, res.DiffIDs[l.idx], l.idx)
+	if cerr := stream.Close(); cerr != nil {
+		err = errors.Join(err, fmt.Errorf("materialize: layer %d: close: %w", l.idx, cerr))
+	}
+	if err != nil {
+		return err
+	}
+	l.scanned = layer
+	l.fetched += l.desc.Size
+	return nil
 }
 
 // readTOC fetches and authenticates l's table of contents. Any failure to
@@ -289,34 +378,15 @@ func removeSpools(layers []*deltaLayer) {
 }
 
 // mergeLayer merges l into the build: from its table of contents, with the
-// files pending, or else scanned from its tar stream under the slots
-// limiter, every file stored on the way.
-func mergeLayer(ctx context.Context, b *rootfs.Builder, src ocichain.BlobSource, res ocichain.Resolved, l *deltaLayer, slots chan struct{}) error {
-	if l.toc != nil {
-		layer, err := rootfs.LayerFromTOC(l.toc, l.idx)
-		if err != nil {
-			return err
-		}
-		return b.Merge(layer)
+// files pending, or as scanned from its tar stream.
+func mergeLayer(b *rootfs.Builder, l *deltaLayer) error {
+	if l.toc == nil {
+		return b.Merge(l.scanned)
 	}
-	select {
-	case slots <- struct{}{}:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	defer func() { <-slots }()
-	stream, err := ocichain.OpenLayer(ctx, src, l.desc)
-	if err != nil {
-		return fmt.Errorf("materialize: open layer %d: %w", l.idx, err)
-	}
-	layer, err := b.Scan(ctx, stream, res.DiffIDs[l.idx], l.idx)
-	if cerr := stream.Close(); cerr != nil {
-		err = errors.Join(err, fmt.Errorf("materialize: layer %d: close: %w", l.idx, cerr))
-	}
+	layer, err := rootfs.LayerFromTOC(l.toc, l.idx)
 	if err != nil {
 		return err
 	}
-	l.fetched += l.desc.Size
 	return b.Merge(layer)
 }
 

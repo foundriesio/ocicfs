@@ -18,10 +18,13 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/opencontainers/go-digest"
@@ -209,6 +212,196 @@ func TestDeltaThresholdsFallBack(t *testing.T) {
 			if n := strings.Count(logs.String(), "fallback="+c.name); n != 2 {
 				t.Fatalf("logged %d layers falling back for %s, want 2:\n%s", n, c.name, logs)
 			}
+		})
+	}
+}
+
+// TestDeltaReadsFallbackLayersTogether asserts layers read whole are read
+// under the slots limiter at once rather than one after another: two of the
+// three layers, each with a stored file of its own to fetch, are held open
+// until both have been opened, which a serial read never reaches.
+func TestDeltaReadsFallbackLayersTogether(t *testing.T) {
+	requireTools(t)
+	restoreBounds(t)
+	maxDeltaFraction = 0
+	dir, root := composeImage(t, layerOf(t, releaseN, "n", 0), layerOf(t, releaseN1, "n1", 1), layerOf(t, fixtureLayout, "whiteout-same-layer", 1))
+	layers := fixtureLayers(t, dir, "composed")
+	rec := newRecorder(t, dir)
+	rec.meet = map[digest.Digest]bool{layers[0].Digest: true, layers[2].Digest: true}
+	rec.met = make(chan struct{})
+	logs := captureLogs(t)
+	gotRoot, gotObj, gotImg := newStores(t)
+	// A pull that opened the layers one at a time would wait at the gate
+	// forever; the deadline turns that into a failure.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	got, err := Delta(ctx, gotObj, gotImg, rec, rec, root, fixturePlatform, newSlots(2))
+	if err != nil {
+		skipIfNoVerity(t, err)
+		t.Fatalf("Delta: %v", err)
+	}
+	wantRoot, wantObj, wantImg := newStores(t)
+	want, err := Materialize(context.Background(), wantObj, wantImg, openLayout(t, dir), root, fixturePlatform, newSlots(2))
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	assertSameImage(t, wantRoot, want, gotRoot, got)
+	rec.assertOpens(t, []digest.Digest{layers[0].Digest, layers[1].Digest, layers[2].Digest})
+	if n := strings.Count(logs.String(), "fallback=fraction"); n != 3 {
+		t.Fatalf("logged %d layers falling back, want 3:\n%s", n, logs)
+	}
+}
+
+// TestDeltaFallbackFailureStopsThePull asserts a failure in a layer read
+// whole, while another layer is being fetched by ranges, is what the pull
+// reports, and that it leaves no binding or temp; a rerun then builds the
+// image Materialize builds.
+func TestDeltaFallbackFailureStopsThePull(t *testing.T) {
+	requireTools(t)
+	restoreBounds(t)
+	// One request per file, and at most two: the one-file layer is fetched
+	// by range, the three-file layer is read whole.
+	coalesceGap = -1
+	maxDeltaRequests = 2
+	dir, root := composeImage(t, layerOf(t, fixtureLayout, "whiteout-same-layer", 1), layerOf(t, releaseN1, "n1", 1))
+	layers := fixtureLayers(t, dir, "composed")
+	rec := newRecorder(t, dir)
+	// Both tables come first; the third request is the ranged layer's file.
+	// It is held until the pull is cancelled, and the whole read of the other
+	// layer fails only once it is held, so the failure lands while a range is
+	// in flight.
+	rec.holdRange = 3
+	rec.held = make(chan struct{})
+	rec.failOpen = map[digest.Digest]error{layers[1].Digest: errInjected}
+	// A pull that never reached the held request would wait here forever;
+	// the deadline turns that into a failure.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	rec.onOpen = func(d digest.Digest) {
+		if d == layers[1].Digest {
+			select {
+			case <-rec.held:
+			case <-ctx.Done():
+			}
+		}
+	}
+	slots := newSlots(2)
+	gotRoot, gotObj, gotImg := newStores(t)
+	_, err := Delta(ctx, gotObj, gotImg, rec, rec, root, fixturePlatform, slots)
+	skipIfNoVerity(t, err)
+	if !errors.Is(err, errInjected) {
+		t.Fatalf("Delta returned %v, want the injected failure", err)
+	}
+	if ranges := rec.rangesOf(layers[0].Digest); len(ranges) != 2 {
+		t.Fatalf("the ranged layer took %d requests, want its table and the held file", len(ranges))
+	}
+	if len(slots) != 0 {
+		t.Fatalf("%d slots still taken after the failed pull", len(slots))
+	}
+	assertNoBinding(t, gotImg, root)
+	assertNoTemps(t, gotObj)
+
+	got, err := Delta(context.Background(), gotObj, gotImg, newRecorder(t, dir), newRecorder(t, dir), root, fixturePlatform, slots)
+	if err != nil {
+		t.Fatalf("Delta rerun: %v", err)
+	}
+	wantRoot, wantObj, wantImg := newStores(t)
+	want, err := Materialize(context.Background(), wantObj, wantImg, openLayout(t, dir), root, fixturePlatform, newSlots(2))
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	assertSameImage(t, wantRoot, want, gotRoot, got)
+}
+
+// TestDeltaSourceCancellationIsAFailure asserts a source that gives up on a
+// layer with a cancellation of its own, while the pull itself is not
+// cancelled, fails the pull like any other error instead of leaving the
+// layer out.
+func TestDeltaSourceCancellationIsAFailure(t *testing.T) {
+	requireTools(t)
+	root := fixtureRoot(t, fixtureLayout, "mixed")
+	layers := fixtureLayers(t, fixtureLayout, "mixed")
+	rec := newRecorder(t, fixtureLayout)
+	// The second layer has no table of contents and is opened whole.
+	rec.failOpen = map[digest.Digest]error{layers[1].Digest: context.Canceled}
+	gotRoot, gotObj, gotImg := newStores(t)
+	_, err := Delta(context.Background(), gotObj, gotImg, rec, rec, root, fixturePlatform, newSlots(2))
+	skipIfNoVerity(t, err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Delta returned %v, want the source's cancellation", err)
+	}
+	assertNoBinding(t, gotImg, root)
+	assertNoTemps(t, gotObj)
+	_ = gotRoot
+}
+
+// TestDeltaCancelledMidFetch asserts a pull cancelled while its files are
+// being fetched, by range or whole, returns the cancellation, joins every
+// goroutine, and leaves no binding or temp; a rerun then succeeds.
+func TestDeltaCancelledMidFetch(t *testing.T) {
+	requireTools(t)
+	for _, c := range []struct {
+		name     string
+		fraction float64
+	}{
+		{"ranges", 0.5},
+		{"whole", 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			restoreBounds(t)
+			coalesceGap = -1
+			maxDeltaFraction = c.fraction
+			root := fixtureRoot(t, releaseN1, "n1")
+			layers := fixtureLayers(t, releaseN1, "n1")
+			rec := newRecorder(t, releaseN1)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			// Both tables come first; the third request is the first file's.
+			// When the layers are read whole, the first layer's whole read is
+			// the trigger; the metadata is opened through the same source
+			// earlier and must not be.
+			var reached atomic.Bool
+			rec.onRange = func(n int) {
+				if n == 3 {
+					reached.Store(true)
+					cancel()
+				}
+			}
+			if c.fraction == 0 {
+				rec.onRange = nil
+				rec.onOpen = func(d digest.Digest) {
+					if d == layers[0].Digest {
+						reached.Store(true)
+						cancel()
+					}
+				}
+			}
+			slots := newSlots(2)
+			gotRoot, gotObj, gotImg := newStores(t)
+			_, err := Delta(ctx, gotObj, gotImg, rec, rec, root, fixturePlatform, slots)
+			skipIfNoVerity(t, err)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Delta returned %v, want context.Canceled", err)
+			}
+			if !reached.Load() {
+				t.Fatal("the pull was not cancelled where the test meant to")
+			}
+			if len(slots) != 0 {
+				t.Fatalf("%d slots still taken after the cancelled pull", len(slots))
+			}
+			assertNoBinding(t, gotImg, root)
+			assertNoTemps(t, gotObj)
+
+			got, err := Delta(context.Background(), gotObj, gotImg, openLayout(t, releaseN1), openLayout(t, releaseN1), root, fixturePlatform, slots)
+			if err != nil {
+				t.Fatalf("Delta rerun: %v", err)
+			}
+			wantRoot, wantObj, wantImg := newStores(t)
+			want, err := Materialize(context.Background(), wantObj, wantImg, openLayout(t, releaseN1), root, fixturePlatform, newSlots(2))
+			if err != nil {
+				t.Fatalf("Materialize: %v", err)
+			}
+			assertSameImage(t, wantRoot, want, gotRoot, got)
 		})
 	}
 }
@@ -618,6 +811,22 @@ type recorder struct {
 	wholeFrom map[digest.Digest]int
 	// failAt fails the n-th range request overall, counted from 1; 0 fails none.
 	failAt int
+	// failOpen fails every Open of the blobs in it with the given error.
+	failOpen map[digest.Digest]error
+	// onRange, when set, is told the count of range requests so far, before
+	// each one is served; onOpen, when set, runs before each Open is served,
+	// told the blob.
+	onRange func(n int)
+	onOpen  func(d digest.Digest)
+	// meet holds the first Open of each blob in it until every one of them
+	// has begun, so a pull that opens them one at a time never gets past the
+	// first; the last arrival closes met.
+	meet map[digest.Digest]bool
+	met  chan struct{}
+	// holdRange holds the n-th range request, counted from 1, until the
+	// pull is cancelled; held is closed when that request arrives.
+	holdRange int
+	held      chan struct{}
 
 	mu     sync.Mutex
 	opens  []digest.Digest
@@ -632,7 +841,25 @@ func newRecorder(t *testing.T, dir string) *recorder {
 func (r *recorder) Open(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
 	r.mu.Lock()
 	r.opens = append(r.opens, desc.Digest)
+	meet := r.meet[desc.Digest]
+	delete(r.meet, desc.Digest)
+	if meet && len(r.meet) == 0 {
+		close(r.met)
+	}
 	r.mu.Unlock()
+	if meet {
+		select {
+		case <-r.met:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if r.onOpen != nil {
+		r.onOpen(desc.Digest)
+	}
+	if err := r.failOpen[desc.Digest]; err != nil {
+		return nil, err
+	}
 	return r.src.Open(ctx, desc)
 }
 
@@ -647,8 +874,16 @@ func (r *recorder) OpenRange(ctx context.Context, desc ocispec.Descriptor, off, 
 		}
 	}
 	r.mu.Unlock()
+	if r.onRange != nil {
+		r.onRange(total)
+	}
 	if r.failAt != 0 && total == r.failAt {
 		return nil, false, errInjected
+	}
+	if r.holdRange != 0 && total == r.holdRange {
+		close(r.held)
+		<-ctx.Done()
+		return nil, false, ctx.Err()
 	}
 	if from, ok := r.wholeFrom[desc.Digest]; ok && ofBlob >= from {
 		stream, err := ocichain.OpenBlob(ctx, r.src, desc)
@@ -693,7 +928,7 @@ func (r *recorder) assertRanges(t *testing.T, want []rangeReq) {
 }
 
 // assertOpens asserts the recorder saw exactly the layer blobs in want
-// opened whole, in order, besides the metadata blobs every pull reads.
+// opened whole, in any order, besides the metadata blobs every pull reads.
 func (r *recorder) assertOpens(t *testing.T, want []digest.Digest) {
 	t.Helper()
 	r.mu.Lock()
@@ -704,6 +939,9 @@ func (r *recorder) assertOpens(t *testing.T, want []digest.Digest) {
 			got = append(got, d)
 		}
 	}
+	want = append([]digest.Digest(nil), want...)
+	slices.Sort(got)
+	slices.Sort(want)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("layer blobs opened whole:\n got=%v\nwant=%v", got, want)
 	}
