@@ -147,14 +147,15 @@ own. The same sequence works with `--from-dir` against a layout directory.
 What a delta can save is bounded by the share of file bytes the two releases
 have in common (how much of that bound a pull realises then depends on the
 compression, the coalescing of ranges and the fallback thresholds), and that
-share is the publisher's to control. A rebuild that
-regenerates files — compiled artifacts, gzip-compressed documentation,
-package updates — changes their digests even when nothing meaningful
-changed: two official `python` builds a month apart shared 7 % of their file
-bytes, so `--delta` saved nothing between them, while a fleet's own images
-rebuilt over a stable base shared about 69 %. A build pipeline that keeps
-unchanged files byte-identical from one release to the next is what makes
-`--delta` pay.
+share is the publisher's to control. A rebuild that regenerates files —
+compiled artifacts, gzip-compressed documentation, package updates — changes
+their digests even when nothing meaningful changed. Measured on official
+images: consecutive patch releases of the same lines (nginx, debian, python)
+shared 69 % of their file bytes on average and 85 % in the median update,
+while a release that also rebuilt its base image shared 7 % (two `python`
+builds a month apart) or less than 1 %, so `--delta` saved nothing there. A
+build pipeline that keeps unchanged files byte-identical from one release to
+the next is what makes `--delta` pay.
 
 What the image needs: zstd:chunked layers, as `skopeo copy
 --dest-compress-format zstd:chunked` writes them. Such a layer is a
