@@ -30,8 +30,10 @@ import (
 // a layer whose plan exceeds them is fetched whole.
 var (
 	// coalesceGap is the widest gap between two files' extents that one range
-	// request spans rather than two.
-	coalesceGap int64 = 64 << 10
+	// request spans rather than two. Measured on arm64 devices, 256 KiB cuts
+	// the wall time of an update by 6-29% against 64 KiB and fetches 10-13%
+	// more bytes, the gaps costing less than the requests they save.
+	coalesceGap int64 = 256 << 10
 	// maxDeltaRequests is the most range requests one layer may take.
 	maxDeltaRequests = 256
 	// maxDeltaFraction is the largest share of a layer blob the ranges may
