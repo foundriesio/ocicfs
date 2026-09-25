@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -192,8 +193,9 @@ type (
 		puller    *remote.Puller
 		transport http.RoundTripper // the base transport range requests are built on
 
-		mu      sync.Mutex
-		rangeTr http.RoundTripper // the authenticated transport range requests go through, built on first use
+		mu       sync.Mutex
+		rangeTr  http.RoundTripper          // the authenticated transport range requests go through, built on first use
+		blobURLs map[digest.Digest]*url.URL // per blob, the URL its last accepted range answer came from after a redirect
 	}
 
 	// bodySource hands an already fetched response body to OpenBlob's verifier.
@@ -247,12 +249,18 @@ func (s *source) Open(ctx context.Context, desc ocispec.Descriptor) (io.ReadClos
 }
 
 // OpenRange fetches n bytes of desc's blob starting at off with one HTTP Range
-// request to the blobs endpoint. A registry that ignores the Range header
-// answers 200 with the whole blob; that stream is returned verified against
-// desc, with whole=true. A 206 answer must cover exactly the requested span of
-// a blob of desc.Size, and a redirect to blob storage carries the Range header
-// along, but not to a private or link-local address literal. Any other answer
-// is an error.
+// request. A registry that ignores the Range header answers 200 with the whole
+// blob; that stream is returned verified against desc, with whole=true. A 206
+// answer must cover exactly the requested span of a blob of desc.Size, and a
+// redirect to blob storage carries the Range header along, but not to a
+// private or link-local address literal. Any other answer is an error.
+//
+// The URL a redirect lands on is remembered per blob for the source's
+// lifetime, and later ranges of that blob are requested from it directly. An
+// answer from a remembered URL that is not an acceptable 206 or 200, or a
+// request that fails before any answer, forgets the URL and the range is
+// re-resolved through the registry's blobs endpoint once; a failure while ctx
+// is cancelled keeps the URL and returns the cancellation.
 func (s *source) OpenRange(ctx context.Context, desc ocispec.Descriptor, off, n int64) (io.ReadCloser, bool, error) {
 	if err := digestutil.ValidateSHA256(desc.Digest); err != nil {
 		return nil, false, fmt.Errorf("ociremote: blob digest: %w", err)
@@ -272,32 +280,88 @@ func (s *source) OpenRange(ctx context.Context, desc ocispec.Descriptor, off, n 
 	if err != nil {
 		return nil, false, fmt.Errorf("ociremote: range transport for %s: %w", s.repo.Name(), err)
 	}
-	u := fmt.Sprintf("%s://%s/v2/%s/blobs/%s", s.repo.Scheme(), s.repo.RegistryStr(), s.repo.RepositoryStr(), desc.Digest)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil, false, fmt.Errorf("ociremote: range request for %s: %w", desc.Digest, err)
-	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, off+n-1))
-	resp, err := (&http.Client{Transport: tr, CheckRedirect: checkRedirect}).Do(req)
-	if err != nil {
-		return nil, false, fmt.Errorf("ociremote: fetch range of %s: %w", desc.Digest, redactURL(err))
+	client := &http.Client{Transport: tr, CheckRedirect: checkRedirect}
+
+	s.mu.Lock()
+	cached := s.blobURLs[desc.Digest]
+	s.mu.Unlock()
+	if cached != nil {
+		cachedURL := cached.String()
+		resp, err := fetchRange(ctx, client, cachedURL, desc, off, n)
+		if err == nil {
+			var (
+				rc    io.ReadCloser
+				whole bool
+			)
+			rc, whole, err = s.openAnswer(ctx, resp, cachedURL, desc, off, n)
+			if err == nil {
+				return rc, whole, nil
+			}
+		}
+		// A cancellation is nothing against the remembered URL, so it is kept
+		// and the cancellation itself is returned. Any other failure forgets
+		// the URL and the range is asked of the registry below; the error
+		// states which answer, or which transport failure, it was.
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, false, cerr
+		}
+		s.forgetBlobURL(desc.Digest, cached)
+		slog.Debug("ociremote: remembered blob URL did not serve the range, asking the registry again", "digest", desc.Digest, "host", cached.Host, "err", err)
 	}
 
+	u := fmt.Sprintf("%s://%s/v2/%s/blobs/%s", s.repo.Scheme(), s.repo.RegistryStr(), s.repo.RepositoryStr(), desc.Digest)
+	resp, err := fetchRange(ctx, client, u, desc, off, n)
+	if err != nil {
+		return nil, false, err
+	}
+	return s.openAnswer(ctx, resp, u, desc, off, n)
+}
+
+// openAnswer turns the answer to a range request sent to u into the caller's
+// reader: the exact span of a 206 that covers it, or the verified whole blob
+// of a 200. Either is accepted, and when the answer came from another URL
+// than u, after a redirect, that URL is remembered for desc's blob. Any other
+// answer is an error and its body is closed.
+func (s *source) openAnswer(ctx context.Context, resp *http.Response, u string, desc ocispec.Descriptor, off, n int64) (io.ReadCloser, bool, error) {
+	var (
+		rc    io.ReadCloser
+		whole bool
+	)
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
 		if err := checkPartialContent(resp, off, n, desc.Size); err != nil {
 			return nil, false, closeBody(resp.Body, fmt.Errorf("ociremote: range of %s: %w", desc.Digest, err))
 		}
-		return &exactReader{body: resp.Body, remaining: n}, false, nil
+		rc = &exactReader{body: resp.Body, remaining: n}
 	case http.StatusOK:
-		rc, err := ocichain.OpenBlob(ctx, bodySource{body: resp.Body}, desc)
+		verified, err := ocichain.OpenBlob(ctx, bodySource{body: resp.Body}, desc)
 		if err != nil {
 			return nil, false, closeBody(resp.Body, err)
 		}
-		return rc, true, nil
+		rc, whole = verified, true
 	default:
 		err := transport.CheckError(resp, http.StatusPartialContent, http.StatusOK)
 		return nil, false, closeBody(resp.Body, notFoundOr(fmt.Errorf("ociremote: fetch range of %s: %w", desc.Digest, err), err, desc.Digest))
+	}
+	if final := resp.Request.URL; final.String() != u {
+		s.mu.Lock()
+		if s.blobURLs == nil {
+			s.blobURLs = make(map[digest.Digest]*url.URL)
+		}
+		s.blobURLs[desc.Digest] = final
+		s.mu.Unlock()
+	}
+	return rc, whole, nil
+}
+
+// forgetBlobURL removes failed from the remembered URLs, so the next range of
+// dgst's blob is resolved through the registry again. A different URL, which
+// another range remembered in the meantime, is left in place.
+func (s *source) forgetBlobURL(dgst digest.Digest, failed *url.URL) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.blobURLs[dgst] == failed {
+		delete(s.blobURLs, dgst)
 	}
 }
 
@@ -329,6 +393,22 @@ func (s *source) rangeTransport(ctx context.Context) (http.RoundTripper, error) 
 	return s.rangeTr, nil
 }
 
+// fetchRange sends one Range request for off+n of desc's blob to u and returns
+// the answer, whatever its status. A failure before any answer is wrapped with
+// its URL's query redacted.
+func fetchRange(ctx context.Context, client *http.Client, u string, desc ocispec.Descriptor, off, n int64) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ociremote: range request for %s: %w", desc.Digest, err)
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, off+n-1))
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("ociremote: fetch range of %s: %w", desc.Digest, redactURL(err))
+	}
+	return resp, nil
+}
+
 // retryStatusCodes are the answers a range request is retried on: the
 // registry is momentarily unavailable or rate-limiting, and the request has
 // no body to replay.
@@ -345,7 +425,12 @@ var retryStatusCodes = []int{
 // link-local IP address: a registry must not be able to send a blob request to
 // a service inside the device's own network. Same-host redirects and host
 // names are allowed, as is the client's default hop limit.
+//
+// It also drops the Referer the client sets on a redirected request from the
+// URL the request came from: that URL may be a blob storage URL whose query
+// carries signed credentials, and no request sent from here needs the header.
 func checkRedirect(req *http.Request, via []*http.Request) error {
+	req.Header.Del("Referer")
 	if len(via) >= 10 {
 		return errors.New("stopped after 10 redirects")
 	}
