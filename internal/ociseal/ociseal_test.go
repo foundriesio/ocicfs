@@ -84,34 +84,63 @@ func TestMergedAnnotationSharesPrefix(t *testing.T) {
 	}
 }
 
-func TestVerifyAnnotationsNonCanonical(t *testing.T) {
+// TestVerifyAnnotations walks the merged-annotation matrix on both
+// constructions: the annotation compared is the one selected by presence — the
+// standard key, else the fallback key — whatever the canonical flag, and a
+// non-canonical construction refuses the whole standard namespace first.
+func TestVerifyAnnotations(t *testing.T) {
 	store, err := objectstore.New(t.TempDir())
 	if err != nil {
 		t.Fatalf("objectstore.New: %v", err)
 	}
-	hexDigest := strings.Repeat("a", 64)
+	const unrecognized = "composefs.merged.erofs.v1.fsverity-sha512-12"
+	good, stale := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	measured := "sha256:" + good
 	tests := []struct {
 		name        string
 		annotations map[string]string
-		measured    string
-		wantErr     bool
+		canonical   bool
+		wantErr     string // substring of the expected error; empty means accepted
 	}{
-		{name: "exact merged key", annotations: map[string]string{MergedAnnotation: hexDigest}, wantErr: true},
-		{name: "sha512 suffix", annotations: map[string]string{"composefs.merged.erofs.v1.fsverity-sha512-12": hexDigest}, wantErr: true},
-		{name: "signature suffix", annotations: map[string]string{"composefs.merged.erofs.v1.fsverity-sha256-12.sig": "not-a-digest"}, wantErr: true},
-		{name: "config namespace only", annotations: map[string]string{ConfigAnnotation: hexDigest}},
-		{name: "unrelated annotation", annotations: map[string]string{"org.opencontainers.image.title": "app"}},
-		{name: "no annotations"},
-		{name: "fallback match", annotations: map[string]string{FallbackMergedAnnotation: hexDigest}, measured: "sha256:" + hexDigest},
-		{name: "fallback mismatch", annotations: map[string]string{FallbackMergedAnnotation: hexDigest}, measured: "sha256:" + strings.Repeat("b", 64), wantErr: true},
-		{name: "fallback beside merged key", annotations: map[string]string{FallbackMergedAnnotation: hexDigest, MergedAnnotation: hexDigest}, measured: "sha256:" + hexDigest, wantErr: true},
+		{name: "canonical: none", canonical: true},
+		{name: "canonical: unrelated annotation", canonical: true, annotations: map[string]string{"org.opencontainers.image.title": "app"}},
+		{name: "canonical: standard match", canonical: true, annotations: map[string]string{MergedAnnotation: good}},
+		{name: "canonical: standard mismatch", canonical: true, annotations: map[string]string{MergedAnnotation: stale}, wantErr: "mismatch"},
+		{name: "canonical: standard malformed", canonical: true, annotations: map[string]string{MergedAnnotation: "not-a-digest"}, wantErr: "sealing annotation"},
+		{name: "canonical: fallback match", canonical: true, annotations: map[string]string{FallbackMergedAnnotation: good}},
+		{name: "canonical: fallback mismatch", canonical: true, annotations: map[string]string{FallbackMergedAnnotation: stale}, wantErr: "mismatch"},
+		{name: "canonical: fallback malformed", canonical: true, annotations: map[string]string{FallbackMergedAnnotation: "not-a-digest"}, wantErr: "sealing annotation"},
+		{name: "canonical: standard beside a stale fallback", canonical: true, annotations: map[string]string{MergedAnnotation: good, FallbackMergedAnnotation: stale}},
+		{name: "canonical: standard beside a malformed fallback", canonical: true, annotations: map[string]string{MergedAnnotation: good, FallbackMergedAnnotation: "not-a-digest"}},
+		{name: "canonical: stale standard beside a matching fallback", canonical: true, annotations: map[string]string{MergedAnnotation: stale, FallbackMergedAnnotation: good}, wantErr: "mismatch"},
+		{name: "canonical: unrecognized kind alone", canonical: true, annotations: map[string]string{unrecognized: good}, wantErr: "unrecognized digest kind"},
+		{name: "canonical: unrecognized kind beside standard", canonical: true, annotations: map[string]string{unrecognized: stale, MergedAnnotation: good}},
+		{name: "canonical: unrecognized kind beside a stale standard", canonical: true, annotations: map[string]string{unrecognized: good, MergedAnnotation: stale}, wantErr: "mismatch"},
+		{name: "canonical: unrecognized kind beside fallback", canonical: true, annotations: map[string]string{unrecognized: stale, FallbackMergedAnnotation: good}},
+
+		{name: "non-canonical: none"},
+		{name: "non-canonical: unrelated annotation", annotations: map[string]string{"org.opencontainers.image.title": "app"}},
+		{name: "non-canonical: standard match", annotations: map[string]string{MergedAnnotation: good}, wantErr: "non-canonical"},
+		{name: "non-canonical: unrecognized kind alone", annotations: map[string]string{unrecognized: good}, wantErr: "non-canonical"},
+		{name: "non-canonical: config namespace only", annotations: map[string]string{ConfigAnnotation: good}},
+		{name: "non-canonical: signature suffix", annotations: map[string]string{MergedAnnotation + ".sig": "not-a-digest"}, wantErr: "non-canonical"},
+		{name: "non-canonical: fallback match", annotations: map[string]string{FallbackMergedAnnotation: good}},
+		{name: "non-canonical: fallback mismatch", annotations: map[string]string{FallbackMergedAnnotation: stale}, wantErr: "mismatch"},
+		{name: "non-canonical: fallback beside standard", annotations: map[string]string{FallbackMergedAnnotation: good, MergedAnnotation: good}, wantErr: "non-canonical"},
+		{name: "non-canonical: fallback beside an unrecognized kind", annotations: map[string]string{FallbackMergedAnnotation: good, unrecognized: good}, wantErr: "non-canonical"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			res := ocichain.Resolved{Manifest: ocispec.Manifest{Annotations: tt.annotations}}
-			err := VerifyAnnotations(context.Background(), store, res, tt.measured, false)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("VerifyAnnotations error = %v, wantErr %t", err, tt.wantErr)
+			err := VerifyAnnotations(context.Background(), store, res, measured, tt.canonical)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("VerifyAnnotations: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("VerifyAnnotations error = %v, want %q", err, tt.wantErr)
 			}
 		})
 	}

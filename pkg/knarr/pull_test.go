@@ -915,6 +915,144 @@ func TestVerifiedPulledImageNonCanonicalSealingPolicy(t *testing.T) {
 	})
 }
 
+// TestPullSealingAnnotationMatrix walks the sealing-annotation matrix on the
+// cached path and on a fresh pull, for a canonical and a non-canonical
+// construction: the merged annotation compared is the one selected by
+// presence, the standard key before the fallback key, whatever the
+// construction; a non-canonical construction refuses the whole standard
+// namespace; the config annotation is keyed by the construction.
+func TestPullSealingAnnotationMatrix(t *testing.T) {
+	const unrecognized = ociseal.MergedAnnotationPrefix + "fsverity-sha512-12"
+	stale := strings.Repeat("0", 64)
+	body := "a payload larger than the sixty-four byte inline limit so it becomes an object\n"
+	type sealCase struct {
+		name        string
+		manifestAnn map[string]string
+		configAnn   map[string]string
+		wantErr     string // substring of the expected error; empty means the pull succeeds
+	}
+	for _, build := range []struct {
+		name      string
+		canonical bool
+		files     []octest.File
+		cases     func(merged, config string) []sealCase
+	}{
+		{
+			name: "canonical", canonical: true, files: canonicalPullFiles(body),
+			cases: func(merged, config string) []sealCase {
+				return []sealCase{
+					{name: "none"},
+					{name: "standard", manifestAnn: map[string]string{ociseal.MergedAnnotation: merged}},
+					{name: "stale standard", manifestAnn: map[string]string{ociseal.MergedAnnotation: stale}, wantErr: "mismatch"},
+					{name: "fallback", manifestAnn: map[string]string{ociseal.FallbackMergedAnnotation: merged}},
+					{name: "stale fallback", manifestAnn: map[string]string{ociseal.FallbackMergedAnnotation: stale}, wantErr: "mismatch"},
+					{name: "both", manifestAnn: map[string]string{ociseal.MergedAnnotation: merged, ociseal.FallbackMergedAnnotation: merged}},
+					{name: "standard beside a stale fallback", manifestAnn: map[string]string{ociseal.MergedAnnotation: merged, ociseal.FallbackMergedAnnotation: stale}},
+					{name: "standard beside a malformed fallback", manifestAnn: map[string]string{ociseal.MergedAnnotation: merged, ociseal.FallbackMergedAnnotation: "not-a-digest"}},
+					{name: "stale standard beside fallback", manifestAnn: map[string]string{ociseal.MergedAnnotation: stale, ociseal.FallbackMergedAnnotation: merged}, wantErr: "mismatch"},
+					{name: "unrecognized kind alone", manifestAnn: map[string]string{unrecognized: merged}, wantErr: "unrecognized digest kind"},
+					{name: "unrecognized kind beside standard", manifestAnn: map[string]string{unrecognized: stale, ociseal.MergedAnnotation: merged}},
+					{name: "unrecognized kind beside fallback", manifestAnn: map[string]string{unrecognized: stale, ociseal.FallbackMergedAnnotation: merged}},
+					{name: "config only", configAnn: map[string]string{ociseal.ConfigAnnotation: config}},
+					{name: "stale config only", configAnn: map[string]string{ociseal.ConfigAnnotation: stale}, wantErr: "mismatch"},
+				}
+			},
+		},
+		{
+			name: "non-canonical", files: []octest.File{{Name: "etc/config", Mode: 0o644, Body: body}},
+			cases: func(merged, config string) []sealCase {
+				return []sealCase{
+					{name: "none"},
+					{name: "standard", manifestAnn: map[string]string{ociseal.MergedAnnotation: merged}, wantErr: "non-canonical"},
+					{name: "fallback", manifestAnn: map[string]string{ociseal.FallbackMergedAnnotation: merged}},
+					{name: "stale fallback", manifestAnn: map[string]string{ociseal.FallbackMergedAnnotation: stale}, wantErr: "mismatch"},
+					{name: "both", manifestAnn: map[string]string{ociseal.MergedAnnotation: merged, ociseal.FallbackMergedAnnotation: merged}, wantErr: "non-canonical"},
+					{name: "unrecognized kind alone", manifestAnn: map[string]string{unrecognized: merged}, wantErr: "non-canonical"},
+					{name: "unrecognized kind beside fallback", manifestAnn: map[string]string{unrecognized: merged, ociseal.FallbackMergedAnnotation: merged}, wantErr: "non-canonical"},
+					{name: "config only", configAnn: map[string]string{ociseal.FallbackConfigAnnotation: config}},
+					{name: "stale config only", configAnn: map[string]string{ociseal.FallbackConfigAnnotation: stale}, wantErr: "mismatch"},
+				}
+			},
+		},
+	} {
+		t.Run(build.name, func(t *testing.T) {
+			lay, err := octest.BuildSingleLayerGzip(t.TempDir(), hostPlatform(), build.files...)
+			if err != nil {
+				t.Fatalf("BuildSingleLayerGzip: %v", err)
+			}
+			obj, imgStore, binding := pullForSealingTest(t, lay)
+			if binding.Canonical != build.canonical {
+				t.Fatalf("binding recorded canonical = %v, want %v", binding.Canonical, build.canonical)
+			}
+			merged := sealingValue(t, binding.FsverityDigest)
+			configFsverity, err := obj.VerityDigest(lay.Config)
+			if err != nil {
+				t.Fatalf("VerityDigest(config): %v", err)
+			}
+			for _, tt := range build.cases(merged, sealingValue(t, configFsverity)) {
+				check := func(t *testing.T, err error) {
+					t.Helper()
+					if tt.wantErr == "" {
+						if err != nil {
+							t.Fatalf("error = %v, want none", err)
+						}
+						return
+					}
+					if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+						t.Fatalf("error = %v, want %q", err, tt.wantErr)
+					}
+				}
+				identity := rebindManifestAnnotations(t, obj, imgStore, lay, binding, tt.manifestAnn, tt.configAnn)
+				t.Run(tt.name+"/cached", func(t *testing.T) {
+					_, ok, err := verifiedPulledImage(context.Background(), obj, imgStore, identity, lay.Platform)
+					check(t, err)
+					if ok != (tt.wantErr == "") {
+						t.Fatalf("verifiedPulledImage reported cached = %v", ok)
+					}
+				})
+				t.Run(tt.name+"/fresh", func(t *testing.T) {
+					// The rewritten manifest joins the layout, so a store that
+					// has never seen the image builds it under that manifest.
+					stored, err := obj.Open(identity.Digest)
+					if err != nil {
+						t.Fatalf("open rewritten manifest: %v", err)
+					}
+					raw, err := io.ReadAll(stored)
+					_ = stored.Close()
+					if err != nil {
+						t.Fatalf("read rewritten manifest: %v", err)
+					}
+					if err := os.WriteFile(filepath.Join(lay.Dir, "blobs", "sha256", identity.Digest.Encoded()), raw, 0o600); err != nil {
+						t.Fatalf("write rewritten manifest: %v", err)
+					}
+					storeRoot := verityStoreRoot(t)
+					eng, err := New(Config{Root: storeRoot})
+					if err != nil {
+						t.Fatalf("New: %v", err)
+					}
+					_, err = eng.Pull(context.Background(), "app@"+identity.Digest.String(), WithFromDir(lay.Dir))
+					check(t, err)
+					_, statErr := os.Stat(octest.BindingPath(storeRoot, identity.Digest, lay.Platform))
+					if bound := statErr == nil; bound != (tt.wantErr == "") {
+						t.Fatalf("binding written = %v after a pull that returned %v", bound, err)
+					}
+				})
+			}
+		})
+	}
+}
+
+// sealingValue converts a measured fs-verity digest into the bare hex form a
+// sealing annotation records.
+func sealingValue(t *testing.T, fsverity string) string {
+	t.Helper()
+	value, err := ociseal.AnnotationValue(fsverity)
+	if err != nil {
+		t.Fatalf("AnnotationValue(%q): %v", fsverity, err)
+	}
+	return value
+}
+
 // canonicalPullFiles is a standard-layout single-layer tree — /usr and its
 // intermediate directories are explicit, so the construction is canonical.
 func canonicalPullFiles(body string) []octest.File {

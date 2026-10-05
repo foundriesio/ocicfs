@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"golang.org/x/sys/unix"
 
@@ -134,36 +133,20 @@ func (e *engine) mount(ctx context.Context, ref, target string, opts ...MountOpt
 // expectedFsverity selects the fs-verity digest a mount enforces from the
 // verified identity-manifest annotations, falling back to the binding's
 // locally measured digest only when the manifest carries no merged-image
-// sealing annotation. Selection is by annotation presence alone, never by the
-// binding's canonical flag: the binding is untrusted here, and letting it
+// sealing annotation. The annotation is selected by presence alone, never by
+// the binding's canonical flag: the binding is untrusted here, and letting it
 // steer the key choice would let a tampered binding present a sealed image as
-// unsealed and re-enter binding trust. The standard key wins over the knarr
-// fallback key when both are present. A malformed value and a merged-image
-// annotation of an unrecognized digest kind both fail closed: the publisher
-// sealed the image, so falling back to the binding would silently drop the
-// seal. An unrecognized digest kind coexisting with a recognized key does
-// not fail: every annotation sits inside the hash-pinned manifest, so the
-// combination is publisher-authored — dual-sealing for a format migration —
-// not a downgrade an attacker can induce, and the recognized seal pins the
-// content at full strength on its own.
+// unsealed and re-enter binding trust. A sealing annotation that cannot be
+// verified fails closed rather than falling back to the binding.
 func expectedFsverity(annotations map[string]string, bindingFsverity string) (string, bool, error) {
-	for _, key := range []string{ociseal.MergedAnnotation, ociseal.FallbackMergedAnnotation} {
-		value, ok := annotations[key]
-		if !ok {
-			continue
-		}
-		sealedDigest, err := ociseal.ParseAnnotation(value)
-		if err != nil {
-			return "", false, fmt.Errorf("sealing annotation %s: %w", key, err)
-		}
-		return sealedDigest, true, nil
+	key, sealedDigest, err := ociseal.SelectMergedAnnotation(annotations)
+	if err != nil {
+		return "", false, err
 	}
-	for key := range annotations {
-		if strings.HasPrefix(key, ociseal.MergedAnnotationPrefix) {
-			return "", false, fmt.Errorf("unverifiable sealing annotation %q: unrecognized digest kind", key)
-		}
+	if key == "" {
+		return bindingFsverity, false, nil
 	}
-	return bindingFsverity, false, nil
+	return sealedDigest, true, nil
 }
 
 func validateMountTarget(target string) error {
