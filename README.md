@@ -15,11 +15,11 @@ upper-layer agent that drives knarr.
 
 > **Status: early development.** The device-side verbs are wired end to
 > end: `pull` from an OCI registry (digest-pinned or tagged) or a local OCI
-> layout, with fail-closed verification of sealed images; read-only,
-> writable (`--rw`), and metadata-only `mount`; `unmount`, `ls`, `inspect`,
-> `hold`/`release`, `remove`, and `gc`; plus the publisher-side `seal`.
-> Pull fetches whole layers today — per-file delta fetch from the
-> zstd:chunked TOC is not implemented yet — and the publisher-side
+> layout, with fail-closed verification of sealed images and, with
+> `--delta`, per-file fetch from the zstd:chunked TOC (see
+> [docs/pull.md](docs/pull.md)); read-only, writable (`--rw`), and
+> metadata-only `mount`; `unmount`, `ls`, `inspect`, `hold`/`release`,
+> `remove`, and `gc`; plus the publisher-side `seal`. The publisher-side
 > `publish` is still to come.
 
 ## Project docs
