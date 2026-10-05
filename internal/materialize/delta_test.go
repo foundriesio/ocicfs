@@ -35,6 +35,7 @@ import (
 	"github.com/foundriesio/knarr/internal/objectstore"
 	"github.com/foundriesio/knarr/internal/ocichain"
 	"github.com/foundriesio/knarr/internal/ocilayout"
+	"github.com/foundriesio/knarr/internal/octest"
 	"github.com/foundriesio/knarr/internal/rootfs"
 	"github.com/foundriesio/knarr/internal/zstdchunked"
 )
@@ -546,8 +547,8 @@ func TestDeltaTOCFailureFallsBack(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "blob digest mismatch") {
 			t.Fatalf("Delta returned %v, want a layer digest mismatch", err)
 		}
-		if !strings.Contains(logs.String(), "falling back to whole layer") {
-			t.Fatalf("no fallback warning logged:\n%s", logs)
+		if !strings.Contains(logs.String(), "table of contents unusable") {
+			t.Fatalf("no warning about the table of contents logged:\n%s", logs)
 		}
 		assertNoBinding(t, img, root)
 	})
@@ -566,8 +567,8 @@ func assertTOCFallbackMatches(t *testing.T, dir string, root digest.Digest) {
 	if err != nil {
 		t.Fatalf("Delta: %v", err)
 	}
-	if !strings.Contains(logs.String(), "falling back to whole layer") {
-		t.Fatalf("no fallback warning logged:\n%s", logs)
+	if !strings.Contains(logs.String(), "table of contents unusable") {
+		t.Fatalf("no warning about the table of contents logged:\n%s", logs)
 	}
 	wantRoot, wantObj, wantImg := newStores(t)
 	want, err := Materialize(context.Background(), wantObj, wantImg, openLayout(t, dir), root, fixturePlatform, newSlots(2))
@@ -631,6 +632,322 @@ func TestDeltaMixedImage(t *testing.T) {
 	if ranges := rec.rangesOf(layers[0].Digest); len(ranges) < 2 {
 		t.Fatalf("the zstd:chunked layer took %d range requests, want its table and its files", len(ranges))
 	}
+}
+
+// TestDeltaReusesSavedLayer asserts a delta pull merges a layer without a
+// table of contents from its saved layer, whichever kind of pull saved it,
+// instead of reading its tar stream, reports it as fetched from nothing, and
+// builds the image a whole pull builds. A layer built from its table is not
+// saved.
+func TestDeltaReusesSavedLayer(t *testing.T) {
+	requireTools(t)
+	root := fixtureRoot(t, fixtureLayout, "mixed")
+	layers := fixtureLayers(t, fixtureLayout, "mixed")
+	for _, c := range []struct {
+		name  string
+		first func(obj *objectstore.Store, img *imagestore.Store) error
+		saved []digest.Digest
+	}{
+		{
+			name: "saved by a delta pull",
+			first: func(obj *objectstore.Store, img *imagestore.Store) error {
+				_, err := Delta(context.Background(), obj, img, openLayout(t, fixtureLayout), openLayout(t, fixtureLayout), root, fixturePlatform, newSlots(2))
+				return err
+			},
+			saved: []digest.Digest{layers[1].Digest},
+		},
+		{
+			name: "saved by a whole pull",
+			first: func(obj *objectstore.Store, img *imagestore.Store) error {
+				_, err := Materialize(context.Background(), obj, img, openLayout(t, fixtureLayout), root, fixturePlatform, newSlots(2))
+				return err
+			},
+			saved: []digest.Digest{layers[0].Digest, layers[1].Digest},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			gotRoot, gotObj, gotImg := newStores(t)
+			if err := c.first(gotObj, gotImg); err != nil {
+				skipIfNoVerity(t, err)
+				t.Fatalf("first pull: %v", err)
+			}
+			for _, l := range layers {
+				assertSaved(t, gotImg, slices.Contains(c.saved, l.Digest), l.Digest)
+			}
+
+			logs := captureLogs(t)
+			rec := newRecorder(t, fixtureLayout)
+			rec.failOpen = map[digest.Digest]error{layers[1].Digest: errInjected}
+			got, err := Delta(context.Background(), gotObj, gotImg, rec, rec, root, fixturePlatform, newSlots(2))
+			if err != nil {
+				t.Fatalf("Delta over the saved layer: %v", err)
+			}
+			rec.assertOpens(t, nil)
+			if ranges := rec.rangesOf(layers[1].Digest); len(ranges) != 0 {
+				t.Fatalf("the saved layer took %d range requests", len(ranges))
+			}
+			if fetched := loggedField(t, logs.String(), layers[1].Digest, "fetched"); fetched != 0 {
+				t.Fatalf("the saved layer logged fetched=%d, want 0", fetched)
+			}
+			if n := strings.Count(logs.String(), "fallback="+fallbackSaved); n != 1 {
+				t.Fatalf("logged %d layers as merged from a saved layer, want 1:\n%s", n, logs)
+			}
+			wantRoot, wantObj, wantImg := newStores(t)
+			want, err := Materialize(context.Background(), wantObj, wantImg, openLayout(t, fixtureLayout), root, fixturePlatform, newSlots(2))
+			if err != nil {
+				t.Fatalf("Materialize: %v", err)
+			}
+			assertSameImage(t, wantRoot, want, gotRoot, got)
+		})
+	}
+}
+
+// TestDeltaSavedLayerMissingFiles asserts where a delta pull gets a file the
+// store lacks once a layer was merged from its saved layer. The image has a
+// layer with a table of contents under one without: both hold the same
+// inlined file and the same stored file, and the upper one a stored file of
+// its own. A file a table lists is fetched by range, the saved layer left
+// unread; a pending inlined file is always the table's; a stored file only
+// the saved layer lists has that layer read whole, once.
+func TestDeltaSavedLayerMissingFiles(t *testing.T) {
+	requireTools(t)
+	// The files asked of the base layer span most of its blob; keep them a
+	// range request.
+	restoreBounds(t)
+	maxDeltaFraction = 1
+	// The same bytes as two files of the base layer: usr/bin/tool, stored,
+	// and etc/inline, inlined.
+	const tool = "this file is bigger than sixty-four bytes so it is stored as an object.\ntool\n"
+	dir, root := composeImage(t, layerOf(t, releaseN1, "n1", 0), gzipLayer(t,
+		octest.File{Name: "opt", Dir: true},
+		octest.File{Name: "opt/tool", Mode: 0o755, Body: tool},
+		octest.File{Name: "opt/inline", Mode: 0o644, Body: "tiny"},
+		octest.File{Name: "opt/own", Mode: 0o644, Body: stored("own")},
+	))
+	layers := fixtureLayers(t, dir, "composed")
+
+	for _, c := range []struct {
+		name    string
+		removed digest.Digest
+		opens   []digest.Digest
+		missing int64
+		fetched int64
+	}{
+		{"a table lists the file", digest.FromString(tool), nil, 0, 0},
+		{"only the saved layer lists the file", storedDigest("own"), []digest.Digest{layers[1].Digest}, 1, layers[1].Size},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			gotRoot, gotObj, gotImg := newStores(t)
+			if _, err := Delta(context.Background(), gotObj, gotImg, openLayout(t, dir), openLayout(t, dir), root, fixturePlatform, newSlots(2)); err != nil {
+				skipIfNoVerity(t, err)
+				t.Fatalf("first Delta: %v", err)
+			}
+			removeObjects(t, gotObj, c.removed)
+
+			logs := captureLogs(t)
+			rec := newRecorder(t, dir)
+			got, err := Delta(context.Background(), gotObj, gotImg, rec, rec, root, fixturePlatform, newSlots(2))
+			if err != nil {
+				t.Fatalf("Delta over the saved layer: %v", err)
+			}
+			rec.assertOpens(t, c.opens)
+			if ranges := rec.rangesOf(layers[1].Digest); len(ranges) != 0 {
+				t.Fatalf("the saved layer took %d range requests", len(ranges))
+			}
+			// The table, then the files the image inlines, which no store
+			// holds, with the stored file when it is the one missing.
+			names := []string{"etc/inline", "etc/b63", "etc/b64", "run/pid"}
+			if c.removed == digest.FromString(tool) {
+				names = append(names, "usr/bin/tool")
+			}
+			rec.assertRanges(t, []rangeReq{tocRange(t, layers[0]), extentOf(t, dir, layers[0], names...)})
+			if fetched := loggedField(t, logs.String(), layers[1].Digest, "fetched"); fetched != c.fetched {
+				t.Fatalf("the saved layer logged fetched=%d, want %d", fetched, c.fetched)
+			}
+			if missing := loggedField(t, logs.String(), layers[1].Digest, "missing"); missing != c.missing {
+				t.Fatalf("the saved layer logged missing=%d, want %d", missing, c.missing)
+			}
+			wantRoot, wantObj, wantImg := newStores(t)
+			want, err := Materialize(context.Background(), wantObj, wantImg, openLayout(t, dir), root, fixturePlatform, newSlots(2))
+			if err != nil {
+				t.Fatalf("Materialize: %v", err)
+			}
+			assertSameImage(t, wantRoot, want, gotRoot, got)
+		})
+	}
+}
+
+// TestDeltaSavedLayerFailureRemovesIt asserts a delta pull that fails over a
+// saved layer in a way the saved layer can have caused — a merge it breaks, a
+// file it names that no layer holds — removes it, and that the next delta
+// pull reads the layer and builds the image a whole pull builds.
+func TestDeltaSavedLayerFailureRemovesIt(t *testing.T) {
+	requireTools(t)
+	dir, root := composeImage(t, layerOf(t, releaseN1, "n1", 0), gzipLayer(t,
+		octest.File{Name: "opt", Dir: true},
+		octest.File{Name: "opt/own", Mode: 0o644, Body: stored("own")},
+		octest.File{Name: "opt/alias", Link: "opt/own"},
+	))
+	layers := fixtureLayers(t, dir, "composed")
+	for _, c := range []struct {
+		name    string
+		alter   func(t *testing.T, doc []byte) []byte
+		wantErr string
+		opens   []digest.Digest // by the failing pull
+	}{
+		{
+			name:    "hardlink to a missing target",
+			alter:   func(t *testing.T, doc []byte) []byte { return retargetSavedLink(t, doc, "opt/own", "opt/nope") },
+			wantErr: "target does not exist",
+		},
+		{
+			name: "fabricated stored file",
+			alter: func(_ *testing.T, doc []byte) []byte {
+				return appendSavedFile(doc, "opt/fabricated", digest.FromString("no layer carries this"))
+			},
+			wantErr: "supply payload",
+			opens:   []digest.Digest{layers[1].Digest},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			gotRoot, gotObj, gotImg := newStores(t)
+			if _, err := Delta(context.Background(), gotObj, gotImg, openLayout(t, dir), openLayout(t, dir), root, fixturePlatform, newSlots(2)); err != nil {
+				skipIfNoVerity(t, err)
+				t.Fatalf("first Delta: %v", err)
+			}
+			data, err := gotImg.GetLayer(layers[1].Digest)
+			if err != nil {
+				t.Fatalf("GetLayer: %v", err)
+			}
+			if err := gotImg.PutLayer(layers[1].Digest, rewriteSaved(t, data, func(doc []byte) []byte { return c.alter(t, doc) })); err != nil {
+				t.Fatalf("PutLayer: %v", err)
+			}
+
+			rec := newRecorder(t, dir)
+			_, err = Delta(context.Background(), gotObj, gotImg, rec, rec, root, fixturePlatform, newSlots(2))
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("Delta over the altered saved layer = %v, want %q", err, c.wantErr)
+			}
+			rec.assertOpens(t, c.opens)
+			assertSaved(t, gotImg, false, layers[1].Digest)
+			assertNoTemps(t, gotObj)
+
+			rec = newRecorder(t, dir)
+			got, err := Delta(context.Background(), gotObj, gotImg, rec, rec, root, fixturePlatform, newSlots(2))
+			if err != nil {
+				t.Fatalf("Delta again: %v", err)
+			}
+			rec.assertOpens(t, []digest.Digest{layers[1].Digest})
+			assertSaved(t, gotImg, true, layers[1].Digest)
+			wantRoot, wantObj, wantImg := newStores(t)
+			want, err := Materialize(context.Background(), wantObj, wantImg, openLayout(t, dir), root, fixturePlatform, newSlots(2))
+			if err != nil {
+				t.Fatalf("Materialize: %v", err)
+			}
+			assertSameImage(t, wantRoot, want, gotRoot, got)
+		})
+	}
+}
+
+// TestDeltaSavedLayerMergeFailureScope asserts a delta pull whose merge fails
+// removes the saved layers merged up to and including the failing layer, and
+// no saved layer above it: a delta pull decodes every saved layer before it
+// merges any.
+func TestDeltaSavedLayerMergeFailureScope(t *testing.T) {
+	requireTools(t)
+	sound := gzipLayer(t, sharedBase()...)
+	// A layer that scans cleanly and cannot be merged.
+	unmergeable := gzipLayer(t, octest.File{Name: "opt", Dir: true}, octest.File{Name: "opt/link", Link: "opt/nope"})
+	seedDir, seedRoot := composeImage(t, sound)
+	pull := func(t *testing.T, obj *objectstore.Store, img *imagestore.Store, dir string, root digest.Digest) error {
+		t.Helper()
+		_, err := Delta(context.Background(), obj, img, openLayout(t, dir), openLayout(t, dir), root, fixturePlatform, newSlots(2))
+		skipIfNoVerity(t, err)
+		return err
+	}
+
+	t.Run("saved layer above the failing one", func(t *testing.T) {
+		dir, root := composeImage(t, unmergeable, sound)
+		_, obj, img := newStores(t)
+		if err := pull(t, obj, img, seedDir, seedRoot); err != nil {
+			t.Fatalf("Delta of the seed image: %v", err)
+		}
+		if err := pull(t, obj, img, dir, root); err == nil || !strings.Contains(err.Error(), "target does not exist") {
+			t.Fatalf("Delta = %v, want the failed merge", err)
+		}
+		assertSaved(t, img, true, sound.desc.Digest)
+
+		// The scan saved the failing layer, so the next pull merges it from
+		// its saved layer: that one goes, the one above it still stays.
+		assertSaved(t, img, true, unmergeable.desc.Digest)
+		if err := pull(t, obj, img, dir, root); err == nil || !strings.Contains(err.Error(), "target does not exist") {
+			t.Fatalf("Delta again = %v, want the failed merge", err)
+		}
+		assertSaved(t, img, false, unmergeable.desc.Digest)
+		assertSaved(t, img, true, sound.desc.Digest)
+	})
+
+	t.Run("saved layer below the failing one", func(t *testing.T) {
+		dir, root := composeImage(t, sound, unmergeable)
+		_, obj, img := newStores(t)
+		if err := pull(t, obj, img, seedDir, seedRoot); err != nil {
+			t.Fatalf("Delta of the seed image: %v", err)
+		}
+		if err := pull(t, obj, img, dir, root); err == nil || !strings.Contains(err.Error(), "target does not exist") {
+			t.Fatalf("Delta = %v, want the failed merge", err)
+		}
+		assertSaved(t, img, false, sound.desc.Digest)
+	})
+}
+
+// TestDeltaUnusableTableThenSavedLayer asserts a layer whose table of
+// contents cannot be used is scanned and saved by the first delta pull and
+// merged from its saved layer by the next, which warns about the table,
+// opens no blob, and reports the layer as taken from its saved layer.
+func TestDeltaUnusableTableThenSavedLayer(t *testing.T) {
+	requireTools(t)
+	// The annotation promises a table larger than the cap, so it is refused
+	// before a byte of it is fetched; the blob is untouched.
+	dir := copyLayout(t, releaseN1)
+	root := rewriteLayer(t, dir, "n1", 1, func(desc *ocispec.Descriptor, blob []byte) []byte {
+		fields := strings.Split(desc.Annotations[zstdchunked.ManifestPositionKey], ":")
+		fields[2] = fmt.Sprint(64<<20 + 1)
+		desc.Annotations[zstdchunked.ManifestPositionKey] = strings.Join(fields, ":")
+		return blob
+	})
+	layers := fixtureLayers(t, dir, "n1")
+	gotRoot, gotObj, gotImg := newStores(t)
+	if _, err := Delta(context.Background(), gotObj, gotImg, openLayout(t, dir), openLayout(t, dir), root, fixturePlatform, newSlots(2)); err != nil {
+		skipIfNoVerity(t, err)
+		t.Fatalf("first Delta: %v", err)
+	}
+	assertSaved(t, gotImg, true, layers[1].Digest)
+
+	logs := captureLogs(t)
+	rec := newRecorder(t, dir)
+	got, err := Delta(context.Background(), gotObj, gotImg, rec, rec, root, fixturePlatform, newSlots(2))
+	if err != nil {
+		t.Fatalf("Delta over the saved layer: %v", err)
+	}
+	rec.assertOpens(t, nil)
+	if !strings.Contains(logs.String(), "table of contents unusable") {
+		t.Fatalf("no warning about the table of contents logged:\n%s", logs)
+	}
+	if strings.Contains(logs.String(), "whole layer") {
+		t.Fatalf("a warning speaks of a whole layer that was never read:\n%s", logs)
+	}
+	if n := strings.Count(logs.String(), "fallback="+fallbackSaved); n != 1 {
+		t.Fatalf("logged %d layers as merged from a saved layer, want 1:\n%s", n, logs)
+	}
+	if fetched := loggedField(t, logs.String(), layers[1].Digest, "fetched"); fetched != 0 {
+		t.Fatalf("the saved layer logged fetched=%d, want 0", fetched)
+	}
+	wantRoot, wantObj, wantImg := newStores(t)
+	want, err := Materialize(context.Background(), wantObj, wantImg, openLayout(t, dir), root, fixturePlatform, newSlots(2))
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	assertSameImage(t, wantRoot, want, gotRoot, got)
 }
 
 // TestCheckSpaceRefusesOversizedPull asserts the storage-fit check refuses
@@ -1102,6 +1419,18 @@ func composeImage(t *testing.T, layers ...fixtureLayer) (string, digest.Digest) 
 		t.Fatal(err)
 	}
 	return dir, manifestDesc.Digest
+}
+
+// gzipLayer builds a plain tar+gzip layer of files, one without a table of
+// contents, as a layer composeImage can place in an image.
+func gzipLayer(t *testing.T, files ...octest.File) fixtureLayer {
+	t.Helper()
+	lay, err := octest.BuildImage(t.TempDir(), octest.ImageSpec{Platform: fixturePlatform, Layers: []octest.LayerSpec{{Files: files}}})
+	if err != nil {
+		t.Fatalf("BuildImage: %v", err)
+	}
+	desc := readFixtureJSON[ocispec.Manifest](t, blobPath(lay.Dir, lay.Manifest)).Layers[0]
+	return fixtureLayer{dir: lay.Dir, desc: desc, diffID: lay.DiffIDs[0]}
 }
 
 // copyLayout copies a fixture layout into a temp directory the test may

@@ -19,6 +19,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sys/unix"
 
+	"github.com/foundriesio/knarr/internal/composefs"
 	"github.com/foundriesio/knarr/internal/imagestore"
 	"github.com/foundriesio/knarr/internal/objectstore"
 	"github.com/foundriesio/knarr/internal/ocichain"
@@ -53,6 +54,7 @@ const (
 	fallbackWhole    = "whole-answer" // the whole blob: the source answered a range with it
 	fallbackNoTOC    = "no-toc"       // the tar stream: the layer has no table of contents
 	fallbackTOCError = "toc-error"    // the tar stream: the table of contents could not be read
+	fallbackSaved    = "saved"        // the saved layer: no usable table of contents, and the layer was read by an earlier pull
 )
 
 // deltaLayer is one layer of a delta pull: its table of contents, how its
@@ -60,8 +62,8 @@ const (
 type deltaLayer struct {
 	idx  int
 	desc ocispec.Descriptor
-	// toc is nil for a layer scanned from its tar stream, which scanned then
-	// holds.
+	// toc is nil for a layer scanned from its tar stream or merged from its
+	// saved layer, which scanned then holds.
 	toc     *zstdchunked.TOC
 	scanned *rootfs.Layer
 	// spool holds the whole verified blob when the source answered the table
@@ -69,6 +71,9 @@ type deltaLayer struct {
 	spool *os.File
 	// files are the missing payloads this layer supplies, in offset order.
 	files []fileFetch
+	// owned counts the missing payloads a layer merged from its saved layer
+	// was read whole for.
+	owned int
 	// requests are the files' extents coalesced into byte ranges.
 	requests []byteRange
 	reason   string
@@ -95,11 +100,14 @@ type byteRange struct {
 // layer with a zstd:chunked table of contents, only the table and the files
 // the store lacks, as byte ranges served by ranges. Every layer's table is
 // fetched under the slots limiter, and a layer whose table cannot be read,
-// or that has none, is scanned from its tar stream in the same turn. A layer
-// whose missing files would take too many or too large ranges is read whole
-// instead, under the limiter too, while the layers fetched by range take
-// their ranges one at a time on the calling goroutine, under the limiter as
-// well; either way the image built is the one Materialize builds.
+// or that has none, is merged from its saved layer when the store holds one
+// and scanned from its tar stream, and saved, in the same turn otherwise. A
+// layer whose missing files would take too many or too large ranges is read
+// whole instead, under the limiter too, while the layers fetched by range
+// take their ranges one at a time on the calling goroutine, under the
+// limiter as well. A stored file the store lacks that no table lists is one
+// a saved layer lists: the layer is then read whole, as Build.Finish reads
+// it. Either way the image built is the one Materialize builds.
 func Delta(ctx context.Context, store *objectstore.Store, img *imagestore.Store, src ocichain.BlobSource, ranges ocichain.RangeSource, root digest.Digest, platform ocispec.Platform, slots chan struct{}) (Built, error) {
 	if ranges == nil {
 		return Built{}, errors.New("materialize: nil range source")
@@ -153,27 +161,55 @@ func Delta(ctx context.Context, store *objectstore.Store, img *imagestore.Store,
 	for j, desc := range res.Manifest.Layers {
 		layers[j] = &deltaLayer{idx: j, desc: desc}
 		wg.Add(1)
-		go under(layers[j], func(l *deltaLayer) error { return readLayer(ctx, b, src, ranges, store, res, l) })
+		go under(layers[j], func(l *deltaLayer) error { return readLayer(ctx, b, src, ranges, store, img, res, l) })
 	}
 	defer removeSpools(layers)
 	if err := wait(); err != nil {
 		return Built{}, err
 	}
 
+	// The layers taken from their saved layers. A failure one of them can
+	// have caused removes the ones merged by then, as in a Build.
+	var reused []int
 	for _, l := range layers {
-		if err := mergeLayer(b, l); err != nil {
+		if l.reason == fallbackSaved {
+			reused = append(reused, l.idx)
+		}
+	}
+	for _, l := range layers {
+		layer, err := l.layer()
+		if err != nil {
+			return Built{}, err
+		}
+		if err := b.Merge(layer); err != nil {
+			removeSaved(img, res, reusedThrough(reused, l.idx))
 			return Built{}, err
 		}
 	}
 	missing, err := b.Missing(ctx)
 	if err != nil {
+		if !cancelled(err) {
+			removeSaved(img, res, reused)
+		}
 		return Built{}, err
 	}
 	if err := checkSpace(store, missing); err != nil {
 		return Built{}, err
 	}
-	if err := plan(layers, missing); err != nil {
+	listed, unlisted := missing, []rootfs.Payload(nil)
+	if len(reused) > 0 {
+		listed, unlisted = splitUnlisted(layers, missing)
+	}
+	if err := plan(layers, listed); err != nil {
 		return Built{}, err
+	}
+	owned, err := supplySaved(ctx, store, img, src, b, res, reused, unlisted, slots)
+	if err != nil {
+		return Built{}, err
+	}
+	for j, n := range owned {
+		layers[j].owned = n
+		layers[j].fetched += layers[j].desc.Size
 	}
 
 	for _, l := range layers {
@@ -202,7 +238,7 @@ func Delta(ctx context.Context, store *objectstore.Store, img *imagestore.Store,
 	for _, l := range layers {
 		slog.Info("delta: layer", "layer", l.desc.Digest, "size", l.desc.Size,
 			"toc_bytes", l.tocBytes, "toc_ms", l.tocLatency.Milliseconds(), "entries", len(l.entries()),
-			"missing", len(l.files), "planned", l.planned, "requests", l.requested(),
+			"missing", len(l.files)+l.owned, "planned", l.planned, "requests", l.requested(),
 			"fetched", l.fetched, "fallback", l.reason)
 		size += l.desc.Size
 		tocBytes += l.tocBytes
@@ -213,7 +249,7 @@ func Delta(ctx context.Context, store *objectstore.Store, img *imagestore.Store,
 	slog.Info("delta: pull", "layers", len(layers), "size", size, "toc_bytes", tocBytes,
 		"missing", len(missing), "planned", planned, "requests", requests, "fetched", fetched)
 
-	return finishImage(ctx, store, img, root, res, b)
+	return finishSaved(ctx, store, img, root, res, b, reused)
 }
 
 // withSlot runs fn once a slot is free and gives the slot back when fn
@@ -238,6 +274,16 @@ func (l *deltaLayer) entries() []zstdchunked.Entry {
 	return l.toc.Entries
 }
 
+// layer returns l as the build merges it: made from its table of contents,
+// with the files pending, or as scanned from its tar stream or decoded from
+// its saved layer.
+func (l *deltaLayer) layer() (*rootfs.Layer, error) {
+	if l.toc == nil {
+		return l.scanned, nil
+	}
+	return rootfs.LayerFromTOC(l.toc, l.idx)
+}
+
 // requested is the number of range requests the layer's files take: none
 // for a layer read out of its spool, whose ranges were never asked for.
 func (l *deltaLayer) requested() int {
@@ -248,14 +294,19 @@ func (l *deltaLayer) requested() int {
 }
 
 // readLayer reads l's table of contents and, when that leaves the layer to
-// its tar stream, opens and scans the stream right away, every file stored
-// on the way.
-func readLayer(ctx context.Context, b *rootfs.Builder, src ocichain.BlobSource, ranges ocichain.RangeSource, store *objectstore.Store, res ocichain.Resolved, l *deltaLayer) error {
+// its tar stream, takes the layer from its saved layer if the store holds
+// one, and otherwise opens and scans the stream right away, every file
+// stored on the way, and saves what the scan yielded.
+func readLayer(ctx context.Context, b *rootfs.Builder, src ocichain.BlobSource, ranges ocichain.RangeSource, store *objectstore.Store, img *imagestore.Store, res ocichain.Resolved, l *deltaLayer) error {
 	readTOC(ctx, ranges, store, l)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if l.toc != nil {
+		return nil
+	}
+	if saved := loadSaved(img, res, l.idx); saved != nil {
+		l.scanned, l.reason = saved, fallbackSaved
 		return nil
 	}
 	stream, err := ocichain.OpenLayer(ctx, src, l.desc)
@@ -269,16 +320,17 @@ func readLayer(ctx context.Context, b *rootfs.Builder, src ocichain.BlobSource, 
 	if err != nil {
 		return err
 	}
+	saveLayer(img, res, l.idx, layer)
 	l.scanned = layer
 	l.fetched += l.desc.Size
 	return nil
 }
 
 // readTOC fetches and authenticates l's table of contents. Any failure to
-// get one turns the layer over to the tar stream: that path verifies the
-// whole blob against its descriptor, so a table that cannot be trusted
-// costs bandwidth, never integrity. A pull the caller cancelled meanwhile is
-// left for the caller to report.
+// get one leaves the layer to its saved layer or its tar stream, each
+// verified against the whole blob and its descriptor, so a table that cannot
+// be trusted costs bandwidth at most, never integrity. A pull the caller
+// cancelled meanwhile is left for the caller to report.
 func readTOC(ctx context.Context, ranges ocichain.RangeSource, store *objectstore.Store, l *deltaLayer) {
 	start := time.Now()
 	toc, spool, n, err := fetchTOC(ctx, ranges, store, l.desc)
@@ -292,7 +344,7 @@ func readTOC(ctx context.Context, ranges ocichain.RangeSource, store *objectstor
 		return
 	}
 	if err != nil {
-		slog.Warn("delta: falling back to whole layer", "layer", l.desc.Digest, "err", err)
+		slog.Warn("delta: table of contents unusable", "layer", l.desc.Digest, "err", err)
 		l.reason = fallbackTOCError
 		return
 	}
@@ -388,19 +440,6 @@ func removeSpools(layers []*deltaLayer) {
 	}
 }
 
-// mergeLayer merges l into the build: from its table of contents, with the
-// files pending, or as scanned from its tar stream.
-func mergeLayer(b *rootfs.Builder, l *deltaLayer) error {
-	if l.toc == nil {
-		return b.Merge(l.scanned)
-	}
-	layer, err := rootfs.LayerFromTOC(l.toc, l.idx)
-	if err != nil {
-		return err
-	}
-	return b.Merge(layer)
-}
-
 // checkSpace refuses a pull whose missing payloads cannot fit in the store's
 // filesystem. Their sizes are a lower bound on what the pull writes: the
 // fs-verity trees and the composefs image come on top.
@@ -423,6 +462,31 @@ func checkSpace(store *objectstore.Store, missing []rootfs.Payload) error {
 		return fmt.Errorf("%w: the missing content needs at least %d bytes and %d are available (fs-verity metadata and the composefs image come on top)", ErrNoSpace, need, avail)
 	}
 	return nil
+}
+
+// splitUnlisted splits the missing payloads into the ones plan assigns to a
+// table of contents and the ones only a saved layer can list: the stored
+// files no table lists. A payload a table lists stays with plan, a range
+// being cheaper than the whole layer a saved layer costs, and so does every
+// inlined file: a saved layer carries such a file's bytes itself, so a
+// pending one always comes from a table.
+func splitUnlisted(layers []*deltaLayer, missing []rootfs.Payload) (listed, unlisted []rootfs.Payload) {
+	inTable := make(map[rootfs.Payload]bool)
+	for _, l := range layers {
+		for _, e := range l.entries() {
+			if e.Digest != "" {
+				inTable[rootfs.Payload{Digest: e.Digest, Size: e.Size}] = true
+			}
+		}
+	}
+	for _, p := range missing {
+		if p.Size > composefs.InlineContentMax && !inTable[p] {
+			unlisted = append(unlisted, p)
+		} else {
+			listed = append(listed, p)
+		}
+	}
+	return listed, unlisted
 }
 
 // plan assigns every missing payload to the lowest layer whose table lists
