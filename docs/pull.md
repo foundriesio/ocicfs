@@ -6,8 +6,10 @@ chain into the fs-verity-sealed object store, builds the composefs image, and
 records the image binding and reference.
 
 By default, knarr pulls from an OCI registry. `--from-dir` sideloads from a local
-OCI image layout directory instead, for air-gapped or test workflows. `--delta`
-fetches only the files the store lacks from zstd:chunked layers, for updates
+OCI image layout directory instead, for air-gapped or test workflows. A layer
+with a usable saved file list from an earlier pull is not read again (see
+[Layers Already Read](#layers-already-read)). `--delta` fetches only the files
+the store lacks from zstd:chunked layers, for updates
 (see [Delta Pull](#delta-pull)).
 
 ## Prerequisites
@@ -118,6 +120,75 @@ prints that identity.
 `--ingest-workers N` applies to a sideload exactly as to a registry pull: the
 layers are read from the layout directory and scanned N at a time (default 2).
 
+## Layers Already Read
+
+A layer with a usable saved file list is not read again. When a pull has read
+a layer's tar stream to its end and verified it — the blob against the digest
+and size the manifest names, the unpacked stream against the `diff_id` the
+config names — it saves the layer's file list in the store, named by the
+blob digest (see [on-disk-layout.md](on-disk-layout.md)). A later pull of
+any image whose manifest names the same blob digest with the same size, and
+whose config names the same `diff_id` for it, merges the layer from that
+file list without opening the blob: as long as the store holds the files the
+image needs, nothing of the layer is downloaded, decompressed or hashed. The
+layer is read again when the image needs a file of it the store no longer
+holds, and when there is no usable file list: it was too large to write or
+could not be written, `gc` swept it with the last image listing the layer,
+or it does not decode. An update that keeps its lower layers, with their
+file lists in place, then reads only the layers that changed:
+
+```sh
+knarr pull "ghcr.io/example/app@$previous"
+knarr pull "ghcr.io/example/app@$next"   # reads only the layers $previous lacks
+```
+
+The file list names every stored file by its sha256 and size and carries the
+bytes of the files small enough to be inlined into the image; the files
+themselves are the store's objects. Once every layer is merged, the pull
+looks up the files the merged image keeps, and only those: a file an upper
+layer overwrites or removes is never asked for, even after `gc` reclaimed
+it. When a file the image needs is absent — `gc` reclaimed it while an
+earlier release shadowed it, and this release no longer does — the layer
+that lists it is read whole, once, as if it had not been saved: every file
+it carries is stored, and its blob digest and `diff_id` are verified again.
+One case reads a layer for a file the image drops: files under `/run` are
+removed only after the layers are merged, so an absent one still has its
+layer read.
+
+The image built is bit-identical to the one a pull into an empty store
+builds, and a pull accepts and rejects the same image content either way.
+One difference is intended: a pull that has no layer left to read succeeds
+when the source no longer serves the blobs. The identity is the blob digest,
+so a layer republished with the same content under another compression is
+read once more. A saved file list that does not decompress to its end, was
+written in another format version, holds a malformed record, exceeds the
+size bounds, or was saved for another blob size or `diff_id` is ignored with
+a warning, and the layer is read. A file list that cannot be saved, or is
+too large to be, is a warning too, never a failed pull.
+
+A saved file list is local state, relied on as the image binding is: on the
+assumption that nothing but knarr writes to the store. Its checksum catches
+corruption, not a deliberate change, and nothing re-checks it against the
+`diff_id` afterwards. What a pull builds from it is checked against a value
+the publisher pinned only for a sealed image (see
+[Sealing Verification](#sealing-verification)): there the merged image's
+fs-verity digest must equal the sealing annotation, at pull and again at
+mount. **Only sealed images are protected against a modified store.** For
+an unsealed image an altered file list is merged unnoticed, into that image
+and into every later one that shares the layer.
+
+A pull that fails in a way a saved file list can have caused removes the
+file lists it used, so the retry reads those layers from the source: when
+the layers do not merge, when a file one of them names cannot be had from
+the layer it names it in, when the image cannot be built, or when the
+sealing check fails. A source that cannot serve a layer and a cancelled pull
+leave them in place.
+
+This applies to a registry pull, to `--from-dir`, to an embedder's
+`NewBuild`, and in a `--delta` pull to the layers without a usable table of
+contents. `knarr gc` deletes the saved file lists of layers no wanted image
+lists (see [gc.md](gc.md)).
+
 ## Delta Pull
 
 An update usually changes a few files of an image, but every layer whose
@@ -173,7 +244,8 @@ stores every file it carries, and a whole-blob read transfers the shadowed
 bytes even if it does not store them. For a layer built from its table the `diff_id` is reported by `inspect` and the
 chain IDs as before but no longer verified: nothing decompresses the whole
 tar stream to hash it. A layer that fell back to the tar stream is verified
-as a plain pull verifies it.
+as a plain pull verifies it, and one merged from its saved file list was
+verified so when the list was saved.
 
 What falls back, and why, is reported by one log line per layer on stderr:
 
@@ -199,6 +271,14 @@ whole answer to its table request asks for none and reports `requests=0`),
   trips this rule before the first request.
 - `whole-answer` — the registry answered a range request with the whole blob
   (no `Range` support): the rest of the layer is read from that answer.
+- `saved` — a layer without a usable table that an earlier pull read (see
+  [Layers Already Read](#layers-already-read)): it is merged from its saved
+  file list and reports `fetched=0`. A file the image needs, the store lacks
+  and a table also lists is still fetched by range; one only the saved file
+  list names has the layer read whole, and `fetched` is then the blob's
+  size. A layer scanned from its tar stream (`no-toc`, `toc-error`) is saved
+  for the next pull; a layer built from its table is not, and costs the next
+  pull its table again.
 
 A closing line per pull sums the same figures. Once the tables are read and
 the layers without a usable table are unpacked, and before the remaining
@@ -232,21 +312,34 @@ disagreement rather than recording a mismatched image. The same check runs on a
 fresh pull and on the cached fast path, so a previously stored image cannot skip
 it.
 
-A **canonical** construction reproduces the sealed digest, so a present
-`composefs.merged.erofs.v1.fsverity-sha256-12` (on the manifest) or
-`composefs.config.fsverity-sha256-12` (on the config descriptor) annotation
-must match the measured value exactly; a mismatch aborts the pull, and an
-image carrying neither annotation is always a valid unsealed pull. A
-**non-canonical** construction cannot honestly claim a reproducible sealed
-digest under that namespace, so pull rejects it outright if the manifest
-carries any annotation under the `composefs.merged.erofs.v1.` prefix —
-regardless of the suffix or value it records. What it does reproduce is its
-own deterministic fallback digest, so a present knarr fallback annotation
+The merged-image annotation a pull holds the image to is chosen by what the
+manifest carries, as `mount` chooses it, and never by how the image came
+out: the standard `composefs.merged.erofs.v1.fsverity-sha256-12` when it is
+present, else the knarr fallback annotation
 (`io.foundries.knarr.composefs.fallback.v1.fsverity-sha256-12`, written by
-`knarr seal --allow-non-canonical`) is verified against the re-derived value
-with the same fail-closed handling. A non-canonical image carrying neither is
-likewise a valid unsealed pull. The upstream annotation keys and their
-meaning are defined by the
+`knarr seal --allow-non-canonical`). The chosen annotation must match the
+measured fs-verity digest of the merged image exactly; a mismatch or a
+malformed value aborts the pull. When both are present the standard one
+decides and the fallback one is not read. A manifest whose only annotation
+under the `composefs.merged.erofs.v1.` prefix is of a kind knarr does not
+recognize is sealed in a way it cannot verify, and the pull fails rather
+than treat the image as unsealed. An image carrying no merged-image
+annotation is a valid unsealed pull.
+
+A **canonical** construction reproduces the sealed digest the standard
+annotation records. A **non-canonical** construction cannot honestly claim a
+reproducible sealed digest under that namespace, so pull rejects it outright
+if the manifest carries any annotation under the
+`composefs.merged.erofs.v1.` prefix — regardless of the suffix or value it
+records. What it does reproduce is its own deterministic fallback digest,
+which is the value the fallback annotation records.
+
+The config annotation, on the config descriptor, follows the construction:
+`composefs.config.fsverity-sha256-12` is checked on a canonical
+construction and `io.foundries.knarr.composefs.config.fsverity-sha256-12`
+on a non-canonical one, against the measured fs-verity digest of the stored
+config and with the same fail-closed handling. The upstream annotation keys
+and their meaning are defined by the
 [composefs OCI sealing specification](https://github.com/composefs/composefs-rs/blob/main/crates/composefs-oci/src/sealing_spec.rs),
 which knarr follows verbatim.
 
@@ -296,9 +389,13 @@ Rules the build enforces:
   is retried until the caller asks for it. `Config.IngestWorkers` sets the
   cap for every build of the engine (0 means the default of 2).
 - **`Ingest(i)` blocks until layer `i` is merged.** It returns once every
-  layer up to `i` is in the store, whichever scan got there first. A
-  cancelled context returns its error and leaves the build running; the
-  call may be repeated.
+  layer up to `i` is merged, whichever scan got there first: read into the
+  store, or merged from its saved file list without being read (see
+  [Layers Already Read](#layers-already-read)). `Finish` then looks the
+  files of such layers up in the store and reads a layer whole, through the
+  blob source, when one the image needs is absent, so the source must still
+  hold that layer at `Finish`. A cancelled context returns its error and
+  leaves the build running; the call may be repeated.
 - **Failures surface early, and stay.** A layer that fails verification
   fails the build: every later call returns the same error, and nothing is
   recorded. Because layers are scanned ahead, the failure of layer `j` may
@@ -307,7 +404,10 @@ Rules the build enforces:
 - **`Close` cancels and waits.** It cancels every scan, waits for them, and
   interrupts an `Ingest` or `Finish` blocked meanwhile, which then returns
   an error. `Finish` drains every scan before returning, whether or not it
-  succeeded.
+  succeeded. A `Finish` that has every layer merged is not interrupted:
+  `Close` waits while it reads a layer for a saved file list and writes the
+  image, and cancelling the context `Finish` was given is what ends such a
+  read.
 - **One call at a time.** `Ingest` and `Finish` are serialized: a call that
   arrives while another is in progress waits for it. Only `Close` cuts in,
   as above.

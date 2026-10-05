@@ -1,9 +1,10 @@
 # Reclaiming store space (`knarr gc`)
 
 `knarr gc` deletes every store object that is neither **wanted** nor **in
-use**, along with orphan image bindings, orphan fs-verity view entries,
-staging leftovers under `tmp/`, and the empty shard directories earlier
-deletions left behind across the store's fan-out trees. It is the reclamation
+use**, along with orphan image bindings, saved layers no wanted image lists,
+orphan fs-verity view entries, staging leftovers under `tmp/`, and the empty
+shard directories earlier deletions left behind across the store's fan-out
+trees. It is the reclamation
 half of the two-layer protection model:
 
 - **Wanted** is intent: an image reachable from a reference record (`knarr
@@ -29,6 +30,14 @@ for Debian-based images the shadowed package-database generations alone can
 add up to a few MiB. The first collection reclaims them. `knarr pull
 --delta` knows every zstd:chunked layer's file table up front and skips
 materializing shadowed files instead of leaving them to gc.
+
+A pull also saves each layer's file list, so a later pull naming the same
+layer blob need not read it (see [pull.md](pull.md#layers-already-read)). gc
+keeps a saved layer while the manifest of a wanted image lists its blob and
+deletes the rest. A saved layer keeps no object alive: the shadowed files
+above are reclaimed all the same, and a later image that shares the layer
+and no longer shadows one of them has that layer read once more. Deleted
+saved layers are not counted in the report.
 
 A delta pull saves bytes only while the previous release's objects are
 still in the store, and gc reclaims an image nothing wants, so the agent

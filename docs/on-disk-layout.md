@@ -10,6 +10,7 @@ seals every content object with it and refuses a store that cannot.
 ├── objects/sha256/<aa>/<rest>   # the content-addressed object store (CAS) — authoritative
 ├── objects/fsverity-sha256-12/<vv>/<rest>   # fs-verity view into the CAS — auxiliary
 ├── images/sha256/<aa>/<rest>/<os>-<arch>[-<variant>].json   # image bindings — auxiliary
+├── layers/sha256/<aa>/<rest>    # saved layers: file lists by layer blob digest — auxiliary
 ├── refs/.lock                   # record-write lock (flock), never removed
 ├── refs/sha256/<kk>/<rest>.json # reference records — auxiliary
 ├── holds/sha256/<aa>/<rest>/<holder>   # GC-protection holds — auxiliary
@@ -58,7 +59,8 @@ never trusted, only verified against it. The indexes are still the only local
 map from a pinned root to its composefs image — losing them loses no content,
 and a re-pull regenerates them while deduplicating against the objects already
 present. The compressed wire form of a layer is **never** persisted — only its
-decompressed per-file content. A `pull --delta` changes what crosses the wire,
+decompressed per-file content, and beside it the layer's file list (see
+[`layers/`](#layers--saved-layers-auxiliary)). A `pull --delta` changes what crosses the wire,
 not what lands here: the objects it writes are a subset of a plain pull's,
 under the same names (a layer built from its table stores only the files
 the image needs), and a whole layer it had to spool lives in `tmp/` only for
@@ -127,6 +129,57 @@ the digest it qualifies. The mount uses the binding's `objectStore.path`
 (`objects/fsverity-sha256-12`, the fs-verity view) as the composefs basedir, so
 the image's fs-verity-keyed redirects resolve to the sealed objects written by
 pull.
+
+## `layers/` — saved layers (auxiliary)
+
+One file per layer blob a pull has read, named by the digest of the
+**compressed** blob — the digest a manifest lists for the layer — and holding
+the layer's file list as the scan of its tar stream produced it. A later pull
+whose manifest names the same blob merges the layer from this file instead of
+reading the blob (see [pull.md](pull.md#layers-already-read)). No file
+content lives here but the bytes of files of 64 bytes or fewer, which the
+image inlines; a larger file is named by its digest and stays an object in
+`objects/`, which a saved layer does not keep alive.
+
+The file is one zstd frame with a content checksum, holding one JSON value per
+line: a header, then one record per tar entry, in tar order.
+
+```json
+{"version":1,"blobSize":2811,"diffID":"sha256:…"}
+{"kind":"node","name":"dXNy","mode":2147484141,"mtime":1700000000}
+{"kind":"node","name":"dXNyL2Jpbi9hcHA=","mode":493,"digest":"sha256:…","size":8192,"mtime":1700000000}
+{"kind":"node","name":"ZXRjL2hvc3RuYW1l","mode":420,"content":"a25hcnIK","size":6,"mtime":1700000000}
+{"kind":"hardlink","name":"dXNyL2Jpbi9hbGlhcw==","target":"dXNyL2Jpbi9hcHA="}
+{"kind":"whiteout","name":"ZXRjLy53aC5vbGQ="}
+{"kind":"opaque","name":"dmFyLy53aC4ud2guLm9wcQ=="}
+```
+
+`version` is the format version. `blobSize` and `diffID` are the size of the
+compressed blob and the `diff_id` the layer was verified against when it was
+saved; a pull uses the file only for a manifest and a config that name the
+same two values for the blob. A record's `kind` is `node` (a file, directory,
+symlink, device or fifo), `hardlink`, `whiteout` or `opaque`. `name`,
+`target` (what a hardlink links to), `linkname` (a symlink's target), and
+the `key` and `value` of each entry of `xattrs` are base64, since none of
+them need be valid UTF-8. A whiteout or opaque marker is its name alone,
+which says what it removes. A node carries
+`mode` (type and permission bits, in Go's `os.FileMode` layout), `uid`,
+`gid`, `mtime` and `mtimeNsec`, and for a device `devmajor` and `devminor`. A
+regular file carries its `size` and either the `digest` of the object that
+holds its content or, when it is small enough to be inlined, its bytes as
+base64 `content`. A field holding its zero value is left out. No fs-verity
+digest is recorded: a pull resolves each file it needs against the object
+store.
+
+The file is written atomically and durably, and is owner-only (0600) like
+the objects, since it carries the bytes of the layer's smallest files. It is
+at most 64 MiB, compressed and decompressed alike, and holds at most 262144
+records; a layer whose file list would exceed either is not saved. A file
+over those bounds, one that does not decompress to its end, is of another
+version, holds a record a scan could not have produced, or records another
+blob size or `diff_id` than the image names is ignored, and the layer is read
+again. `knarr gc` deletes the saved layers no wanted image's manifest lists
+(see [gc.md](gc.md)).
 
 ## `refs/` — reference records (auxiliary)
 
@@ -243,3 +296,11 @@ manifest's sealing annotation for a sealed image, the binding's recorded digest
 otherwise), so a stale or tampered binding cannot serve unverified content. Ref
 records are validated when read (schema, ref key, and sha256 digests), but they
 are not content trust anchors.
+
+`layers/` is auxiliary too: losing a saved layer costs the next pull a read of
+that layer and nothing else. Unlike a binding, a saved layer is not checked
+against the object store when it is used — only its own checksum and the blob
+size and `diff_id` it records are — so what it contributes to an image is
+verified only where the image is sealed: the merged image must then measure
+to the sealing annotation at pull and at mount. See
+[pull.md](pull.md#layers-already-read).
