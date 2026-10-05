@@ -60,6 +60,9 @@ func (e *engine) gc(ctx context.Context, opts ...GCOption) (*GCReport, error) {
 	if err := e.sweepBindings(ctx, marks, cfg.DryRun, report); err != nil {
 		return nil, err
 	}
+	if err := e.sweepSavedLayers(ctx, marks, cfg.DryRun); err != nil {
+		return nil, err
+	}
 
 	// Pass 1: census and probe, no deletion. An unmarked object whose in-use
 	// probe fails is mounted; if it reads as a composefs image, the objects it
@@ -132,7 +135,7 @@ func (e *engine) gc(ctx context.Context, opts ...GCOption) (*GCReport, error) {
 }
 
 // gcMarks accumulates everything the marking passes decide to keep. The
-// sweep deletes whatever is in none of the first three sets, so an entry
+// sweep deletes whatever is in none of the first four sets, so an entry
 // here is a promise of survival. Content is marked in the two namespaces
 // objects are named by — sha256 content digests, and the view-relative
 // fs-verity names that are the only way an EROFS refers to per-file
@@ -150,6 +153,12 @@ type gcMarks struct {
 	// wanted keeps binding directories, keyed by the image identity digest
 	// (the platform image manifest); sweepBindings deletes the rest.
 	wanted map[digest.Digest]struct{}
+
+	// layers keeps saved layers, keyed by the digest of the compressed layer
+	// blob a wanted image's manifest lists; sweepSavedLayers deletes the
+	// rest. It marks no object: a layer blob is never stored, and a saved
+	// layer keeps none of the files it lists alive.
+	layers map[digest.Digest]struct{}
 
 	// verified dedups the chain-resolution and identity check, keyed by
 	// "root|identity|platform". Every distinct root must be checked — a
@@ -173,6 +182,7 @@ func (e *engine) markWanted(ctx context.Context) (*gcMarks, error) {
 		sha:      map[digest.Digest]struct{}{},
 		objects:  map[string]struct{}{},
 		wanted:   map[digest.Digest]struct{}{},
+		layers:   map[digest.Digest]struct{}{},
 		verified: map[string]struct{}{},
 		marked:   map[string]struct{}{},
 	}
@@ -252,10 +262,11 @@ func (e *engine) markWanted(ctx context.Context) (*gcMarks, error) {
 }
 
 // markImage marks one wanted image: the hash-verified metadata chain root
-// anchors for platform p, the binding's composefs object, and every per-file
-// object that EROFS redirects to. The chain must land on wantIdentity — the
-// digest the record or hold protects — or the root is broken, not merely a
-// different image.
+// anchors for platform p, the saved layers of the layer blobs its manifest
+// lists, the binding's composefs object, and every per-file object that
+// EROFS redirects to. The chain must land on wantIdentity — the digest the
+// record or hold protects — or the root is broken, not merely a different
+// image.
 func (e *engine) markImage(ctx context.Context, m *gcMarks, root, wantIdentity digest.Digest, p ocispec.Platform, origin string) error {
 	// Every distinct root is resolved and must land on the recorded identity
 	// — a broken alias must abort, not slide past because another record
@@ -275,6 +286,9 @@ func (e *engine) markImage(ctx context.Context, m *gcMarks, root, wantIdentity d
 	}
 	m.sha[res.ManifestDesc.Digest] = struct{}{}
 	m.sha[res.Manifest.Config.Digest] = struct{}{}
+	for _, layer := range res.Manifest.Layers {
+		m.layers[layer.Digest] = struct{}{}
+	}
 
 	// The expensive half — binding verification and the EROFS redirect walk —
 	// is per image, not per record: aliases naming one identity walk it once.
@@ -440,6 +454,24 @@ func (e *engine) sweepBindings(ctx context.Context, m *gcMarks, dryRun bool, rep
 		}
 		report.BindingsRemoved++
 		slog.Debug("knarr: gc removed orphan binding", "identity", root, "platform", ocilayout.PlatformString(&p), "dryRun", dryRun)
+		return nil
+	})
+}
+
+// sweepSavedLayers deletes every saved layer whose layer blob no wanted
+// image's manifest lists: only a pull of an image naming that blob could use
+// it, and one that does reads the layer again.
+func (e *engine) sweepSavedLayers(ctx context.Context, m *gcMarks, dryRun bool) error {
+	return e.img.WalkLayers(ctx, func(blob digest.Digest) error {
+		if _, ok := m.layers[blob]; ok {
+			return nil
+		}
+		if !dryRun {
+			if err := e.img.DeleteLayer(blob); err != nil {
+				return err
+			}
+		}
+		slog.Debug("knarr: gc removed saved layer", "layer", blob, "dryRun", dryRun)
 		return nil
 	})
 }

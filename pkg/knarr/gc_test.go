@@ -22,6 +22,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/foundriesio/knarr/internal/devtest"
+	"github.com/foundriesio/knarr/internal/imagestore"
 	"github.com/foundriesio/knarr/internal/octest"
 )
 
@@ -88,6 +89,7 @@ func assertNoEmptyDirs(t *testing.T, storeRoot string) {
 		filepath.Join(storeRoot, "objects", "sha256"),
 		filepath.Join(storeRoot, "objects", "fsverity-sha256-12"),
 		filepath.Join(storeRoot, "images", "sha256"),
+		filepath.Join(storeRoot, "layers", "sha256"),
 		filepath.Join(storeRoot, "refs", "sha256"),
 		filepath.Join(storeRoot, "holds", "sha256"),
 	} {
@@ -759,4 +761,74 @@ func TestGCKeepsShadowedObjectAnotherImageWants(t *testing.T) {
 		t.Fatalf("GC after remove: %v", err)
 	}
 	assertObjectAbsent(t, storeRoot, shared)
+}
+
+// TestGCSweepsSavedLayers asserts gc deletes the saved layer of a layer blob
+// no wanted image's manifest lists and keeps one a wanted image lists,
+// whether a reference or a hold alone wants that image; a dry run deletes
+// neither. A saved layer keeps no object alive: the files only the removed
+// image referenced are reclaimed.
+func TestGCSweepsSavedLayers(t *testing.T) {
+	eng, storeRoot, referenced := gcEngine(t, "referenced")
+	held := gcPull(t, eng, "held")
+	dropped := gcPull(t, eng, "dropped")
+	ctx := context.Background()
+
+	img, err := imagestore.New(storeRoot)
+	if err != nil {
+		t.Fatalf("imagestore.New: %v", err)
+	}
+	stray := digest.SHA256.FromString("a layer blob no image lists")
+	for _, blob := range []digest.Digest{referenced.Layers[0], held.Layers[0], dropped.Layers[0], stray} {
+		if err := img.PutLayer(blob, []byte("saved layer")); err != nil {
+			t.Fatalf("PutLayer: %v", err)
+		}
+	}
+	saved := func(blob digest.Digest) bool {
+		t.Helper()
+		_, err := img.GetLayer(blob)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("GetLayer: %v", err)
+		}
+		return err == nil
+	}
+
+	if err := eng.Hold(ctx, held.Root.String(), "keeper"); err != nil {
+		t.Fatalf("Hold: %v", err)
+	}
+	// Drop the ref record only, leaving the binding: the hold alone wants the
+	// image now.
+	if err := os.Remove(octest.RefPath(storeRoot, mustNormalizeRef(t, held.Ref))); err != nil {
+		t.Fatalf("remove ref record: %v", err)
+	}
+	if err := eng.Remove(ctx, dropped.Ref); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	if _, err := eng.GC(ctx, WithDryRun()); err != nil {
+		t.Fatalf("GC dry run: %v", err)
+	}
+	for _, blob := range []digest.Digest{referenced.Layers[0], held.Layers[0], dropped.Layers[0], stray} {
+		if !saved(blob) {
+			t.Fatalf("dry run deleted the saved layer %s", blob)
+		}
+	}
+
+	if _, err := eng.GC(ctx); err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	if !saved(referenced.Layers[0]) {
+		t.Fatal("gc deleted the saved layer of an image a reference wants")
+	}
+	if !saved(held.Layers[0]) {
+		t.Fatal("gc deleted the saved layer of an image a hold wants")
+	}
+	if saved(dropped.Layers[0]) {
+		t.Fatal("gc kept the saved layer of a removed image")
+	}
+	if saved(stray) {
+		t.Fatal("gc kept a saved layer no image lists")
+	}
+	assertObjectAbsent(t, storeRoot, gcUniqueDigest("dropped"))
+	assertNoEmptyDirs(t, storeRoot)
 }
