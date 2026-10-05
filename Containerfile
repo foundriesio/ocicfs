@@ -86,7 +86,10 @@ RUN git init /tmp/composefs-rs \
  && git -C /tmp/composefs-rs checkout --quiet FETCH_HEAD \
  && test "$(git -C /tmp/composefs-rs rev-parse HEAD)" = "${COMPOSEFS_RS_COMMIT}"
 
-RUN cargo build --release \
+# The checkout carries no Cargo.lock, so dependencies resolve at build time.
+# The fallback resolver keeps them to versions this toolchain can compile
+# instead of the newest published ones.
+RUN CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo build --release \
         --manifest-path /tmp/composefs-rs/Cargo.toml \
         -p composefs-ctl --no-default-features --features oci \
  && cp /tmp/composefs-rs/target/release/cfsctl /usr/bin/cfsctl
