@@ -39,6 +39,18 @@
 //	    "fsverity":    {"mode":"required","digest":"sha256:...","source":"local-measurement"},
 //	    "canonical":   false,
 //	    "size":        N } }
+//
+// Beside the bindings the store keeps saved layers: the file list a scan of a
+// layer's tar stream produced, kept so a later pull naming the same layer
+// blob can merge the layer without reading it. Each is one file named by the
+// digest of the compressed layer blob, holding whatever bytes the caller
+// encoded:
+//
+//	<root>/layers/sha256/<blob-xx>/<blob-rest>
+//
+// A saved layer is auxiliary like a binding: losing one costs the next pull a
+// read of that layer and nothing else. It is owner-only, since a file list
+// carries the bytes of the layer's smallest files.
 package imagestore
 
 import (
@@ -46,6 +58,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -191,11 +204,15 @@ func (s *Store) Delete(root digest.Digest, p ocispec.Platform) error {
 	return nil
 }
 
-// PruneEmptyDirs removes the empty directories binding removal leaves behind:
-// each image's own directory and the shard level above it. Call it only under
-// the store-exclusive gc lock.
+// PruneEmptyDirs removes the empty directories binding and saved-layer
+// removal leave behind: each image's own directory and the shard level above
+// it, and the saved layers' shard level. Call it only under the
+// store-exclusive gc lock.
 func (s *Store) PruneEmptyDirs() error {
 	if err := durable.PruneEmptyDirs(filepath.Join(s.root, "images", "sha256"), 2); err != nil {
+		return fmt.Errorf("imagestore: %w", err)
+	}
+	if err := durable.PruneEmptyDirs(filepath.Join(s.root, "layers", "sha256"), 1); err != nil {
 		return fmt.Errorf("imagestore: %w", err)
 	}
 	return nil
@@ -278,6 +295,107 @@ func (s *Store) Walk(ctx context.Context, fn func(root digest.Digest, p ocispec.
 	return err
 }
 
+// PutLayer writes data as the saved layer of the layer blob named blob, at
+// layers/sha256/<blob-xx>/<blob-rest>, atomically and durably, replacing one
+// already there. Data larger than GetLayer reads is refused.
+func (s *Store) PutLayer(blob digest.Digest, data []byte) error {
+	path, err := s.layerPath(blob)
+	if err != nil {
+		return err
+	}
+	if len(data) > maxLayerBytes {
+		return fmt.Errorf("imagestore: saved layer of %d bytes exceeds the limit of %d", len(data), maxLayerBytes)
+	}
+	if err := durable.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("imagestore: create saved layer dir: %w", err)
+	}
+	if err := durable.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("imagestore: write saved layer: %w", err)
+	}
+	return nil
+}
+
+// GetLayer reads the saved layer of the layer blob named blob. An absent one
+// surfaces as an error satisfying errors.Is(err, os.ErrNotExist); a file
+// larger than a saved layer may be is refused rather than read into memory.
+func (s *Store) GetLayer(blob digest.Digest) ([]byte, error) {
+	path, err := s.layerPath(blob)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(path) // #nosec G304 -- digest-derived saved layer path
+	if err != nil {
+		return nil, fmt.Errorf("imagestore: read saved layer: %w", err)
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			slog.Warn("imagestore: failed to close saved layer", "path", path, "err", err)
+		}
+	}()
+	// One byte past the cap tells a larger file from one that ends there.
+	data, err := io.ReadAll(io.LimitReader(f, maxLayerBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("imagestore: read saved layer: %w", err)
+	}
+	if len(data) > maxLayerBytes {
+		return nil, fmt.Errorf("imagestore: saved layer %s exceeds the limit of %d bytes", blob, maxLayerBytes)
+	}
+	return data, nil
+}
+
+// DeleteLayer removes the saved layer of the layer blob named blob, durably:
+// a saved layer removed because it broke a pull must not come back after a
+// crash to break the next. An absent one, its shard directory included, is
+// not an error.
+func (s *Store) DeleteLayer(blob digest.Digest) error {
+	path, err := s.layerPath(blob)
+	if err != nil {
+		return err
+	}
+	if err := durable.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("imagestore: delete saved layer: %w", err)
+	}
+	return nil
+}
+
+// WalkLayers calls fn for every saved layer on disk with the digest of the
+// layer blob it is named by. It is lenient as Walk is: the walk feeds a sweep,
+// where an entry that cannot be keyed simply is not deleted, so it is skipped
+// with a warning rather than failing the whole walk.
+func (s *Store) WalkLayers(ctx context.Context, fn func(blob digest.Digest) error) error {
+	base := filepath.Join(s.root, "layers", "sha256")
+	err := filepath.WalkDir(base, func(path string, de fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return fmt.Errorf("imagestore: walk saved layers: %w", walkErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if de.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(base, path)
+		if err != nil {
+			return fmt.Errorf("imagestore: walk saved layers: %w", err)
+		}
+		parts := strings.Split(rel, string(filepath.Separator))
+		if len(parts) != 2 || len(parts[0]) != 2 {
+			slog.Warn("imagestore: skipping foreign entry under layers", "path", path)
+			return nil
+		}
+		blob := digest.NewDigestFromEncoded(digest.SHA256, parts[0]+parts[1])
+		if digestutil.ValidateSHA256(blob) != nil {
+			slog.Warn("imagestore: skipping foreign entry under layers", "path", path)
+			return nil
+		}
+		return fn(blob)
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
 // bindingPlatform reads the platform a binding file records and requires it
 // to name the file it sits in.
 func bindingPlatform(path, name string) (ocispec.Platform, error) {
@@ -309,6 +427,9 @@ const (
 	objectStoreType      = "composefs-digest-store"
 	objectStoreAlgorithm = "fsverity-sha256-12"
 	objectStorePath      = "objects/fsverity-sha256-12"
+
+	// maxLayerBytes caps a saved layer file, written or read.
+	maxLayerBytes = 64 << 20
 )
 
 // The on-disk binding JSON documents.
@@ -370,6 +491,15 @@ func (s *Store) bindingPath(root digest.Digest, p ocispec.Platform) (string, pla
 	}
 	path := filepath.Join(s.root, "images", "sha256", root.Hex()[:2], root.Hex()[2:], filename+".json")
 	return path, platform, nil
+}
+
+// layerPath returns the path of the saved layer named by the layer blob
+// digest blob.
+func (s *Store) layerPath(blob digest.Digest) (string, error) {
+	if err := digestutil.ValidateSHA256(blob); err != nil {
+		return "", fmt.Errorf("imagestore: layer blob digest: %w", err)
+	}
+	return filepath.Join(s.root, "layers", "sha256", blob.Hex()[:2], blob.Hex()[2:]), nil
 }
 
 func validateBinding(doc bindingDoc, wantPlatform platformDoc) error {

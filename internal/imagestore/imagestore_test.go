@@ -455,3 +455,173 @@ func TestWalkListsBindingsAndSkipsForeign(t *testing.T) {
 		t.Fatalf("Walk = %#v, want both bindings", got)
 	}
 }
+
+func TestSavedLayerPutGetDelete(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	blob := digest.SHA256.FromString("layer blob")
+	if _, err := s.GetLayer(blob); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("GetLayer before PutLayer = %v, want os.ErrNotExist", err)
+	}
+	if err := s.DeleteLayer(blob); err != nil {
+		t.Fatalf("DeleteLayer of an absent layer: %v", err)
+	}
+
+	if err := s.PutLayer(blob, []byte("first")); err != nil {
+		t.Fatalf("PutLayer: %v", err)
+	}
+	path := filepath.Join(s.root, "layers", "sha256", blob.Hex()[:2], blob.Hex()[2:])
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("saved layer mode = %v, want 0600", fi.Mode().Perm())
+	}
+	if err := s.PutLayer(blob, []byte("second")); err != nil {
+		t.Fatalf("PutLayer over an existing layer: %v", err)
+	}
+	got, err := s.GetLayer(blob)
+	if err != nil {
+		t.Fatalf("GetLayer: %v", err)
+	}
+	if string(got) != "second" {
+		t.Fatalf("GetLayer = %q, want the bytes last put", got)
+	}
+
+	if err := s.DeleteLayer(blob); err != nil {
+		t.Fatalf("DeleteLayer: %v", err)
+	}
+	if _, err := s.GetLayer(blob); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("GetLayer after DeleteLayer = %v, want os.ErrNotExist", err)
+	}
+	if err := s.PruneEmptyDirs(); err != nil {
+		t.Fatalf("PruneEmptyDirs: %v", err)
+	}
+	if _, err := os.Stat(filepath.Dir(path)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("shard directory after PruneEmptyDirs: %v, want it gone", err)
+	}
+	if _, err := os.Stat(filepath.Join(s.root, "layers", "sha256")); err != nil {
+		t.Fatalf("layers root after PruneEmptyDirs: %v", err)
+	}
+}
+
+func TestDeleteLayerAbsentIsOK(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	blob := digest.SHA256.FromString("layer blob")
+	if err := s.DeleteLayer(blob); err != nil {
+		t.Fatalf("DeleteLayer with no layers tree: %v", err)
+	}
+	if err := s.PutLayer(blob, []byte("x")); err != nil {
+		t.Fatalf("PutLayer: %v", err)
+	}
+	if err := s.DeleteLayer(blob); err != nil {
+		t.Fatalf("DeleteLayer: %v", err)
+	}
+	if err := s.DeleteLayer(blob); err != nil {
+		t.Fatalf("DeleteLayer of an absent layer in a present shard: %v", err)
+	}
+	if err := os.Remove(filepath.Join(s.root, "layers", "sha256", blob.Hex()[:2])); err != nil {
+		t.Fatalf("remove shard: %v", err)
+	}
+	if err := s.DeleteLayer(blob); err != nil {
+		t.Fatalf("DeleteLayer with the shard directory absent: %v", err)
+	}
+}
+
+func TestSavedLayerRejectsInvalidDigest(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for _, blob := range []digest.Digest{"", "sha256:../../etc/passwd", digest.Digest("sha512:" + strings.Repeat("a", 128))} {
+		if err := s.PutLayer(blob, []byte("x")); err == nil {
+			t.Errorf("PutLayer(%q) succeeded", blob)
+		}
+		if _, err := s.GetLayer(blob); err == nil || errors.Is(err, os.ErrNotExist) {
+			t.Errorf("GetLayer(%q) = %v, want a digest error", blob, err)
+		}
+		if err := s.DeleteLayer(blob); err == nil {
+			t.Errorf("DeleteLayer(%q) succeeded", blob)
+		}
+	}
+}
+
+func TestWalkLayersListsSavedLayersAndSkipsForeign(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.WalkLayers(context.Background(), func(digest.Digest) error {
+		t.Fatal("WalkLayers called fn on a store with no saved layer")
+		return nil
+	}); err != nil {
+		t.Fatalf("WalkLayers on a store with no saved layer: %v", err)
+	}
+
+	first := digest.SHA256.FromString("walk first")
+	second := digest.SHA256.FromString("walk second")
+	for _, blob := range []digest.Digest{first, second} {
+		if err := s.PutLayer(blob, []byte("x")); err != nil {
+			t.Fatalf("PutLayer: %v", err)
+		}
+	}
+	// Foreign entries are skipped, not fatal: the walk feeds deletion, and a
+	// file it cannot key simply is not deleted.
+	shard := filepath.Join(s.root, "layers", "sha256", first.Hex()[:2])
+	for _, stray := range []string{filepath.Join(s.root, "layers", "sha256", "stray"), filepath.Join(shard, ".knarr-123")} {
+		if err := os.WriteFile(stray, []byte("x"), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+
+	got := map[digest.Digest]bool{}
+	err = s.WalkLayers(context.Background(), func(blob digest.Digest) error {
+		got[blob] = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WalkLayers: %v", err)
+	}
+	if len(got) != 2 || !got[first] || !got[second] {
+		t.Fatalf("WalkLayers = %v, want both saved layers", got)
+	}
+}
+
+// TestSavedLayerSizeLimit asserts a saved layer over the size limit is neither
+// written nor read: a file that large under layers/ is refused, not loaded.
+func TestSavedLayerSizeLimit(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	blob := digest.SHA256.FromString("layer blob")
+	if err := s.PutLayer(blob, make([]byte, maxLayerBytes+1)); err == nil || !strings.Contains(err.Error(), "exceeds the limit") {
+		t.Fatalf("PutLayer over the limit = %v, want the size limit", err)
+	}
+	if _, err := s.GetLayer(blob); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("GetLayer after the refused PutLayer = %v, want os.ErrNotExist", err)
+	}
+
+	if err := s.PutLayer(blob, []byte("small")); err != nil {
+		t.Fatalf("PutLayer: %v", err)
+	}
+	path := filepath.Join(s.root, "layers", "sha256", blob.Hex()[:2], blob.Hex()[2:])
+	if err := os.Truncate(path, maxLayerBytes); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	if data, err := s.GetLayer(blob); err != nil || len(data) != maxLayerBytes {
+		t.Fatalf("GetLayer at the limit = %d bytes, %v", len(data), err)
+	}
+	if err := os.Truncate(path, maxLayerBytes+1); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	if _, err := s.GetLayer(blob); err == nil || !strings.Contains(err.Error(), "exceeds the limit") {
+		t.Fatalf("GetLayer over the limit = %v, want the size limit", err)
+	}
+}
