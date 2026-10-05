@@ -53,14 +53,15 @@ type ObjectSink interface {
 // Builder assembles one composefs image from layers handed to it one at a
 // time. A scanned layer arrives complete: every stored object of it is sealed
 // and its fs-verity digest resolved before the Scan that produced it returns.
-// A layer made from a table of contents arrives with its payloads pending;
-// once every layer is merged, Missing resolves the payloads the store already
-// holds and names the rest, and Supply takes their bytes. From Missing until
-// Finish or Close the builder owns a sealing writer bound to the context
-// Missing was given. Merge, Missing, Finish and Close are called from one
-// goroutine, in that order, and none of them overlaps a Supply; Supply may be
-// called from several goroutines at once between Missing and Finish, each
-// payload from one of them.
+// A layer made from a table of contents, or decoded from a saved layer,
+// arrives with its payloads pending; once every layer is merged, Missing
+// resolves the payloads the store already holds and names the rest, and
+// Supply takes their bytes. From Missing until Finish or Close the builder
+// owns a sealing writer bound to the context Missing was given. Merge,
+// Missing, Finish and Close are called from one goroutine, in that order, and
+// none of them overlaps a Supply; Supply may be called from several
+// goroutines at once between Missing and Finish, each payload from one of
+// them.
 type Builder struct {
 	store *objectstore.Store
 	m     *merge
