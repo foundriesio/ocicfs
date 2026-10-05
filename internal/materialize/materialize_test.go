@@ -6,6 +6,7 @@ package materialize
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,12 +17,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -32,6 +35,7 @@ import (
 	"github.com/foundriesio/knarr/internal/ocilayout"
 	"github.com/foundriesio/knarr/internal/ociseal"
 	"github.com/foundriesio/knarr/internal/octest"
+	"github.com/foundriesio/knarr/internal/rootfs"
 )
 
 // canonicalLayerFiles is a standard-layout single-layer tree — /usr and its
@@ -1207,4 +1211,888 @@ func TestBuildIngestCancelled(t *testing.T) {
 			}
 		})
 	})
+}
+
+// stored returns a body over the inline threshold, so a file carrying it is
+// kept as an object.
+func stored(label string) string {
+	return label + ": a payload larger than the sixty-four byte inline limit so it becomes an object\n"
+}
+
+// storedDigest is the digest of the object a file with the body stored(label)
+// is kept as.
+func storedDigest(label string) digest.Digest {
+	return digest.FromString(stored(label))
+}
+
+// sharedBase is the layer two releases of an image share: a canonical tree
+// with one file the upper layer of every release overwrites, one it may
+// remove, a hardlink and an inlined file.
+func sharedBase() []octest.File {
+	return []octest.File{
+		{Name: "usr", Dir: true},
+		{Name: "usr/bin", Dir: true},
+		{Name: "usr/bin/app", Mode: 0o755, Body: stored("app")},
+		{Name: "usr/bin/edited", Mode: 0o755, Body: stored("edited in the base")},
+		{Name: "usr/bin/removed", Mode: 0o755, Body: stored("removed")},
+		{Name: "usr/bin/alias", Link: "usr/bin/app"},
+		{Name: "usr/bin/tiny", Mode: 0o644, Body: "tiny"},
+	}
+}
+
+// releaseLayer is the upper layer of one release: it overwrites a file of the
+// base, adds one of its own, and removes another file of the base when
+// whiteout is set.
+func releaseLayer(release string, whiteout bool) []octest.File {
+	files := []octest.File{
+		{Name: "usr/bin/edited", Mode: 0o755, Body: stored("edited in " + release)},
+		{Name: "usr/bin/" + release, Mode: 0o755, Body: stored(release)},
+	}
+	if whiteout {
+		files = append(files, octest.File{Name: "usr/bin/.wh.removed"})
+	}
+	return files
+}
+
+// buildLayers builds an image of the given layers for the fixture platform.
+func buildLayers(t *testing.T, layers ...[]octest.File) octest.Layout {
+	t.Helper()
+	specs := make([]octest.LayerSpec, len(layers))
+	for i, files := range layers {
+		specs[i] = octest.LayerSpec{Files: files}
+	}
+	lay, err := octest.BuildImage(t.TempDir(), octest.ImageSpec{Platform: fixturePlatform, Layers: specs})
+	if err != nil {
+		t.Fatalf("BuildImage: %v", err)
+	}
+	return lay
+}
+
+// pullLayout materializes the image root of lay from its layout directory.
+func pullLayout(t *testing.T, obj *objectstore.Store, img *imagestore.Store, lay octest.Layout, root digest.Digest) Built {
+	t.Helper()
+	built, err := Materialize(context.Background(), obj, img, openLayout(t, lay.Dir), root, lay.Platform, newSlots(2))
+	skipIfNoVerity(t, err)
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	return built
+}
+
+// assertMatchesFreshPull asserts got, built in the store at gotRoot, is the
+// image a pull of the same root into an empty store builds.
+func assertMatchesFreshPull(t *testing.T, lay octest.Layout, root digest.Digest, gotRoot string, got Built) {
+	t.Helper()
+	wantRoot, wantObj, wantImg := newStores(t)
+	assertSameImage(t, wantRoot, pullLayout(t, wantObj, wantImg, lay, root), gotRoot, got)
+}
+
+// removeObjects removes the named objects from the store, as a collection
+// that found them unreferenced does.
+func removeObjects(t *testing.T, obj *objectstore.Store, digests ...digest.Digest) {
+	t.Helper()
+	for _, d := range digests {
+		if err := obj.Remove(d); err != nil {
+			t.Fatalf("Remove(%s): %v", d, err)
+		}
+	}
+}
+
+// assertSaved asserts the store holds, or does not hold, a saved layer for
+// each blob.
+func assertSaved(t *testing.T, img *imagestore.Store, want bool, blobs ...digest.Digest) {
+	t.Helper()
+	for _, blob := range blobs {
+		_, err := img.GetLayer(blob)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("GetLayer(%s): %v", blob, err)
+		}
+		if got := err == nil; got != want {
+			t.Fatalf("saved layer of %s present = %v, want %v", blob, got, want)
+		}
+	}
+}
+
+// TestSavedLayerReused asserts a pull saves every layer it scans, and that a
+// later pull of an image sharing a layer merges it from the saved layer
+// without opening its blob — Ingest of that layer included — and builds the
+// image a pull into an empty store builds. A pull that finds no saved layer
+// reuses none.
+func TestSavedLayerReused(t *testing.T) {
+	requireTools(t)
+	layA := buildLayers(t, sharedBase(), releaseLayer("a", true))
+	layB := buildLayers(t, sharedBase(), releaseLayer("b", true))
+	base := layA.Layers[0]
+	if layB.Layers[0] != base {
+		t.Fatalf("the two releases do not share their base layer: %s and %s", base, layB.Layers[0])
+	}
+	forEachCap(t, func(t *testing.T, slots chan struct{}) {
+		root, obj, img := newStores(t)
+		first, err := Begin(context.Background(), obj, img, openLayout(t, layA.Dir), layA.Root, layA.Platform, slots)
+		skipIfNoVerity(t, err)
+		if err != nil {
+			t.Fatalf("Begin(a): %v", err)
+		}
+		defer first.Close() //nolint:errcheck // a failure is reported by the call that hit it
+		if _, err := first.Finish(context.Background()); err != nil {
+			t.Fatalf("Finish(a): %v", err)
+		}
+		if len(first.reused) != 0 {
+			t.Fatalf("a pull into an empty store reused layers %v", first.reused)
+		}
+		assertSaved(t, img, true, layA.Layers...)
+		assertSaved(t, img, false, layB.Layers[1])
+
+		rec := newRecorder(t, layB.Dir)
+		rec.failOpen = map[digest.Digest]error{base: errInjected}
+		b, err := Begin(context.Background(), obj, img, rec, layB.Root, layB.Platform, slots)
+		if err != nil {
+			t.Fatalf("Begin(b): %v", err)
+		}
+		defer b.Close() //nolint:errcheck // a failure is reported by the call that hit it
+		for i := range layB.Layers {
+			if err := b.Ingest(context.Background(), i); err != nil {
+				t.Fatalf("Ingest(%d): %v", i, err)
+			}
+		}
+		got, err := b.Finish(context.Background())
+		if err != nil {
+			t.Fatalf("Finish(b): %v", err)
+		}
+		rec.assertOpens(t, []digest.Digest{layB.Layers[1]})
+		if !reflect.DeepEqual(b.reused, []int{0}) {
+			t.Fatalf("reused layers = %v, want the base alone", b.reused)
+		}
+		assertMatchesFreshPull(t, layB, layB.Root, root, got)
+		assertSaved(t, img, true, layB.Layers...)
+		if len(slots) != 0 {
+			t.Fatalf("%d slots still held after the pull", len(slots))
+		}
+	})
+}
+
+// TestSavedLayerShadowedFiles asserts a file of a saved layer that an upper
+// layer overwrites or removes is never asked for: with their objects
+// collected, the layer is still not opened. Once the new release stops
+// removing such a file, the image needs it, and the layer is read whole,
+// once.
+func TestSavedLayerShadowedFiles(t *testing.T) {
+	requireTools(t)
+	layA := buildLayers(t, sharedBase(), releaseLayer("a", true))
+	base := layA.Layers[0]
+	for _, c := range []struct {
+		name     string
+		whiteout bool
+		opens    func(lay octest.Layout) []digest.Digest
+	}{
+		{"still removed", true, func(lay octest.Layout) []digest.Digest { return []digest.Digest{lay.Layers[1]} }},
+		{"no longer removed", false, func(lay octest.Layout) []digest.Digest { return []digest.Digest{base, lay.Layers[1]} }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			root, obj, img := newStores(t)
+			pullLayout(t, obj, img, layA, layA.Root)
+			// What a collection reclaims after the first pull: the files of
+			// the base its own upper layer shadows.
+			removeObjects(t, obj, storedDigest("edited in the base"), storedDigest("removed"))
+
+			layB := buildLayers(t, sharedBase(), releaseLayer("b", c.whiteout))
+			rec := newRecorder(t, layB.Dir)
+			got, err := Materialize(context.Background(), obj, img, rec, layB.Root, layB.Platform, newSlots(2))
+			if err != nil {
+				t.Fatalf("Materialize(b): %v", err)
+			}
+			rec.assertOpens(t, c.opens(layB))
+			assertMatchesFreshPull(t, layB, layB.Root, root, got)
+			present, err := obj.Has(storedDigest("removed"))
+			if err != nil {
+				t.Fatalf("Has: %v", err)
+			}
+			if present == c.whiteout {
+				t.Fatalf("the removed file's object present = %v with whiteout = %v", present, c.whiteout)
+			}
+		})
+	}
+}
+
+// TestSavedLayerMissingObjects asserts a saved layer whose files the store no
+// longer holds — one of them, or all of them, as after a crash that kept the
+// saved layer and lost the objects — is read whole, once, and the image built
+// is the one built before.
+func TestSavedLayerMissingObjects(t *testing.T) {
+	requireTools(t)
+	lay := buildLayers(t, sharedBase(), releaseLayer("a", true))
+	for _, c := range []struct {
+		name    string
+		removed []digest.Digest
+	}{
+		{"one needed object", []digest.Digest{storedDigest("app")}},
+		{"every object of the layer", []digest.Digest{storedDigest("app"), storedDigest("edited in the base"), storedDigest("removed")}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			root, obj, img := newStores(t)
+			want := pullLayout(t, obj, img, lay, lay.Root)
+			removeObjects(t, obj, c.removed...)
+
+			rec := newRecorder(t, lay.Dir)
+			got, err := Materialize(context.Background(), obj, img, rec, lay.Root, lay.Platform, newSlots(2))
+			if err != nil {
+				t.Fatalf("Materialize again: %v", err)
+			}
+			rec.assertOpens(t, []digest.Digest{lay.Layers[0]})
+			if !sameBuilt(got, want) {
+				t.Fatalf("built mismatch:\n again=%#v\n first=%#v", got, want)
+			}
+			assertMatchesFreshPull(t, lay, lay.Root, root, got)
+		})
+	}
+}
+
+// TestSavedLayerRunFile asserts the documented over-fetch: a file under /run
+// survives the layer merge and is dropped only afterwards, so a saved layer
+// listing one the store lacks is read although the image does not keep the
+// file.
+func TestSavedLayerRunFile(t *testing.T) {
+	requireTools(t)
+	lay := buildLayers(t, append(sharedBase(),
+		octest.File{Name: "run", Dir: true},
+		octest.File{Name: "run/state", Mode: 0o644, Body: stored("run state")},
+	), releaseLayer("a", true))
+	root, obj, img := newStores(t)
+	pullLayout(t, obj, img, lay, lay.Root)
+	removeObjects(t, obj, storedDigest("run state"))
+
+	rec := newRecorder(t, lay.Dir)
+	got, err := Materialize(context.Background(), obj, img, rec, lay.Root, lay.Platform, newSlots(2))
+	if err != nil {
+		t.Fatalf("Materialize again: %v", err)
+	}
+	rec.assertOpens(t, []digest.Digest{lay.Layers[0]})
+	assertMatchesFreshPull(t, lay, lay.Root, root, got)
+}
+
+// TestSavedLayerSuppliedOnce asserts a file the store lacks is supplied once
+// however many saved layers list it, and each layer is read at most once: the
+// same blob sits at two positions of the manifest, and a third layer lists
+// the same file under another name.
+func TestSavedLayerSuppliedOnce(t *testing.T) {
+	requireTools(t)
+	twice := sharedBase()
+	other := []octest.File{{Name: "usr/bin/copy", Mode: 0o755, Body: stored("app")}}
+	lay := buildLayers(t, twice, other, twice)
+	if lay.Layers[0] != lay.Layers[2] {
+		t.Fatalf("the manifest does not list one blob twice: %v", lay.Layers)
+	}
+	root, obj, img := newStores(t)
+	want := pullLayout(t, obj, img, lay, lay.Root)
+	removeObjects(t, obj, storedDigest("app"))
+
+	rec := newRecorder(t, lay.Dir)
+	b, err := Begin(context.Background(), obj, img, rec, lay.Root, lay.Platform, newSlots(2))
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer b.Close() //nolint:errcheck // a failure is reported by the call that hit it
+	got, err := b.Finish(context.Background())
+	if err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if !reflect.DeepEqual(b.reused, []int{0, 1, 2}) {
+		t.Fatalf("reused layers = %v, want all three positions", b.reused)
+	}
+	rec.assertOpens(t, []digest.Digest{lay.Layers[0]})
+	if !sameBuilt(got, want) {
+		t.Fatalf("built mismatch:\n again=%#v\n first=%#v", got, want)
+	}
+	assertMatchesFreshPull(t, lay, lay.Root, root, got)
+}
+
+// TestSavedLayerUnusable asserts a saved layer that records another diff_id
+// or blob size, is of an unknown version, or is damaged, is ignored: the
+// layer is read as if none were saved, and the scan saves it anew.
+func TestSavedLayerUnusable(t *testing.T) {
+	requireTools(t)
+	layA := buildLayers(t, sharedBase(), releaseLayer("a", true))
+	layB := buildLayers(t, sharedBase(), releaseLayer("b", true))
+	base, baseSize, diffID := layA.Layers[0], layerSize(t, layA, 0), layA.DiffIDs[0]
+	reencode := func(size int64, diffID digest.Digest) func(t *testing.T, data []byte) []byte {
+		return func(t *testing.T, data []byte) []byte {
+			l, err := rootfs.DecodeLayer(data, 0, baseSize, layA.DiffIDs[0])
+			if err != nil {
+				t.Fatalf("DecodeLayer: %v", err)
+			}
+			out, err := rootfs.EncodeLayer(l, size, diffID)
+			if err != nil {
+				t.Fatalf("EncodeLayer: %v", err)
+			}
+			return out
+		}
+	}
+	for name, damage := range map[string]func(t *testing.T, data []byte) []byte{
+		"another diff_id":   reencode(baseSize, digest.FromString("another layer")),
+		"another blob size": reencode(baseSize+1, diffID),
+		"unknown version": func(t *testing.T, data []byte) []byte {
+			return rewriteSaved(t, data, func(doc []byte) []byte {
+				return bytes.Replace(doc, []byte(`"version":1`), []byte(`"version":2`), 1)
+			})
+		},
+		"corrupted": func(_ *testing.T, data []byte) []byte {
+			out := append([]byte{}, data...)
+			out[len(out)-1] ^= 0xff
+			return out
+		},
+		"empty": func(*testing.T, []byte) []byte { return nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			root, obj, img := newStores(t)
+			pullLayout(t, obj, img, layA, layA.Root)
+			data, err := img.GetLayer(base)
+			if err != nil {
+				t.Fatalf("GetLayer: %v", err)
+			}
+			damaged := damage(t, data)
+			if bytes.Equal(damaged, data) {
+				t.Fatal("the saved layer was not changed")
+			}
+			if err := img.PutLayer(base, damaged); err != nil {
+				t.Fatalf("PutLayer: %v", err)
+			}
+
+			logs := captureLogs(t)
+			rec := newRecorder(t, layB.Dir)
+			got, err := Materialize(context.Background(), obj, img, rec, layB.Root, layB.Platform, newSlots(2))
+			if err != nil {
+				t.Fatalf("Materialize(b): %v", err)
+			}
+			rec.assertOpens(t, layB.Layers)
+			if !strings.Contains(logs.String(), "ignoring saved layer") {
+				t.Fatalf("no warning about the unusable saved layer:\n%s", logs)
+			}
+			assertMatchesFreshPull(t, layB, layB.Root, root, got)
+			if saved, err := img.GetLayer(base); err != nil || !bytes.Equal(saved, data) {
+				t.Fatalf("the scan did not save the layer anew (err %v)", err)
+			}
+		})
+	}
+}
+
+// TestSavedLayerIdentity asserts a saved layer stands in only for the blob it
+// was saved for, at the size and diff_id it was verified against: an image
+// naming that blob with another size or diff_id is rejected as a pull into an
+// empty store rejects it, by reading the layer.
+func TestSavedLayerIdentity(t *testing.T) {
+	requireTools(t)
+	for name, edit := range map[string]func(m *ocispec.Manifest, c *ocispec.Image){
+		"another diff_id":   func(_ *ocispec.Manifest, c *ocispec.Image) { c.RootFS.DiffIDs[0] = digest.FromString("another layer") },
+		"another blob size": func(m *ocispec.Manifest, _ *ocispec.Image) { m.Layers[0].Size++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			lay := buildLayers(t, sharedBase(), releaseLayer("a", true))
+			_, obj, img := newStores(t)
+			pullLayout(t, obj, img, lay, lay.Root)
+
+			root := rewriteImage(t, lay, edit)
+			rec := newRecorder(t, lay.Dir)
+			_, err := Materialize(context.Background(), obj, img, rec, root, lay.Platform, newSlots(2))
+			if err == nil {
+				t.Fatal("Materialize accepted the image over a saved layer")
+			}
+			if len(rec.opens) == 0 || !slices.Contains(rec.opens, lay.Layers[0]) {
+				t.Fatalf("the layer was not read: opened %v", rec.opens)
+			}
+			_, freshObj, freshImg := newStores(t)
+			if _, freshErr := Materialize(context.Background(), freshObj, freshImg, openLayout(t, lay.Dir), root, lay.Platform, newSlots(2)); freshErr == nil {
+				t.Fatal("a pull into an empty store accepted the image")
+			}
+			if _, err := img.Get(root, lay.Platform); !errors.Is(err, imagestore.ErrNotFound) {
+				t.Fatalf("binding lookup after the rejected pull = %v, want not found", err)
+			}
+		})
+	}
+}
+
+// TestSavedLayerSealFailure asserts a sealed image whose saved layer was
+// altered fails the sealing verification, that the failed pull removes the
+// saved layers it reused and no other, and that the next pull, reading those
+// layers from the source, builds the sealed image.
+func TestSavedLayerSealFailure(t *testing.T) {
+	requireTools(t)
+	layA := buildLayers(t, sharedBase(), releaseLayer("a", true))
+	layB := buildLayers(t, sharedBase(), releaseLayer("b", true))
+	base := layA.Layers[0]
+
+	_, freshObj, freshImg := newStores(t)
+	unsealed := pullLayout(t, freshObj, freshImg, layB, layB.Root)
+	sealedValue, err := ociseal.AnnotationValue(unsealed.FsverityDigest)
+	if err != nil {
+		t.Fatalf("AnnotationValue: %v", err)
+	}
+	sealed := rewriteManifestAnnotations(t, layB, map[string]string{ociseal.MergedAnnotation: sealedValue}, nil)
+
+	root, obj, img := newStores(t)
+	pullLayout(t, obj, img, layA, layA.Root)
+	data, err := img.GetLayer(base)
+	if err != nil {
+		t.Fatalf("GetLayer: %v", err)
+	}
+	// The altered saved layer gives one file another mode: every record still
+	// decodes, and the image built from it is not the one sealed.
+	altered := rewriteSaved(t, data, func(doc []byte) []byte {
+		out := bytes.Replace(doc, []byte(`"mode":493`), []byte(`"mode":448`), 1)
+		if bytes.Equal(out, doc) {
+			t.Fatal("the saved layer holds no record of mode 0755")
+		}
+		return out
+	})
+	if err := img.PutLayer(base, altered); err != nil {
+		t.Fatalf("PutLayer: %v", err)
+	}
+
+	rec := newRecorder(t, layB.Dir)
+	_, err = Materialize(context.Background(), obj, img, rec, sealed, layB.Platform, newSlots(2))
+	if err == nil || !strings.Contains(err.Error(), "annotation") {
+		t.Fatalf("Materialize over the altered saved layer = %v, want an annotation mismatch", err)
+	}
+	rec.assertOpens(t, []digest.Digest{layB.Layers[1]})
+	if _, err := img.Get(sealed, layB.Platform); !errors.Is(err, imagestore.ErrNotFound) {
+		t.Fatalf("binding lookup after the failed pull = %v, want not found", err)
+	}
+	assertSaved(t, img, false, base)
+	// The layers the failed pull scanned itself, and the ones it did not
+	// touch, keep their saved layers.
+	assertSaved(t, img, true, layA.Layers[1], layB.Layers[1])
+
+	rec = newRecorder(t, layB.Dir)
+	got, err := Materialize(context.Background(), obj, img, rec, sealed, layB.Platform, newSlots(2))
+	if err != nil {
+		t.Fatalf("Materialize again: %v", err)
+	}
+	rec.assertOpens(t, []digest.Digest{base})
+	if got.FsverityDigest != unsealed.FsverityDigest {
+		t.Fatalf("fs-verity digest = %s, want the sealed %s", got.FsverityDigest, unsealed.FsverityDigest)
+	}
+	assertMatchesFreshPull(t, layB, sealed, root, got)
+	assertSaved(t, img, true, base)
+}
+
+// TestSavedLayerFailureRemovesIt asserts a pull that fails over a saved layer
+// in a way the saved layer can have caused removes it, so the failure does
+// not repeat: the next pull reads the layer and builds the image a pull into
+// an empty store builds. Each altered saved layer still decodes. One makes a
+// merge fail, one names a file no layer holds, which fails only after the
+// authentic layer was read for it, and one cannot be built into an image.
+func TestSavedLayerFailureRemovesIt(t *testing.T) {
+	requireTools(t)
+	layA := buildLayers(t, sharedBase(), releaseLayer("a", true))
+	layB := buildLayers(t, sharedBase(), releaseLayer("b", true))
+	base := layA.Layers[0]
+	upper := layB.Layers[1]
+	for _, c := range []struct {
+		name    string
+		alter   func(t *testing.T, doc []byte) []byte
+		wantErr string
+		// opens are the layers the failing pull reads, and again the ones
+		// the next pull reads.
+		opens, again []digest.Digest
+	}{
+		{
+			// The base fails to merge before the upper layer is opened.
+			name:    "hardlink to a missing target",
+			alter:   func(t *testing.T, doc []byte) []byte { return retargetSavedLink(t, doc, "usr/bin/app", "usr/bin/nope") },
+			wantErr: "target does not exist",
+			again:   []digest.Digest{base, upper},
+		},
+		{
+			name: "fabricated stored file",
+			alter: func(_ *testing.T, doc []byte) []byte {
+				return appendSavedFile(doc, "usr/bin/fabricated", digest.FromString("no layer carries this"))
+			},
+			wantErr: "supply payload",
+			opens:   []digest.Digest{upper, base},
+			again:   []digest.Digest{base},
+		},
+		{
+			// The pending files cannot be resolved against the store.
+			name: "stored file listed with another size",
+			alter: func(_ *testing.T, doc []byte) []byte {
+				return appendSavedFile(doc, "usr/bin/resized", storedDigest("app"))
+			},
+			wantErr: "is listed with sizes",
+			opens:   []digest.Digest{upper},
+			again:   []digest.Digest{base},
+		},
+		{
+			name: "file in place of a directory",
+			alter: func(t *testing.T, doc []byte) []byte {
+				dir := fmt.Sprintf(`"name":%q,"mode":%d`, base64.StdEncoding.EncodeToString([]byte("usr/bin")), uint32(os.ModeDir|0o755))
+				file := fmt.Sprintf(`"name":%q,"mode":%d`, base64.StdEncoding.EncodeToString([]byte("usr/bin")), 0o644)
+				if !bytes.Contains(doc, []byte(dir)) {
+					t.Fatalf("the saved layer holds no record %s", dir)
+				}
+				return bytes.Replace(doc, []byte(dir), []byte(file), 1)
+			},
+			wantErr: "is not a directory",
+			opens:   []digest.Digest{upper},
+			again:   []digest.Digest{base},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			root, obj, img := newStores(t)
+			pullLayout(t, obj, img, layA, layA.Root)
+			data, err := img.GetLayer(base)
+			if err != nil {
+				t.Fatalf("GetLayer: %v", err)
+			}
+			if err := img.PutLayer(base, rewriteSaved(t, data, func(doc []byte) []byte { return c.alter(t, doc) })); err != nil {
+				t.Fatalf("PutLayer: %v", err)
+			}
+
+			rec := newRecorder(t, layB.Dir)
+			_, err = Materialize(context.Background(), obj, img, rec, layB.Root, layB.Platform, newSlots(2))
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("Materialize over the altered saved layer = %v, want %q", err, c.wantErr)
+			}
+			rec.assertOpens(t, c.opens)
+			assertSaved(t, img, false, base)
+			// A layer the pull did not reuse keeps its saved layer.
+			assertSaved(t, img, true, layA.Layers[1])
+			assertSaved(t, img, slices.Contains(c.opens, upper), upper)
+			assertNoTemps(t, obj)
+
+			rec = newRecorder(t, layB.Dir)
+			got, err := Materialize(context.Background(), obj, img, rec, layB.Root, layB.Platform, newSlots(2))
+			if err != nil {
+				t.Fatalf("Materialize again: %v", err)
+			}
+			rec.assertOpens(t, c.again)
+			assertMatchesFreshPull(t, layB, layB.Root, root, got)
+			assertSaved(t, img, true, base, upper)
+		})
+	}
+
+	// A build that is only ever ingested and closed meets the failed merge in
+	// Ingest, and removes the saved layer there.
+	t.Run("ingest without finish", func(t *testing.T) {
+		_, obj, img := newStores(t)
+		pullLayout(t, obj, img, layA, layA.Root)
+		data, err := img.GetLayer(base)
+		if err != nil {
+			t.Fatalf("GetLayer: %v", err)
+		}
+		altered := rewriteSaved(t, data, func(doc []byte) []byte { return retargetSavedLink(t, doc, "usr/bin/app", "usr/bin/nope") })
+		if err := img.PutLayer(base, altered); err != nil {
+			t.Fatalf("PutLayer: %v", err)
+		}
+		b, err := Begin(context.Background(), obj, img, openLayout(t, layB.Dir), layB.Root, layB.Platform, newSlots(2))
+		if err != nil {
+			t.Fatalf("Begin: %v", err)
+		}
+		first := b.Ingest(context.Background(), 0)
+		if first == nil || !strings.Contains(first.Error(), "target does not exist") {
+			t.Fatalf("Ingest(0) over the altered saved layer = %v, want the failed merge", first)
+		}
+		if err := b.Close(); !errors.Is(err, first) {
+			t.Fatalf("Close = %v, want %v", err, first)
+		}
+		assertSaved(t, img, false, base)
+	})
+}
+
+// TestSavedLayerMergeFailureScope asserts a failed merge removes the saved
+// layers merged up to and including the failing layer, and no saved layer
+// decoded ahead of it: that one was never merged, so it cannot be at fault,
+// and an image that keeps failing must not keep evicting it.
+func TestSavedLayerMergeFailureScope(t *testing.T) {
+	requireTools(t)
+	// A layer that scans cleanly and cannot be merged.
+	unmergeable := []octest.File{{Name: "opt", Dir: true}, {Name: "opt/link", Link: "opt/nope"}}
+	seed := buildLayers(t, sharedBase())
+	sound := seed.Layers[0]
+
+	t.Run("saved layer above the failing one", func(t *testing.T) {
+		lay := buildLayers(t, unmergeable, sharedBase())
+		if lay.Layers[1] != sound {
+			t.Fatalf("the image does not share the saved layer: %s and %s", lay.Layers[1], sound)
+		}
+		_, obj, img := newStores(t)
+		pullLayout(t, obj, img, seed, seed.Root)
+
+		// The lower layer is held in its scan until the upper one has been
+		// decoded from its saved layer, ahead of the merge.
+		src := newGatedSource(openLayout(t, lay.Dir), lay.Layers[0])
+		b, err := Begin(context.Background(), obj, img, src, lay.Root, lay.Platform, newSlots(2))
+		if err != nil {
+			t.Fatalf("Begin: %v", err)
+		}
+		defer b.Close() //nolint:errcheck // a failure is reported by the call that hit it
+		finished := make(chan error, 1)
+		go func() {
+			_, err := b.Finish(context.Background())
+			finished <- err
+		}()
+		<-src.entered
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			b.mu.Lock()
+			ahead := slices.Contains(b.reused, 1)
+			b.mu.Unlock()
+			if ahead {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the upper layer was not decoded ahead of the merge")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		close(src.release)
+		if err := <-finished; err == nil || !strings.Contains(err.Error(), "target does not exist") {
+			t.Fatalf("Finish = %v, want the failed merge", err)
+		}
+		assertSaved(t, img, true, sound)
+
+		// The scan saved the failing layer, so the next pull merges it from
+		// its saved layer: that one goes, the one above it still stays.
+		assertSaved(t, img, true, lay.Layers[0])
+		_, err = Materialize(context.Background(), obj, img, openLayout(t, lay.Dir), lay.Root, lay.Platform, newSlots(2))
+		if err == nil || !strings.Contains(err.Error(), "target does not exist") {
+			t.Fatalf("Materialize again = %v, want the failed merge", err)
+		}
+		assertSaved(t, img, false, lay.Layers[0])
+		assertSaved(t, img, true, sound)
+	})
+
+	t.Run("saved layer below the failing one", func(t *testing.T) {
+		lay := buildLayers(t, sharedBase(), unmergeable)
+		_, obj, img := newStores(t)
+		pullLayout(t, obj, img, seed, seed.Root)
+		_, err := Materialize(context.Background(), obj, img, openLayout(t, lay.Dir), lay.Root, lay.Platform, newSlots(2))
+		if err == nil || !strings.Contains(err.Error(), "target does not exist") {
+			t.Fatalf("Materialize = %v, want the failed merge", err)
+		}
+		assertSaved(t, img, false, sound)
+	})
+}
+
+// TestSavedLayerSourceFailureKeepsIt asserts a failure to read a layer from
+// the source, for a file its saved layer left to fetch, removes no saved
+// layer: nothing suggests one of them is at fault.
+func TestSavedLayerSourceFailureKeepsIt(t *testing.T) {
+	requireTools(t)
+	lay := buildLayers(t, sharedBase(), releaseLayer("a", true))
+	root, obj, img := newStores(t)
+	pullLayout(t, obj, img, lay, lay.Root)
+	removeObjects(t, obj, storedDigest("app"))
+
+	rec := newRecorder(t, lay.Dir)
+	rec.failOpen = map[digest.Digest]error{lay.Layers[0]: errInjected}
+	if _, err := Materialize(context.Background(), obj, img, rec, lay.Root, lay.Platform, newSlots(2)); !errors.Is(err, errInjected) {
+		t.Fatalf("Materialize with the layer unreadable = %v, want the injected failure", err)
+	}
+	assertSaved(t, img, true, lay.Layers...)
+	assertNoTemps(t, obj)
+
+	got, err := Materialize(context.Background(), obj, img, openLayout(t, lay.Dir), lay.Root, lay.Platform, newSlots(2))
+	if err != nil {
+		t.Fatalf("Materialize once the layer is readable: %v", err)
+	}
+	assertMatchesFreshPull(t, lay, lay.Root, root, got)
+}
+
+// TestSavedLayerNotSavedOnFailure asserts a layer that fails verification is
+// not saved, and that a layer that cannot be saved does not fail the pull.
+func TestSavedLayerNotSavedOnFailure(t *testing.T) {
+	requireTools(t)
+	t.Run("corrupt layer", func(t *testing.T) {
+		lay := buildLayers(t, sharedBase(), releaseLayer("a", true))
+		blobs := readLayoutBlobs(t, lay.Dir)
+		corruptBlob(blobs, lay.Layers[1])
+		_, obj, img := newStores(t)
+		_, err := Materialize(context.Background(), obj, img, blobs, lay.Root, lay.Platform, newSlots(1))
+		skipIfNoVerity(t, err)
+		if err == nil {
+			t.Fatal("Materialize accepted a corrupt layer")
+		}
+		assertSaved(t, img, true, lay.Layers[0])
+		assertSaved(t, img, false, lay.Layers[1])
+	})
+	t.Run("unwritable layers directory", func(t *testing.T) {
+		lay := buildLayers(t, sharedBase(), releaseLayer("a", true))
+		root, obj, img := newStores(t)
+		if err := os.WriteFile(filepath.Join(root, "layers"), nil, 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		logs := captureLogs(t)
+		got := pullLayout(t, obj, img, lay, lay.Root)
+		if !strings.Contains(logs.String(), "failed to save layer") {
+			t.Fatalf("no warning about the layer that was not saved:\n%s", logs)
+		}
+		if err := os.Remove(filepath.Join(root, "layers")); err != nil {
+			t.Fatalf("Remove: %v", err)
+		}
+		assertSaved(t, img, false, lay.Layers...)
+		assertMatchesFreshPull(t, lay, lay.Root, root, got)
+	})
+}
+
+// TestSavedLayerFallbackInterrupted asserts what ends the read of a layer for
+// its saved layer's missing files. A cancelled Finish context ends it: Finish
+// returns the cancellation, holding no slot, temp or binding, and a new pull
+// succeeds. Close does not: it waits for the read and for the image and its
+// binding to be written.
+func TestSavedLayerFallbackInterrupted(t *testing.T) {
+	requireTools(t)
+	lay := buildLayers(t, sharedBase(), releaseLayer("a", true))
+	base := lay.Layers[0]
+
+	t.Run("cancelled context", func(t *testing.T) {
+		root, obj, img := newStores(t)
+		pullLayout(t, obj, img, lay, lay.Root)
+		removeObjects(t, obj, storedDigest("app"))
+		if err := img.Delete(lay.Root, lay.Platform); err != nil {
+			t.Fatalf("Delete binding: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		rec := newRecorder(t, lay.Dir)
+		rec.onOpen = func(d digest.Digest) {
+			if d == base {
+				cancel()
+			}
+		}
+		slots := newSlots(2)
+		b, err := Begin(context.Background(), obj, img, rec, lay.Root, lay.Platform, slots)
+		if err != nil {
+			t.Fatalf("Begin: %v", err)
+		}
+		if _, err := b.Finish(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Finish = %v, want context.Canceled", err)
+		}
+		assertSaved(t, img, true, lay.Layers...)
+		if err := b.Close(); err != nil {
+			t.Fatalf("Close after the cancelled Finish = %v, want nil", err)
+		}
+		if len(slots) != 0 {
+			t.Fatalf("%d slots still held after the cancelled Finish", len(slots))
+		}
+		assertNoTemps(t, obj)
+		if _, err := img.Get(lay.Root, lay.Platform); !errors.Is(err, imagestore.ErrNotFound) {
+			t.Fatalf("binding lookup after the cancelled Finish = %v, want not found", err)
+		}
+		got, err := Materialize(context.Background(), obj, img, openLayout(t, lay.Dir), lay.Root, lay.Platform, slots)
+		if err != nil {
+			t.Fatalf("Materialize after the cancelled Finish: %v", err)
+		}
+		assertMatchesFreshPull(t, lay, lay.Root, root, got)
+	})
+
+	t.Run("close", func(t *testing.T) {
+		root, obj, img := newStores(t)
+		pullLayout(t, obj, img, lay, lay.Root)
+		removeObjects(t, obj, storedDigest("app"))
+		if err := img.Delete(lay.Root, lay.Platform); err != nil {
+			t.Fatalf("Delete binding: %v", err)
+		}
+
+		src := newGatedSource(openLayout(t, lay.Dir), base)
+		b, err := Begin(context.Background(), obj, img, src, lay.Root, lay.Platform, newSlots(2))
+		if err != nil {
+			t.Fatalf("Begin: %v", err)
+		}
+		type outcome struct {
+			built Built
+			err   error
+		}
+		finished := make(chan outcome, 1)
+		go func() {
+			built, err := b.Finish(context.Background())
+			finished <- outcome{built, err}
+		}()
+		// The base is opened only to supply the missing file, so the gate is
+		// reached inside Finish's tail.
+		<-src.entered
+		closed := make(chan error, 1)
+		go func() { closed <- b.Close() }()
+		select {
+		case err := <-closed:
+			t.Fatalf("Close returned %v while Finish was reading a layer", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+		close(src.release)
+		out := <-finished
+		if out.err != nil {
+			t.Fatalf("Finish: %v", out.err)
+		}
+		if err := <-closed; err != nil {
+			t.Fatalf("Close = %v, want nil", err)
+		}
+		if _, err := img.Get(lay.Root, lay.Platform); err != nil {
+			t.Fatalf("binding after Finish: %v", err)
+		}
+		assertMatchesFreshPull(t, lay, lay.Root, root, out.built)
+	})
+}
+
+// layerSize returns the size lay's manifest declares for layer i.
+func layerSize(t *testing.T, lay octest.Layout, i int) int64 {
+	t.Helper()
+	return readFixtureJSON[ocispec.Manifest](t, blobPath(lay.Dir, lay.Manifest)).Layers[i].Size
+}
+
+// rewriteImage rewrites lay's manifest and config through edit, writes both
+// under their new digests, and returns the new manifest digest as the pinned
+// root.
+func rewriteImage(t *testing.T, lay octest.Layout, edit func(m *ocispec.Manifest, c *ocispec.Image)) digest.Digest {
+	t.Helper()
+	manifest := readFixtureJSON[ocispec.Manifest](t, blobPath(lay.Dir, lay.Manifest))
+	config := readFixtureJSON[ocispec.Image](t, blobPath(lay.Dir, lay.Config))
+	edit(&manifest, &config)
+	configDesc := writeFixtureJSON(t, lay.Dir, config, ocispec.MediaTypeImageConfig)
+	manifest.Config.Digest, manifest.Config.Size = configDesc.Digest, configDesc.Size
+	return writeFixtureJSON(t, lay.Dir, manifest, ocispec.MediaTypeImageManifest).Digest
+}
+
+// retargetSavedLink points the hardlinks a saved layer records to from at to.
+func retargetSavedLink(t *testing.T, doc []byte, from, to string) []byte {
+	t.Helper()
+	target := func(name string) []byte {
+		return fmt.Appendf(nil, `"target":%q`, base64.StdEncoding.EncodeToString([]byte(name)))
+	}
+	if !bytes.Contains(doc, target(from)) {
+		t.Fatalf("the saved layer records no hardlink to %s", from)
+	}
+	return bytes.ReplaceAll(doc, target(from), target(to))
+}
+
+// appendSavedFile adds to a saved layer the record of a stored file of 100
+// bytes with the given content digest, which the layer does not carry.
+func appendSavedFile(doc []byte, name string, d digest.Digest) []byte {
+	return fmt.Appendf(append([]byte{}, doc...), `{"kind":"node","name":%q,"mode":%d,"digest":%q,"size":100}`+"\n",
+		base64.StdEncoding.EncodeToString([]byte(name)), 0o644, d)
+}
+
+// rewriteSaved decompresses a saved layer, passes its JSON through edit, and
+// compresses the result again, so the frame and its checksum stay sound.
+func rewriteSaved(t *testing.T, data []byte, edit func(doc []byte) []byte) []byte {
+	t.Helper()
+	decoder, err := zstd.NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer decoder.Close()
+	doc, err := io.ReadAll(decoder)
+	if err != nil {
+		t.Fatalf("decompress saved layer: %v", err)
+	}
+	var out bytes.Buffer
+	encoder, err := zstd.NewWriter(&out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := encoder.Write(edit(doc)); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
 }

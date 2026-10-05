@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -39,9 +41,12 @@ type Built struct {
 
 // Build is one image being materialized a layer at a time. Layers are scanned
 // ahead of the caller's Ingest calls under the engine's worker cap and merged
-// in manifest order; Ingest(i) returns once layer i is merged. The build's own
-// context carries the values of the Begin context without its cancellation,
-// so a build may span request handlers; Finish and Close end it.
+// in manifest order; Ingest(i) returns once layer i is merged. A scanned
+// layer is saved in the image store, and a layer the store holds a saved
+// layer for is merged from it without being read, its stored files pending
+// until Finish. The build's own context carries the values of the Begin
+// context without its cancellation, so a build may span request handlers;
+// Finish and Close end it.
 type Build struct {
 	store *objectstore.Store
 	img   *imagestore.Store
@@ -59,10 +64,11 @@ type Build struct {
 	accepted int           // highest layer index an Ingest or Finish asked for; -1 before the first
 	mergedN  int           // layers merged so far, in index order
 	err      error         // first causative failure
-	scans    []layerScan   // one per layer, filled by the scan goroutines
+	scans    []layerScan   // one per layer, filled by the scan goroutines and, for a reused layer, the launcher
 	merged   chan struct{} // closed and replaced on every merge or failure
 	launched bool
 	closed   bool
+	reused   []int // layers published from their saved layers
 
 	builderMu sync.Mutex // serializes calls on b.b: Merge, and Finish's tail against Close
 	wg        sync.WaitGroup
@@ -105,7 +111,7 @@ func Begin(ctx context.Context, store *objectstore.Store, img *imagestore.Store,
 // Ingest returns once every layer up to and including i is merged, in
 // manifest order: each is opened through the blob source (its compressed
 // digest verified as it is consumed) and scanned (its diff_id verified at end
-// of stream). A jump forward covers every layer in between; an index at or
+// of stream), or merged from its saved layer. A jump forward covers every layer in between; an index at or
 // below one already merged returns at once; an index outside the manifest's
 // layers is an error. A failure of any layer scanned so far is returned here
 // and by every later call; a cancelled ctx returns its error and leaves the
@@ -131,11 +137,13 @@ func (b *Build) Ingest(ctx context.Context, i int) error {
 
 // Finish waits for every layer to merge, finishes the rootfs build, verifies
 // the sealing annotations, syncs the store, and records the binding under the
-// resolved platform manifest. On a layer failure or a cancelled ctx it stops
-// every scan before returning the error. A Close that arrives before Finish
-// starts writing ends it with ErrClosed, recording nothing; one that
-// arrives while it writes waits for the image and its binding to land. The
-// build is spent afterwards.
+// resolved platform manifest. When layers were merged from their saved
+// layers, it first reads whole, under ctx and the scan limiter, each one that
+// lists a file the image needs and the store lacks. On a layer failure or a
+// cancelled ctx it stops every scan before returning the error. A Close that
+// arrives before Finish starts that tail ends it with ErrClosed, recording
+// nothing; one that arrives during it waits for the tail to end. The build is
+// spent afterwards.
 func (b *Build) Finish(ctx context.Context) (Built, error) {
 	n := len(b.res.DiffIDs)
 	b.mu.Lock()
@@ -157,23 +165,42 @@ func (b *Build) Finish(ctx context.Context) (Built, error) {
 		b.mu.Unlock()
 		return Built{}, err
 	}
-	// Nothing below is interruptible: a Close arriving now waits for the
-	// image and its binding to be written, so the store is never left
-	// half-recorded once Close has returned.
+	// Close interrupts nothing below: one arriving now waits for the image
+	// and its binding to be written, so the store is never left half-recorded
+	// once Close has returned. Only ctx ends a layer read made on the way.
 	b.builderMu.Lock()
 	defer b.builderMu.Unlock()
 	b.mu.Lock()
-	closed := b.closed
+	closed, reused := b.closed, b.reused
 	b.mu.Unlock()
 	if closed {
 		return Built{}, ErrClosed
 	}
-	return finishImage(ctx, b.store, b.img, b.root, b.res, b.b)
+	if len(reused) == 0 {
+		return finishImage(ctx, b.store, b.img, b.root, b.res, b.b)
+	}
+	// The build's own context is cancelled by now, so the layers a saved
+	// layer leaves to read are read under the caller's.
+	missing, err := b.b.Missing(ctx)
+	switch {
+	case err == nil:
+		_, err = supplySaved(ctx, b.store, b.img, b.src, b.b, b.res, reused, missing, b.slots)
+	case !cancelled(err):
+		removeSaved(b.img, b.res, reused)
+	}
+	if err != nil {
+		// Missing opened the builder's sealing writer, which only the
+		// builder's own Finish or Close ends; no Close of the build need follow.
+		b.b.Close()
+		return Built{}, err
+	}
+	return finishSaved(ctx, b.store, b.img, b.root, b.res, b.b, reused)
 }
 
 // Close abandons a build that will not finish: it stops every scan, waits for
 // them, and releases their slots. An Ingest blocked meanwhile returns; a
-// Finish past its wait completes first, and Close returns only once it has.
+// Finish past its wait completes first, any layer it reads included, and
+// Close returns only once it has.
 // Objects already sealed stay in the store as unreferenced content. It
 // returns the first layer failure the build recorded, if any, so a caller can
 // report it over its own closed state. Idempotent; a no-op after Finish.
@@ -241,13 +268,17 @@ func (b *Build) failure() error {
 
 // launch opens the layers in index order, each once the build is within its
 // window of merged layers and a slot is free, and hands each to a scan
-// goroutine that owns the slot the open took. It stops on cancellation or an
-// open failure.
+// goroutine that owns the slot the open took. A layer the store holds a
+// usable saved layer for is reused instead, within the same window. It stops
+// on cancellation or an open failure.
 func (b *Build) launch() {
 	defer b.wg.Done()
 	for j := range b.scans {
 		if !b.waitWindow(j) {
 			return
+		}
+		if b.reuse(j) {
+			continue
 		}
 		layer, err := b.openLayer(j)
 		if err != nil {
@@ -260,6 +291,26 @@ func (b *Build) launch() {
 		b.wg.Add(1)
 		go b.scan(j, layer)
 	}
+}
+
+// reuse publishes layer j from its saved layer as a finished scan and merges
+// whatever prefix of layers is ready, taking no slot and opening no blob. It
+// reports false, leaving the layer to be opened, when the store holds no
+// saved layer this image can use, or the build is stopped already.
+func (b *Build) reuse(j int) bool {
+	if b.ctx.Err() != nil {
+		return false
+	}
+	l := loadSaved(b.img, b.res, j)
+	if l == nil {
+		return false
+	}
+	b.mu.Lock()
+	b.reused = append(b.reused, j)
+	b.scans[j] = layerScan{done: true, layer: l}
+	b.mu.Unlock()
+	b.mergeReady()
+	return true
 }
 
 // waitWindow blocks until layer j is within the window of merged layers,
@@ -323,13 +374,17 @@ func (b *Build) openLayer(j int) (io.ReadCloser, error) {
 	}
 }
 
-// scan scans layer j, publishes the outcome, releases the slot it holds, and
-// merges whatever prefix of scanned layers is ready.
+// scan scans layer j, saves what a clean scan yielded, publishes the outcome,
+// releases the slot it holds, and merges whatever prefix of scanned layers is
+// ready.
 func (b *Build) scan(j int, layer io.ReadCloser) {
 	defer b.wg.Done()
 	l, err := b.b.Scan(b.ctx, layer, b.res.DiffIDs[j], j)
 	if cerr := layer.Close(); cerr != nil {
 		err = errors.Join(err, fmt.Errorf("materialize: layer %d: close: %w", j, cerr))
+	}
+	if err == nil {
+		saveLayer(b.img, b.res, j, l)
 	}
 	b.mu.Lock()
 	b.scans[j] = layerScan{done: true, layer: l, err: err}
@@ -362,7 +417,10 @@ func (b *Build) wake() {
 
 // mergeReady merges, in index order, every scanned layer that follows the
 // merged prefix, stopping at the first one still scanning or once the build
-// has failed.
+// has failed. A merge that fails removes the saved layers merged so far, the
+// failing one included: one of them may be what a sound layer could not be
+// merged over. A saved layer published ahead of the failure was not merged
+// and stays.
 func (b *Build) mergeReady() {
 	b.builderMu.Lock()
 	defer b.builderMu.Unlock()
@@ -385,7 +443,9 @@ func (b *Build) mergeReady() {
 		b.mu.Lock()
 		if err != nil {
 			b.fail(err)
+			merged := reusedThrough(b.reused, b.mergedN)
 			b.mu.Unlock()
+			removeSaved(b.img, b.res, merged)
 			return
 		}
 		b.scans[b.mergedN].layer = nil
@@ -438,15 +498,206 @@ func prepare(ctx context.Context, store *objectstore.Store, img *imagestore.Stor
 	return res, nil
 }
 
+// saveLayer saves the scanned layer j of res in img under the layer's blob
+// digest, with the blob size and diff_id it was verified against. The caller
+// has scanned the whole stream cleanly and has not merged l yet. A layer that
+// cannot be saved, or is too large to be, is only read again by a later pull,
+// so the failure is logged rather than returned.
+func saveLayer(img *imagestore.Store, res ocichain.Resolved, j int, l *rootfs.Layer) {
+	desc := res.Manifest.Layers[j]
+	data, err := rootfs.EncodeLayer(l, desc.Size, res.DiffIDs[j])
+	if err == nil {
+		err = img.PutLayer(desc.Digest, data)
+	}
+	if err != nil {
+		slog.Warn("materialize: failed to save layer", "layer", desc.Digest, "err", err)
+	}
+}
+
+// loadSaved returns layer j of res as its saved layer in img describes it, or
+// nil when img holds none this image can use: none at all, or one that does
+// not decode or was saved for another blob size or diff_id, which is logged.
+func loadSaved(img *imagestore.Store, res ocichain.Resolved, j int) *rootfs.Layer {
+	l, err := readSaved(img, res, j)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("materialize: ignoring saved layer", "layer", res.Manifest.Layers[j].Digest, "err", err)
+		}
+		return nil
+	}
+	return l
+}
+
+// readSaved reads and decodes the saved layer of layer j of res, requiring it
+// to have been saved for the blob size the manifest declares and the diff_id
+// the config names. A blob with no saved layer surfaces as an error
+// satisfying errors.Is(err, os.ErrNotExist).
+func readSaved(img *imagestore.Store, res ocichain.Resolved, j int) (*rootfs.Layer, error) {
+	desc := res.Manifest.Layers[j]
+	data, err := img.GetLayer(desc.Digest)
+	if err != nil {
+		return nil, err
+	}
+	return rootfs.DecodeLayer(data, j, desc.Size, res.DiffIDs[j])
+}
+
+// removeSaved deletes the saved layers of the layers in reused, so the next
+// pull reads those layers from the source. A build calls it for the saved
+// layers it merged, on a failure one of them can have caused: of a merge, of
+// resolving or supplying a pending file, of building the image, or of its
+// sealing verification. A failure to read a layer from the source, a cancellation,
+// and a failure to record the built image leave them in place.
+func removeSaved(img *imagestore.Store, res ocichain.Resolved, reused []int) {
+	for _, j := range reused {
+		blob := res.Manifest.Layers[j].Digest
+		if err := img.DeleteLayer(blob); err != nil {
+			slog.Warn("materialize: failed to remove saved layer", "layer", blob, "err", err)
+		}
+	}
+}
+
+// reusedThrough returns the layers in reused up to and including layer j: the
+// saved layers a merge that fails at j has taken in.
+func reusedThrough(reused []int, j int) []int {
+	var merged []int
+	for _, r := range reused {
+		if r <= j {
+			merged = append(merged, r)
+		}
+	}
+	return merged
+}
+
+// supplySaved supplies b with the payloads in missing: files that layers
+// merged from their saved layers left pending and the store lacks. Each layer
+// assignSaved gives a payload is read whole from src, once, under a slot — a
+// scan that stores every file the layer carries and verifies its blob digest
+// and diff_id, and whose result is dropped — and each payload is then
+// supplied once, out of the store. It returns how many payloads each layer it
+// read was read for. A payload that cannot be assigned, or supplied once its
+// layer was read, removes the saved layers.
+func supplySaved(ctx context.Context, store *objectstore.Store, img *imagestore.Store, src ocichain.BlobSource, b *rootfs.Builder, res ocichain.Resolved, reused []int, missing []rootfs.Payload, slots chan struct{}) (map[int]int, error) {
+	if len(missing) == 0 {
+		return nil, nil
+	}
+	owned, err := assignSaved(img, res, reused, missing)
+	if err != nil {
+		removeSaved(img, res, reused)
+		return nil, err
+	}
+	for _, j := range reused {
+		if owned[j] == 0 {
+			continue
+		}
+		if err := withSlot(ctx, slots, func() error { return rescanLayer(ctx, b, src, res, j) }); err != nil {
+			return nil, err
+		}
+	}
+	for _, p := range missing {
+		if err := supplyStored(ctx, store, b, p); err != nil {
+			if !cancelled(err) {
+				removeSaved(img, res, reused)
+			}
+			return nil, err
+		}
+	}
+	return owned, nil
+}
+
+// assignSaved assigns each payload in missing to the first layer in reused
+// whose saved layer lists it, and returns the number assigned to each layer
+// that got any. The saved layers are read again here rather than kept from
+// the merge. A blob the manifest lists twice takes every payload it lists at
+// its first position, so no layer is assigned twice. A payload no saved layer
+// lists is an error.
+func assignSaved(img *imagestore.Store, res ocichain.Resolved, reused []int, missing []rootfs.Payload) (map[int]int, error) {
+	unowned := make(map[rootfs.Payload]bool, len(missing))
+	for _, p := range missing {
+		unowned[p] = true
+	}
+	owned := make(map[int]int)
+	for _, j := range reused {
+		if len(unowned) == 0 {
+			break
+		}
+		l, err := readSaved(img, res, j)
+		if err != nil {
+			return nil, fmt.Errorf("materialize: read the saved layer of layer %d again: %w", j, err)
+		}
+		for _, p := range l.Payloads() {
+			if unowned[p] {
+				delete(unowned, p)
+				owned[j]++
+			}
+		}
+	}
+	for _, p := range missing {
+		if unowned[p] {
+			return nil, fmt.Errorf("materialize: no saved layer lists missing payload %s of %d bytes", p.Digest, p.Size)
+		}
+	}
+	return owned, nil
+}
+
+// rescanLayer reads layer j of res whole from src as a scan does and drops
+// the scan's result.
+func rescanLayer(ctx context.Context, b *rootfs.Builder, src ocichain.BlobSource, res ocichain.Resolved, j int) error {
+	stream, err := ocichain.OpenLayer(ctx, src, res.Manifest.Layers[j])
+	if err != nil {
+		return fmt.Errorf("materialize: open layer %d: %w", j, err)
+	}
+	_, err = b.Scan(ctx, stream, res.DiffIDs[j], j)
+	if cerr := stream.Close(); cerr != nil {
+		err = errors.Join(err, fmt.Errorf("materialize: layer %d: close: %w", j, cerr))
+	}
+	return err
+}
+
+// supplyStored supplies b with the payload p out of the object the store
+// holds for it.
+func supplyStored(ctx context.Context, store *objectstore.Store, b *rootfs.Builder, p rootfs.Payload) error {
+	r, err := store.Open(p.Digest)
+	if err != nil {
+		return fmt.Errorf("materialize: supply payload %s: %w", p.Digest, err)
+	}
+	err = b.Supply(ctx, p, r)
+	if cerr := r.Close(); cerr != nil {
+		err = errors.Join(err, cerr)
+	}
+	if err != nil {
+		return fmt.Errorf("materialize: supply payload %s: %w", p.Digest, err)
+	}
+	return nil
+}
+
+// cancelled reports whether err is a context's cancellation or deadline.
+func cancelled(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 // finishImage finishes the rootfs build, verifies the sealing annotations,
 // syncs the store, and records the binding under the resolved platform
 // manifest.
 func finishImage(ctx context.Context, store *objectstore.Store, img *imagestore.Store, root digest.Digest, res ocichain.Resolved, b *rootfs.Builder) (Built, error) {
+	return finishSaved(ctx, store, img, root, res, b, nil)
+}
+
+// finishSaved is finishImage for a build that merged the layers in reused
+// from their saved layers. When the image cannot be built, or fails its
+// sealing verification, for another reason than a cancellation, those saved
+// layers are removed.
+func finishSaved(ctx context.Context, store *objectstore.Store, img *imagestore.Store, root digest.Digest, res ocichain.Resolved, b *rootfs.Builder, reused []int) (Built, error) {
 	built, err := b.Finish(ctx)
 	if err != nil {
+		if !cancelled(err) {
+			removeSaved(img, res, reused)
+		}
 		return Built{}, err
 	}
 	if err := ociseal.VerifyAnnotations(ctx, store, res, built.FsverityDigest, built.Canonical); err != nil {
+		if !cancelled(err) {
+			removeSaved(img, res, reused)
+		}
 		return Built{}, fmt.Errorf("materialize: verify sealing annotations: %w", err)
 	}
 
