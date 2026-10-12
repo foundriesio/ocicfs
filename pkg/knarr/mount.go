@@ -60,7 +60,7 @@ func (e *engine) mount(ctx context.Context, ref, target string, opts ...MountOpt
 
 	// The store lock is held shared across the whole mount setup: a
 	// digest-pinned mount needs no ref record, so it can otherwise begin from
-	// an orphan binding after gc's census judged the image unwanted and idle.
+	// an orphan binding during gc's inventory, before the image is judged.
 	// Under the shared lock no mount overlaps a sweep; once the image's own
 	// in-use lock is taken inside the mount, the sweep sees it.
 	unlock, err := e.lockStoreShared()

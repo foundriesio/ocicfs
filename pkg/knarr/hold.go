@@ -42,7 +42,7 @@ func (e *engine) Holds(ctx context.Context) (map[digest.Digest][]string, error) 
 		if err != nil {
 			return nil, fmt.Errorf("list holds: %w", err)
 		}
-		// A last release racing the census empties the digest between the
+		// A last release racing the listing empties the digest between the
 		// two reads; it is then not held.
 		if len(holders) > 0 {
 			out[root] = holders

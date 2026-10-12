@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -347,6 +348,16 @@ type GCReport struct {
 	// entries are counted in ObjectsRemoved but not listed here, so its
 	// length can fall short of that count.
 	Removed []string
+	// Candidates counts the objects judged unwanted before the in-use probe,
+	// which InUseSkipped then takes from.
+	Candidates int
+	// InventoryDuration is the time spent walking and measuring every
+	// object under the shared store lock.
+	InventoryDuration time.Duration
+	// MarkSweepDuration is the time spent under the exclusive store lock
+	// marking wanted content, sweeping records, and probing for mounters,
+	// up to the first deletion.
+	MarkSweepDuration time.Duration
 }
 
 // RemoveOptions is the resolved configuration a Remove acts on. Callers pass
@@ -455,9 +466,11 @@ type Engine interface {
 	// — nor in use by a mounter, along with orphan bindings, runtime
 	// references whose holder no longer stands, orphan fs-verity view
 	// entries, staging leftovers, and the empty shard directories earlier
-	// deletions left behind. It
-	// holds the store lock exclusively and fails fast with an error matching
-	// ErrStoreBusy while a pull, hold, or mount is in progress; retry. A
+	// deletions left behind. It inventories the objects under the shared
+	// store lock and decides and deletes under the exclusive one, failing
+	// fast with an error matching ErrStoreBusy while a pull, hold, or mount
+	// is in progress at the start, or while one started during the
+	// inventory is still running when the lock turns exclusive; retry. A
 	// wanted image it cannot fully enumerate aborts the collection with
 	// nothing deleted, naming the broken root and the remedy. WithDryRun
 	// reports the same counts a collection would produce without removing

@@ -24,8 +24,9 @@ var ErrNotMounted = errors.New("target is not mounted")
 // mounts never stack, so the existing one must be unmounted first.
 var ErrAlreadyMounted = errors.New("target is already mounted")
 
-// ErrStoreBusy reports that gc could not take the exclusive store lock
-// because a pull, hold, or mount is in progress; the caller retries.
+// ErrStoreBusy reports that gc could not take the store lock: a pull, hold,
+// or mount is in progress at the start, or one started during the inventory
+// is still running when gc needs the lock exclusive; the caller retries.
 var ErrStoreBusy = errors.New("store busy")
 
 // ErrNoRangeSource reports that a delta pull was asked of a source that

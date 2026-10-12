@@ -19,8 +19,9 @@ seals every content object with it and refuses a store that cannot.
 ```
 
 `.lock` is created on demand and never removed: `pull`, `hold`, and `mount`
-hold it shared for their duration, `gc` exclusive (failing fast when busy),
-so a collection never interleaves with an image being staged, a hold being
+hold it shared for their duration, `gc` shared while it inventories the
+objects and exclusive while it decides and deletes (failing fast when busy),
+so a deletion never interleaves with an image being staged, a hold being
 recorded, or a mount being set up. See [gc.md](gc.md).
 
 Every digest is sharded by its first byte (`<aa>` = first two hex chars, `<rest>`

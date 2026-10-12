@@ -14,15 +14,22 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sys/unix"
 
 	"github.com/foundriesio/knarr/internal/composefs"
 	"github.com/foundriesio/knarr/internal/imagestore"
 	"github.com/foundriesio/knarr/internal/objectstore"
 	"github.com/foundriesio/knarr/internal/ocilayout"
 )
+
+// gcBetweenPhases, when set, runs after the inventory and before gc converts
+// the store lock to exclusive. It is nil outside tests, which use it to
+// interleave a verb with a collection.
+var gcBetweenPhases func()
 
 // GC deletes every store object that is neither wanted nor in use.
 func (e *engine) GC(ctx context.Context, opts ...GCOption) (*GCReport, error) {
@@ -39,21 +46,48 @@ func (e *engine) gc(ctx context.Context, opts ...GCOption) (*GCReport, error) {
 		opt(&cfg)
 	}
 
-	unlock, err := e.lockStoreExclusive()
+	// The lock is taken exclusive first, so a verb in flight fails the
+	// collection before any work, then converted to shared for the
+	// inventory, which fs-verity-measures every object and dominates the
+	// run time: pulls, holds, and mounts proceed alongside it. The
+	// conversion to exclusive that follows fails if a verb started during
+	// the inventory and is still running; every conversion is non-blocking
+	// and a failed one leaves no lock, so the release only closes the file.
+	lock, err := e.openStoreLock(unix.LOCK_EX | unix.LOCK_NB)
 	if err != nil {
 		return nil, err
 	}
+	unlock := releaseStoreLock(lock)
 	defer unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
+	if err := flockStore(lock, unix.LOCK_SH|unix.LOCK_NB); err != nil {
+		return nil, err
+	}
+	start := time.Now()
+	inventory, err := e.inventoryObjects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	report := &GCReport{InventoryDuration: time.Since(start)}
+
+	if gcBetweenPhases != nil {
+		gcBetweenPhases()
+	}
+
+	// Decisions and deletions run under the exclusive lock from fresh
+	// listings, so a reference or hold recorded during the inventory marks
+	// what it wants before anything is judged.
+	if err := flockStore(lock, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return nil, err
+	}
+	start = time.Now()
 	marks, err := e.markWanted(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	report := &GCReport{}
 	if err := e.sweepRuntimeRefs(ctx, cfg.DryRun, report); err != nil {
 		return nil, err
 	}
@@ -64,18 +98,30 @@ func (e *engine) gc(ctx context.Context, opts ...GCOption) (*GCReport, error) {
 		return nil, err
 	}
 
-	// Pass 1: census and probe, no deletion. An unmarked object whose in-use
-	// probe fails is mounted; if it reads as a composefs image, the objects it
-	// redirects to join the mark set — the transitive protection — so no data
-	// object of a live mount can already be gone by the time its image is
-	// visited.
-	candidates, err := e.censusObjects(ctx, marks, report)
+	var candidates []gcObject
+	for _, o := range inventory {
+		if _, ok := marks.sha[o.digest]; ok {
+			continue
+		}
+		if _, ok := marks.objects[o.viewName]; ok {
+			continue
+		}
+		candidates = append(candidates, o)
+	}
+	report.Candidates = len(candidates)
+
+	// The in-use probe runs over every candidate before the first deletion:
+	// an in-use image's redirects join the mark set — the transitive
+	// protection — so no data object of a live mount can already be gone by
+	// the time its image is visited.
+	candidates, err = e.probeInUse(ctx, marks, inventory, candidates, report)
 	if err != nil {
 		return nil, err
 	}
+	report.MarkSweepDuration = time.Since(start)
 
-	// Pass 2: delete what pass 1 judged unwanted and idle and pass 1's
-	// transitive marks did not claim since.
+	// Delete what was judged unwanted and idle and the transitive marks did
+	// not claim since.
 	for _, c := range candidates {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -172,7 +218,7 @@ type gcMarks struct {
 }
 
 // markWanted builds the wanted set from the store's roots: every reference
-// record and every held digest. Both censuses are strict, and any wanted
+// record and every held digest. Both listings are strict, and any wanted
 // image that cannot be fully enumerated — an unresolvable chain, a missing
 // binding, an unreadable EROFS — aborts the collection: sweeping anyway could
 // delete live data an offline device cannot re-fetch, so keeping garbage one
@@ -476,65 +522,95 @@ func (e *engine) sweepSavedLayers(ctx context.Context, m *gcMarks, dryRun bool) 
 	})
 }
 
-// gcCandidate is one pass-1 deletion candidate: unmarked by either name and
-// idle at probe time.
-type gcCandidate struct {
+// gcObject is one stored object as the inventory saw it: its content digest,
+// size, and the view-relative fs-verity name EROFS redirects carry.
+type gcObject struct {
 	digest   digest.Digest
 	size     int64
 	viewName string
 }
 
-// censusObjects is gc's pass 1: it walks every object, measures the unmarked
-// ones (a cheap read of the sealed fs-verity root hash), probes the rest for
-// mounters, and redirect-walks any in-use image into the mark set. An object
-// that cannot be measured is skipped with a warning, never deleted: wanted
-// per-file objects are marked only by fs-verity name, so an unmeasurable
-// object cannot be proven unwanted.
-func (e *engine) censusObjects(ctx context.Context, m *gcMarks, report *GCReport) ([]gcCandidate, error) {
-	var candidates []gcCandidate
+// inventoryObjects walks every object and measures it (a cheap read of the
+// sealed fs-verity root hash). An object that cannot be measured is skipped
+// with a warning, never deleted: wanted per-file objects are marked only by
+// fs-verity name, so an unmeasurable object cannot be proven unwanted.
+func (e *engine) inventoryObjects(ctx context.Context) ([]gcObject, error) {
+	var inventory []gcObject
 	err := e.obj.Walk(ctx, func(d digest.Digest, size int64) error {
-		if _, ok := m.sha[d]; ok {
-			return nil
-		}
 		fsv, err := e.obj.VerityDigest(d)
 		if err != nil {
 			slog.Warn("knarr: gc skipping unmeasurable object", "digest", d, "err", err)
 			return nil
 		}
-		name := viewRelativeName(fsv)
-		if _, ok := m.objects[name]; ok {
-			return nil
-		}
-		inUse, err := e.obj.InUse(d)
-		if err != nil {
-			return err
-		}
-		if inUse {
-			report.InUseSkipped++
-			path, err := e.obj.ObjectPath(d)
-			if err != nil {
-				return err
-			}
-			names, err := composefs.ReferencedObjects(ctx, path)
-			if err != nil {
-				// Only composefs images carry mount locks, but the probe is
-				// advisory: an in-use object that does not read as one is
-				// simply kept, contributing nothing transitively.
-				slog.Debug("knarr: gc kept in-use object that is not a composefs image", "digest", d, "err", err)
-				return nil
-			}
-			for _, n := range names {
-				m.objects[n] = struct{}{}
-			}
-			return nil
-		}
-		candidates = append(candidates, gcCandidate{digest: d, size: size, viewName: name})
+		inventory = append(inventory, gcObject{digest: d, size: size, viewName: viewRelativeName(fsv)})
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return candidates, nil
+	return inventory, nil
+}
+
+// probeInUse drops every in-use candidate, counting it in the report, and
+// returns the rest. It also probes the objects written since the inventory,
+// which are never candidates this cycle, so that an image mounted from them
+// marks the inventoried objects it redirects to.
+func (e *engine) probeInUse(ctx context.Context, m *gcMarks, inventory, candidates []gcObject, report *GCReport) ([]gcObject, error) {
+	var idle []gcObject
+	for _, c := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		inUse, err := e.markInUse(ctx, m, c.digest)
+		if err != nil {
+			return nil, err
+		}
+		if inUse {
+			report.InUseSkipped++
+			continue
+		}
+		idle = append(idle, c)
+	}
+	inventoried := make(map[digest.Digest]struct{}, len(inventory))
+	for _, o := range inventory {
+		inventoried[o.digest] = struct{}{}
+	}
+	err := e.obj.Walk(ctx, func(d digest.Digest, _ int64) error {
+		if _, ok := inventoried[d]; ok {
+			return nil
+		}
+		_, err := e.markInUse(ctx, m, d)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return idle, nil
+}
+
+// markInUse reports whether a mounter holds object d and, when one does,
+// adds the objects it redirects to to the mark set.
+func (e *engine) markInUse(ctx context.Context, m *gcMarks, d digest.Digest) (bool, error) {
+	inUse, err := e.obj.InUse(d)
+	if err != nil || !inUse {
+		return false, err
+	}
+	path, err := e.obj.ObjectPath(d)
+	if err != nil {
+		return false, err
+	}
+	names, err := composefs.ReferencedObjects(ctx, path)
+	if err != nil {
+		// Only composefs images carry mount locks, but the probe is
+		// advisory: an in-use object that does not read as one is simply
+		// kept, contributing nothing transitively.
+		slog.Debug("knarr: gc kept in-use object that is not a composefs image", "digest", d, "err", err)
+		return true, nil
+	}
+	for _, n := range names {
+		m.objects[n] = struct{}{}
+	}
+	return true, nil
 }
 
 // viewRelativeName maps a measured fs-verity digest to the sharded

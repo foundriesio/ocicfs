@@ -96,15 +96,28 @@ legitimate one, for gc exactly as for mount; sealing is what closes that gap.
 
 ## Concurrency
 
-gc takes the store lock exclusively and never blocks: while a pull, hold, or
-mount is in progress it fails fast with a "store busy" error, and the caller
-retries. Those three verbs hold the lock shared for their duration, so a
-collection never interleaves with an image being staged, a hold being
-recorded, or a mount being set up. `remove` and `release` need no lock —
-racing them only makes a collection keep too much for one cycle, or, when a
-`remove` lands between gc's census of the reference records and its walk of
-that image, surfaces as a transient broken-root abort for the image just
-removed; nothing is deleted either way, and a retry succeeds.
+A collection runs in two phases under the store lock, and never blocks on
+it. The first, the inventory, walks every object and measures its fs-verity
+digest; on a store of tens of thousands of objects that is nearly all of
+gc's run time, so it holds the lock shared, and pulls, holds, and mounts
+proceed alongside it. The second takes the lock exclusive, lists the
+reference records and holds afresh, decides what is unwanted, probes every
+candidate for a mounter, and only then deletes. `pull`, `hold`, and `mount`
+hold the lock shared for their duration, so no deletion interleaves with an
+image being staged, a hold being recorded, or a mount being set up, and a
+reference recorded while the inventory ran protects its objects before
+anything is judged.
+
+A collection fails fast with a "store busy" error, deleting nothing, when a
+pull, hold, or mount is in progress as it starts, or when one that started
+during the inventory is still running as the lock turns exclusive; the
+caller retries. An object written during the inventory is not a
+candidate this cycle: it is kept until the next collection, which sees it in
+its own inventory. `remove` and `release` need no lock — racing them only
+makes a collection keep too much for one cycle, or, when a `remove` lands
+between gc's listing of the reference records and its walk of that image,
+surfaces as a transient broken-root abort for the image just removed;
+nothing is deleted either way, and a retry succeeds.
 
 ## In-use coverage
 

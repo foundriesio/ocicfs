@@ -13,7 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -573,12 +573,232 @@ func TestGCStoreBusy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GC on empty store: %v", err)
 	}
-	if !reflect.DeepEqual(*report, GCReport{}) {
-		t.Fatalf("GC on empty store = %+v, want a zero report", report)
+	if report.ObjectsRemoved != 0 || report.BytesFreed != 0 || report.BindingsRemoved != 0 ||
+		report.RefsRemoved != 0 || report.InUseSkipped != 0 || report.Candidates != 0 || len(report.Removed) != 0 {
+		t.Fatalf("GC on empty store = %+v, want nothing removed", report)
+	}
+	if report.InventoryDuration < 0 || report.MarkSweepDuration < 0 {
+		t.Fatalf("GC on empty store = %+v, want non-negative durations", report)
 	}
 }
 
-// TestGCSkipsUnmeasurableObject pins the census's conservative branch: an
+// gcHook runs fn once, inside the next collection, after the inventory and
+// before the store lock turns exclusive.
+func gcHook(t *testing.T, fn func()) {
+	t.Helper()
+	gcBetweenPhases = func() {
+		gcBetweenPhases = nil
+		fn()
+	}
+	t.Cleanup(func() { gcBetweenPhases = nil })
+}
+
+// lockObjectShared takes the in-use lock a mounter would hold on object d,
+// for the rest of the test.
+func lockObjectShared(t *testing.T, storeRoot string, d digest.Digest) {
+	t.Helper()
+	f, err := os.Open(octest.ObjectPath(storeRoot, d)) // #nosec G304 -- store object path under the test root
+	if err != nil {
+		t.Fatalf("open object: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close object: %v", err)
+		}
+	})
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_SH); err != nil { // #nosec G115 -- a file descriptor always fits in int
+		t.Fatalf("Flock: %v", err)
+	}
+}
+
+// TestGCPullDuringInventory pins fresh marking: an image whose objects the
+// inventory saw unreferenced is pulled again while the inventory runs, and
+// the collection neither fails nor removes it — the marks taken under the
+// exclusive lock see the restored reference, not the stale listing.
+func TestGCPullDuringInventory(t *testing.T) {
+	eng, storeRoot, _ := gcEngine(t, "keep")
+	ctx := context.Background()
+	late := gcPull(t, eng, "late")
+	if err := eng.Remove(ctx, late.Ref); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	gcHook(t, func() {
+		if _, err := eng.Pull(ctx, late.Ref, WithFromDir(late.Dir)); err != nil {
+			t.Fatalf("Pull %s: %v", late.Ref, err)
+		}
+	})
+	report, err := eng.GC(ctx)
+	if err != nil {
+		t.Fatalf("GC with a pull during the inventory: %v", err)
+	}
+	if report.ObjectsRemoved != 0 || report.InUseSkipped != 0 {
+		t.Fatalf("GC = %+v, want nothing removed", report)
+	}
+	assertObjectExists(t, storeRoot, late.Manifest)
+	assertObjectExists(t, storeRoot, gcUniqueDigest("late"))
+	assertObjectExists(t, storeRoot, gcUniqueDigest("keep"))
+	if _, err := eng.Inspect(ctx, late.Ref); err != nil {
+		t.Fatalf("Inspect after gc: %v", err)
+	}
+}
+
+// TestGCMountDuringInventory pins the in-use probe under the exclusive lock:
+// an orphan image mounted after the inventory judged nothing yet survives
+// with the data objects it references, and a dry run reports none of them
+// as removed either.
+func TestGCMountDuringInventory(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []GCOption
+	}{
+		{name: "collect"},
+		{name: "dry run", opts: []GCOption{WithDryRun()}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eng, storeRoot, lay := gcEngine(t, "orphan")
+			ctx := context.Background()
+			image := readPullBinding(t, storeRoot, lay.Root, lay.Platform).RootFS.Descriptor.Digest
+			if err := eng.Remove(ctx, lay.Ref); err != nil {
+				t.Fatalf("Remove: %v", err)
+			}
+
+			gcHook(t, func() { lockObjectShared(t, storeRoot, image) })
+			report, err := eng.GC(ctx, tc.opts...)
+			if err != nil {
+				t.Fatalf("GC: %v", err)
+			}
+			if report.InUseSkipped != 1 {
+				t.Fatalf("GC = %+v, want exactly the mounted image skipped as in use", report)
+			}
+			if len(report.Removed) != report.ObjectsRemoved {
+				t.Fatalf("GC listed %d removed digests, counted %d", len(report.Removed), report.ObjectsRemoved)
+			}
+			protected := []digest.Digest{image, digest.SHA256.FromString(gcSharedBody), gcUniqueDigest("orphan")}
+			for _, d := range protected {
+				if slices.Contains(report.Removed, d.String()) {
+					t.Fatalf("GC = %+v, reports the protected object %s removed", report, d)
+				}
+				assertObjectExists(t, storeRoot, d)
+			}
+			// The orphan's metadata chain has no mounter and goes.
+			if !slices.Contains(report.Removed, lay.Manifest.String()) {
+				t.Fatalf("GC = %+v, want the orphan manifest %s removed", report, lay.Manifest)
+			}
+		})
+	}
+}
+
+// TestGCBusyAfterInventory pins the second lock switch: a verb still holding
+// the store lock shared when the inventory ends fails the collection with
+// ErrStoreBusy and nothing deleted, and a retry once it is gone collects.
+func TestGCBusyAfterInventory(t *testing.T) {
+	eng, storeRoot, lay := gcEngine(t, "orphan")
+	e := eng.(*engine)
+	ctx := context.Background()
+	if err := eng.Remove(ctx, lay.Ref); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	var unlock func()
+	gcHook(t, func() {
+		var err error
+		if unlock, err = e.lockStoreShared(); err != nil {
+			t.Fatalf("lockStoreShared: %v", err)
+		}
+	})
+	if _, err := eng.GC(ctx); !errors.Is(err, ErrStoreBusy) {
+		t.Fatalf("GC against a verb started during the inventory = %v, want ErrStoreBusy", err)
+	}
+	assertObjectExists(t, storeRoot, lay.Manifest)
+	assertObjectExists(t, storeRoot, gcUniqueDigest("orphan"))
+
+	unlock()
+	report, err := eng.GC(ctx)
+	if err != nil {
+		t.Fatalf("GC retry: %v", err)
+	}
+	if report.ObjectsRemoved == 0 {
+		t.Fatalf("GC retry = %+v, want the orphan reclaimed", report)
+	}
+	assertObjectAbsent(t, storeRoot, lay.Manifest)
+	assertObjectAbsent(t, storeRoot, gcUniqueDigest("orphan"))
+}
+
+// TestGCKeepsObjectWrittenDuringInventory pins the one-cycle grace: an
+// object the inventory never saw is not a candidate, whatever wants it, and
+// the next collection reclaims it.
+func TestGCKeepsObjectWrittenDuringInventory(t *testing.T) {
+	eng, storeRoot, _ := gcEngine(t, "keep")
+	e := eng.(*engine)
+	ctx := context.Background()
+
+	var stray digest.Digest
+	gcHook(t, func() {
+		var err error
+		if stray, _, err = e.obj.WriteObject(ctx, strings.NewReader("written during the inventory, wanted by nothing")); err != nil {
+			t.Fatalf("WriteObject: %v", err)
+		}
+	})
+	if _, err := eng.GC(ctx); err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	assertObjectExists(t, storeRoot, stray)
+
+	if _, err := eng.GC(ctx); err != nil {
+		t.Fatalf("second GC: %v", err)
+	}
+	assertObjectAbsent(t, storeRoot, stray)
+	assertObjectExists(t, storeRoot, gcUniqueDigest("keep"))
+}
+
+// TestGCNewMountProtectsInventoriedObject pins the probe of objects written
+// during the inventory: an image pulled then, mounted, and unreferenced
+// again is no candidate itself, and its redirect walk still protects the
+// inventoried data object it shares with an image already judged unwanted.
+func TestGCNewMountProtectsInventoriedObject(t *testing.T) {
+	eng, storeRoot, _ := gcEngine(t, "keep")
+	ctx := context.Background()
+	dropped := gcPull(t, eng, "drop")
+	if err := eng.Remove(ctx, dropped.Ref); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	reused := gcUniqueDigest("drop")
+
+	var image digest.Digest
+	gcHook(t, func() {
+		lay, err := octest.BuildSingleLayerGzip(t.TempDir(), hostPlatform(),
+			octest.File{Name: "etc/shared.txt", Mode: 0o644, Body: gcSharedBody},
+			octest.File{Name: "etc/drop.txt", Mode: 0o644, Body: "unique payload for drop, padded far beyond the sixty-four byte inline threshold\n"},
+			octest.File{Name: "etc/late.txt", Mode: 0o644, Body: "a file that makes this a new image, padded past the sixty-four byte inline threshold\n"},
+		)
+		if err != nil {
+			t.Fatalf("build layout: %v", err)
+		}
+		if _, err := eng.Pull(ctx, lay.Ref, WithFromDir(lay.Dir)); err != nil {
+			t.Fatalf("Pull %s: %v", lay.Ref, err)
+		}
+		image = readPullBinding(t, storeRoot, lay.Root, lay.Platform).RootFS.Descriptor.Digest
+		lockObjectShared(t, storeRoot, image)
+		if err := eng.Remove(ctx, lay.Ref); err != nil {
+			t.Fatalf("Remove: %v", err)
+		}
+	})
+	report, err := eng.GC(ctx)
+	if err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	assertObjectExists(t, storeRoot, image)
+	assertObjectExists(t, storeRoot, reused)
+	assertObjectExists(t, storeRoot, gcUniqueDigest("keep"))
+	// The dropped image's own chain, which nothing mounted, goes.
+	if !slices.Contains(report.Removed, dropped.Manifest.String()) {
+		t.Fatalf("GC = %+v, want the dropped manifest %s removed", report, dropped.Manifest)
+	}
+	assertObjectAbsent(t, storeRoot, dropped.Manifest)
+}
+
+// TestGCSkipsUnmeasurableObject pins the inventory's conservative branch: an
 // object without a measurable fs-verity digest cannot be proven unwanted —
 // wanted per-file objects are marked only by fs-verity name — so gc must
 // skip it with a warning, never delete it, and still complete.
