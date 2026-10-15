@@ -1,23 +1,23 @@
-Source: knarr
+Source: ocicfs
 Section: utils
 Priority: optional
 Maintainer: Mykhaylo Sul <mykhaylo.sul@oss.qualcomm.com>
 Rules-Requires-Root: no
 Build-Depends: debhelper-compat (= 13)
 Standards-Version: 4.7.0
-Homepage: https://github.com/foundriesio/knarr
-Vcs-Browser: https://github.com/foundriesio/knarr
-Vcs-Git: https://github.com/foundriesio/knarr.git
-XS-Go-Import-Path: github.com/foundriesio/knarr
+Homepage: https://github.com/foundriesio/ocicfs
+Vcs-Browser: https://github.com/foundriesio/ocicfs
+Vcs-Git: https://github.com/foundriesio/ocicfs.git
+XS-Go-Import-Path: github.com/foundriesio/ocicfs
 
-Package: knarr
+Package: ocicfs
 Architecture: any
 Depends: ${misc:Depends},
          ${shlibs:Depends}
 Recommends: composefs
 Static-Built-Using: ${misc:Static-Built-Using}
 Description: OCI-native content delivery and mount engine for edge devices
- knarr pulls standard OCI images into a shared content-addressed store and
+ ocicfs pulls standard OCI images into a shared content-addressed store and
  mounts them with composefs, EROFS and fs-verity: one mount syscall per
  image, a single decompressed copy of content on disk, and no daemon.
  .

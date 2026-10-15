@@ -15,7 +15,7 @@ out_dir=${1:?usage: deb-test.sh <deb-dir>}
 
 arch=$(dpkg --print-architecture 2>/dev/null \
     || uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
-deb="$out_dir/knarr_${DEB_VERSION}_${arch}.deb"
+deb="$out_dir/ocicfs_${DEB_VERSION}_${arch}.deb"
 [ -f "$deb" ] || { echo "deb-test: missing $deb" >&2; exit 1; }
 
 for image in debian:trixie ubuntu:noble; do
@@ -25,25 +25,25 @@ for image in debian:trixie ubuntu:noble; do
         -e DEB_VERSION -e VERSION -e ARCH="$arch" \
         "$image" bash -s <<'EOF'
 set -eux
-deb="/out/knarr_${DEB_VERSION}_${ARCH}.deb"
+deb="/out/ocicfs_${DEB_VERSION}_${ARCH}.deb"
 
-[ "$(dpkg-deb -f "$deb" Package)" = knarr ]
+[ "$(dpkg-deb -f "$deb" Package)" = ocicfs ]
 [ "$(dpkg-deb -f "$deb" Version)" = "$DEB_VERSION" ]
 [ "$(dpkg-deb -f "$deb" Architecture)" = "$ARCH" ]
 dpkg-deb -f "$deb" Recommends | grep -q composefs
 
 apt-get update
 apt-get install -y --no-install-recommends "$deb"
-knarr --version | grep -F "knarr ${VERSION}"
-knarr --help >/dev/null
+ocicfs --version | grep -F "ocicfs ${VERSION}"
+ocicfs --help >/dev/null
 
 # Installing the same package again exercises the upgrade path.
 apt-get install -y --reinstall --no-install-recommends "$deb"
-knarr --version >/dev/null
+ocicfs --version >/dev/null
 
-apt-get remove -y knarr
-! command -v knarr
-apt-get purge -y knarr
+apt-get remove -y ocicfs
+! command -v ocicfs
+apt-get purge -y ocicfs
 EOF
 done
 echo "deb-test: OK"

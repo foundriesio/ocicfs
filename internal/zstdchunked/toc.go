@@ -13,7 +13,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/foundriesio/knarr/internal/digestutil"
+	"github.com/foundriesio/ocicfs/internal/digestutil"
 	"github.com/klauspost/compress/zstd"
 	"github.com/opencontainers/go-digest"
 )

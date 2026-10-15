@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/foundriesio/knarr/internal/devtest"
+	"github.com/foundriesio/ocicfs/internal/devtest"
 )
 
 // TestEnableMeasure enables fs-verity on a file and measures it. It runs on the

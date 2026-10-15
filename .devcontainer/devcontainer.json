@@ -1,5 +1,5 @@
 {
-  "name": "knarr",
+  "name": "ocicfs",
   "build": {
     "dockerfile": "../Containerfile",
     "context": ".."
@@ -8,7 +8,7 @@
     "--privileged"
   ],
   "containerEnv": {
-    "KNARR_TEST_VERITY_SIZE_MB": "${localEnv:KNARR_TEST_VERITY_SIZE_MB}"
+    "OCICFS_TEST_VERITY_SIZE_MB": "${localEnv:OCICFS_TEST_VERITY_SIZE_MB}"
   },
   "remoteEnv": {
     "PATH": "${containerEnv:PATH}:${containerWorkspaceFolder}/bin"

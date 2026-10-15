@@ -729,7 +729,7 @@ func TestOpenLayerCtxCancelledBeforeOpen(t *testing.T) {
 // read complete from the already-buffered prefix and succeed).
 func TestOpenLayerCtxCancelledDuringRead(t *testing.T) {
 	f := newFixture(t)
-	payload := bytes.Repeat([]byte("knarr-streaming-payload;"), 4096) // ~96 KiB > bufio buffer
+	payload := bytes.Repeat([]byte("ocicfs-streaming-payload;"), 4096) // ~96 KiB > bufio buffer
 	l, desc := openLayerRaw(t, f, payload)
 	ctx, cancel := context.WithCancel(context.Background())
 	rc, err := OpenLayer(ctx, l, desc)
@@ -750,7 +750,7 @@ func TestOpenLayerCtxCancelledDuringRead(t *testing.T) {
 // through the hasher. Without the drain the byte count (and digest) would fall
 // short and the read would fail.
 func TestVerifyingLayerReaderDrainsTrailingBytes(t *testing.T) {
-	src := bytes.Repeat([]byte("knarr-layer-bytes;"), 16)
+	src := bytes.Repeat([]byte("ocicfs-layer-bytes;"), 16)
 	desc := ocispec.Descriptor{Digest: digest.SHA256.FromBytes(src), Size: int64(len(src))}
 
 	h := sha256.New()

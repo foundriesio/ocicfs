@@ -22,11 +22,11 @@ import (
 
 	"github.com/opencontainers/go-digest"
 
-	"github.com/foundriesio/knarr/internal/composefs"
-	"github.com/foundriesio/knarr/internal/devtest"
-	"github.com/foundriesio/knarr/internal/digestutil"
-	"github.com/foundriesio/knarr/internal/objectstore"
-	"github.com/foundriesio/knarr/internal/verity"
+	"github.com/foundriesio/ocicfs/internal/composefs"
+	"github.com/foundriesio/ocicfs/internal/devtest"
+	"github.com/foundriesio/ocicfs/internal/digestutil"
+	"github.com/foundriesio/ocicfs/internal/objectstore"
+	"github.com/foundriesio/ocicfs/internal/verity"
 )
 
 func TestNormalizeName(t *testing.T) {
@@ -709,7 +709,7 @@ func TestTransformSynthesizedParentDiverges(t *testing.T) {
 
 // TestTransformOpaqueSameLayerBeforeMarkerDiverges asserts the divergence case:
 // a same-layer entry written under a directory *before* that layer's opaque
-// marker is kept by knarr (upstream clears it), so the image is non-canonical.
+// marker is kept by ocicfs (upstream clears it), so the image is non-canonical.
 func TestTransformOpaqueSameLayerBeforeMarkerDiverges(t *testing.T) {
 	layer1 := tarBytes(t,
 		tarEntry{name: "usr", typ: tar.TypeDir, mode: 0o755},
@@ -735,7 +735,7 @@ func TestTransformOpaqueSameLayerBeforeMarkerDiverges(t *testing.T) {
 
 // TestTransformOpaqueSameLayerAfterMarkerStaysCanonical is the control: when the
 // opaque marker precedes its layer's own entries — the usual tar ordering —
-// knarr and upstream agree, so the image stays canonical.
+// ocicfs and upstream agree, so the image stays canonical.
 func TestTransformOpaqueSameLayerAfterMarkerStaysCanonical(t *testing.T) {
 	layer1 := tarBytes(t,
 		tarEntry{name: "usr", typ: tar.TypeDir, mode: 0o755},

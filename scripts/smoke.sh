@@ -3,7 +3,7 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: Apache-2.0
 #
-# knarr smoke test: exercise the image lifecycle and sealing against a real
+# ocicfs smoke test: exercise the image lifecycle and sealing against a real
 # image and a real registry.
 #
 # Phase 0 builds a purpose-built image offline with umoci -- object, inline,
@@ -28,7 +28,7 @@
 # command. A final differential leg diffs the mounted rootfs against the same
 # image flattened by crane export, so the layer merge is checked against an
 # independent implementation on a real image. A sealing leg then runs
-# `knarr seal` against the registry for the host platform of the multi-arch
+# `ocicfs seal` against the registry for the host platform of the multi-arch
 # image -- dry-run parity, the annotation check on the raw pushed manifest,
 # and the sealed image's own full lifecycle, whose pull verifies the seal
 # device-side. The registry legs run against a local zot
@@ -42,7 +42,7 @@
 #
 # or run it one-shot against a container built from the Containerfile:
 #
-#   docker run --rm --privileged -v "$PWD":/work knarr-dev make smoke
+#   docker run --rm --privileged -v "$PWD":/work ocicfs-dev make smoke
 #
 # Env:
 #   SMOKE_IMAGE     registry image to pull (default docker.io/library/busybox:latest)
@@ -55,7 +55,7 @@
 set -euo pipefail
 
 IMAGE="${SMOKE_IMAGE:-docker.io/library/busybox:latest}"
-LAYOUT="${SMOKE_LAYOUT:-/tmp/knarr-smoke-layout}"
+LAYOUT="${SMOKE_LAYOUT:-/tmp/ocicfs-smoke-layout}"
 STORE=""
 MNT=""
 OVL=""
@@ -69,15 +69,15 @@ DSTORE=""
 cleanup() {
 	set +e
 	if [ -n "$OVL" ]; then
-		bin/knarr --root "$STORE" unmount "$OVL/merged" 2>/dev/null
-		bin/knarr --root "$STORE" unmount "$OVL/meta" 2>/dev/null
+		bin/ocicfs --root "$STORE" unmount "$OVL/merged" 2>/dev/null
+		bin/ocicfs --root "$STORE" unmount "$OVL/meta" 2>/dev/null
 		rm -rf "$OVL"
 	fi
 	if [ -n "$GCOVL" ]; then
-		bin/knarr --root "$STORE" unmount "$GCOVL/merged" 2>/dev/null
+		bin/ocicfs --root "$STORE" unmount "$GCOVL/merged" 2>/dev/null
 		rm -rf "$GCOVL"
 	fi
-	[ -n "$MNT" ] && bin/knarr --root "$STORE" unmount "$MNT" 2>/dev/null
+	[ -n "$MNT" ] && bin/ocicfs --root "$STORE" unmount "$MNT" 2>/dev/null
 	[ -n "$REGPID" ] && kill "$REGPID" 2>/dev/null
 	[ -n "$REGDIR" ] && rm -rf "$REGDIR"
 	[ -n "$IMGDIR" ] && rm -rf "$IMGDIR"
@@ -88,14 +88,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-STORE="$(mktemp -d /var/lib/knarr/smoke-XXXXXX)"
+STORE="$(mktemp -d /var/lib/ocicfs/smoke-XXXXXX)"
 MNT="$(mktemp -d)"
-KN=(bin/knarr --root "$STORE")
+KN=(bin/ocicfs --root "$STORE")
 
 fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
 
 # host_child prints the digest of the manifest an image index offers for the
-# host platform -- the identity knarr keys the image by. $1 is the index JSON.
+# host platform -- the identity ocicfs keys the image by. $1 is the index JSON.
 host_child() {
 	jq -r --arg arch "$(go env GOARCH)" \
 		'[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)][0].digest' \
@@ -163,7 +163,7 @@ run_lifecycle() {
 	echo "== mount --metadata-only + consumer-assembled overlay =="
 	# The upper and work directories must not live on an overlayfs, so keep the
 	# whole leg beside the store on the verity-capable filesystem.
-	OVL="$(mktemp -d /var/lib/knarr/smoke-ovl-XXXXXX)"
+	OVL="$(mktemp -d /var/lib/ocicfs/smoke-ovl-XXXXXX)"
 	mkdir "$OVL/meta" "$OVL/merged" "$OVL/upper" "$OVL/work"
 	"${KN[@]}" mount --metadata-only "$ref" "$OVL/meta"
 	mount -t overlay overlay -o \
@@ -203,7 +203,7 @@ run_lifecycle() {
 	if printf '%s\n' "$listed" | grep -qF "$ref"; then fail "ls still lists $ref after remove"; fi
 }
 
-[ -x bin/knarr ] || make build
+[ -x bin/ocicfs ] || make build
 
 # Every phase talks to the run's own empty zot instance rather than the dev
 # container's persistent one on 5000, so every assertion runs against
@@ -235,7 +235,7 @@ echo "==== phase 0: purpose-built image -> seal -> cross-check -> lifecycle ====
 # whiteout and an override. Hardlink-free so the cross-check below must
 # reach the exact four-way digest match, not its fallback.
 echo "== build with umoci and push =="
-IMGDIR="$(mktemp -d /var/lib/knarr/smoke-img-XXXXXX)"
+IMGDIR="$(mktemp -d /var/lib/ocicfs/smoke-img-XXXXXX)"
 umoci init --layout "$IMGDIR/layout"
 umoci new --image "$IMGDIR/layout:custom"
 umoci unpack --image "$IMGDIR/layout:custom" "$IMGDIR/b1" >/dev/null 2>&1
@@ -273,7 +273,7 @@ jq -e '.config.annotations["composefs.config.fsverity-sha256-12"] | test("^[0-9a
 
 echo "== seal-crosscheck (expect the exact four-way match) =="
 ccheck="$(CROSSCHECK_REGISTRY="127.0.0.1:$port" scripts/seal-crosscheck.sh "$cref")"
-printf '%s\n' "$ccheck" | grep -E "knarr:|cfsctl:|mkcomposefs:|RESULT"
+printf '%s\n' "$ccheck" | grep -E "ocicfs:|cfsctl:|mkcomposefs:|RESULT"
 printf '%s\n' "$ccheck" | grep -qF "RESULT: all four digests MATCH" \
 	|| fail "seal-crosscheck did not reach the exact four-way match"
 
@@ -304,10 +304,10 @@ echo "==== lifecycle 3: image pulled and addressed by tag ===="
 run_lifecycle "127.0.0.1:$port/smoke:latest" "$identity" "$digest" pull "127.0.0.1:$port/smoke:latest"
 
 echo "==== differential: mounted rootfs vs crane's image-level flatten ===="
-# crane export flattens the image the same way knarr's merge must (docker
+# crane export flattens the image the same way ocicfs's merge must (docker
 # export would not do: it dumps a *container*, whose runtime artifacts --
 # .dockerenv, /etc/mtab, /dev stubs -- are not image content). The export is
-# pinned to the host platform: knarr mounts the host-platform image, while
+# pinned to the host platform: ocicfs mounts the host-platform image, while
 # crane resolves a multi-arch index to linux/amd64 by default on any host.
 # Symlinks are compared as symlinks: real images carry links that only resolve
 # in a running container (absolute targets, dpkg-trimmed doc trees), so
@@ -453,7 +453,7 @@ printf '%s\n' "$out"
 [ -n "$(ls -A "$MNT")" ] || fail "metadata mount broke during gc"
 # Data objects open lazily: prove a by-digest file still opens through the
 # live data plane after the collection, not merely that files remain on disk.
-GCOVL="$(mktemp -d /var/lib/knarr/smoke-gc-ovl-XXXXXX)"
+GCOVL="$(mktemp -d /var/lib/ocicfs/smoke-gc-ovl-XXXXXX)"
 mkdir "$GCOVL/merged" "$GCOVL/upper" "$GCOVL/work"
 mount -t overlay overlay -o \
 	"lowerdir=$MNT::$STORE/objects/fsverity-sha256-12,upperdir=$GCOVL/upper,workdir=$GCOVL/work,redirect_dir=on,metacopy=on,verity=require" \
@@ -541,10 +541,10 @@ if [ "$(go env GOARCH)" = amd64 ]; then
 	rm -f "$dlog"
 
 	echo "== plain pull of N+1 into a second store (expect the same composefs image) =="
-	DSTORE="$(mktemp -d /var/lib/knarr/smoke-delta-XXXXXX)"
-	bin/knarr --root "$DSTORE" pull "$n1ref"
+	DSTORE="$(mktemp -d /var/lib/ocicfs/smoke-delta-XXXXXX)"
+	bin/ocicfs --root "$DSTORE" pull "$n1ref"
 	dinspect="$("${KN[@]}" inspect --format json "$n1ref")"
-	pinspect="$(bin/knarr --root "$DSTORE" inspect --format json "$n1ref")"
+	pinspect="$(bin/ocicfs --root "$DSTORE" inspect --format json "$n1ref")"
 	[ "$(jq -r .composefs.digest <<<"$dinspect")" = "$(jq -r .composefs.digest <<<"$pinspect")" ] \
 		|| fail "the delta pull built a different composefs image than the plain pull"
 	[ "$(jq -r .fsverity <<<"$dinspect")" = "$(jq -r .fsverity <<<"$pinspect")" ] \

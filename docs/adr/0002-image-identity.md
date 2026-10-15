@@ -9,10 +9,10 @@ Accepted.
 An OCI reference can land on either of two documents: an image index, which
 lists one manifest per platform, or an image manifest, which describes one
 platform's image. Both are legitimate names for the same stored content on a
-given host, and knarr acquires both in normal use — a tag resolves to whatever
+given host, and ocicfs acquires both in normal use — a tag resolves to whatever
 the registry serves (usually the index), while a caller that has already
 selected a platform (a container runtime staging an image, an agent pinning a
-digest out of an index) hands knarr the platform manifest.
+digest out of an index) hands ocicfs the platform manifest.
 
 Keying the store by whichever document the reference happened to land on gives
 one image two identities. The bindings, the reference record's target, and the
@@ -35,7 +35,7 @@ been, the descriptor the reference itself landed on (an index for a tag or an
 index-pinned reference, a manifest otherwise); it is provenance for an operator
 and unauthenticated local bookkeeping, never a verification input. `identity` is
 the platform manifest, the digest every lookup goes through. The record schema
-is `application/vnd.knarr.ref.v2+json`; a record written under the previous
+is `application/vnd.ocicfs.ref.v2+json`; a record written under the previous
 schema fails closed on read, naming the remedy.
 
 Holds resolve to the identity like everything else, with one asymmetry between
@@ -51,10 +51,10 @@ holder that could not be dropped would linger forever.
 - One image has one binding, one holder directory, and one lock, however it was
   named. `remove` keeps its single-lock check-then-delete shape, and a hold
   taken through one door is seen by a `remove` that arrives through the other.
-- The digest knarr prints, lists, and reports from `inspect` is the identity. It
+- The digest ocicfs prints, lists, and reports from `inspect` is the identity. It
   may differ from the digest the caller pinned; it is the digest to hold, to
   pin, and to look the image up by.
-- Identity is a function of the stored bytes *and* the platform selector. knarr
+- Identity is a function of the stored bytes *and* the platform selector. ocicfs
   selects a platform entry exactly and rejects ambiguity, so an index offering
   two entries a laxer selector would rank rather than reject can still split
   across consumers. The invariant is one identity per (image, agreed platform

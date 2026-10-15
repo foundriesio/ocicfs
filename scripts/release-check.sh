@@ -7,7 +7,7 @@
 # and per-arch in the release workflow.
 #
 # Usage:
-#   release-check.sh binary <arch>       validate bin/knarr; expects
+#   release-check.sh binary <arch>       validate bin/ocicfs; expects
 #                                        EXPECTED_VERSION and
 #                                        EXPECTED_REVISION in the environment
 #   release-check.sh archive <tar.gz> <arch>
@@ -20,7 +20,7 @@ fail() { echo "release-check: $*" >&2; exit 1; }
 binary() {
     arch=${1:?usage: release-check.sh binary <arch>}
     : "${EXPECTED_VERSION:?}" "${EXPECTED_REVISION:?}"
-    bin=bin/knarr
+    bin=bin/ocicfs
     [ -f "$bin" ] || fail "missing $bin"
 
     case "$arch" in
@@ -42,7 +42,7 @@ binary() {
     esac
 
     ver_out=$("$bin" --version)
-    want_ver="knarr ${EXPECTED_VERSION} (${EXPECTED_REVISION})"
+    want_ver="ocicfs ${EXPECTED_VERSION} (${EXPECTED_REVISION})"
     [ "$ver_out" = "$want_ver" ] \
         || fail "--version mismatch: got '$ver_out', want '$want_ver'"
     case "$ver_out" in
@@ -67,15 +67,15 @@ archive() {
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
     tar -C "$tmp" -xzf "$tarball"
-    for f in knarr LICENSE README.md INSTALL.md; do
+    for f in ocicfs LICENSE README.md INSTALL.md; do
         [ -f "$tmp/$base/$f" ] || fail "missing $f in $tarball"
     done
     count=$(find "$tmp/$base" -type f | wc -l)
     [ "$count" -eq 4 ] || fail "unexpected files in $tarball ($count != 4)"
-    [ -x "$tmp/$base/knarr" ] || fail "knarr is not executable in $tarball"
+    [ -x "$tmp/$base/ocicfs" ] || fail "ocicfs is not executable in $tarball"
 
-    "$tmp/$base/knarr" --version >/dev/null \
-        || fail "archived knarr --version failed"
+    "$tmp/$base/ocicfs" --version >/dev/null \
+        || fail "archived ocicfs --version failed"
     echo "release-check: archive OK ($tarball)"
 }
 
@@ -94,9 +94,9 @@ install_test() {
 set -eux
 cd /tmp
 tar -xzf "/rel/$NAME"
-install -m 0755 "$(basename "$NAME" .tar.gz)/knarr" /usr/local/bin/knarr
-knarr --version
-knarr --help >/dev/null
+install -m 0755 "$(basename "$NAME" .tar.gz)/ocicfs" /usr/local/bin/ocicfs
+ocicfs --version
+ocicfs --help >/dev/null
 EOF
     done
     echo "release-check: install OK ($tarball)"

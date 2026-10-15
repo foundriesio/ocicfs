@@ -1,10 +1,10 @@
-# Inspecting a local image (`knarr inspect`)
+# Inspecting a local image (`ocicfs inspect`)
 
-`knarr inspect` reports the OCI identity of an image already in the local store and the
+`ocicfs inspect` reports the OCI identity of an image already in the local store and the
 composefs image built for it. It reads only local state and never touches the network.
 
 ```sh
-knarr inspect app@sha256:<digest>
+ocicfs inspect app@sha256:<digest>
 ```
 
 The reference takes the same forms `mount` accepts — `name@sha256:<hex>`, a bare
@@ -27,7 +27,7 @@ merged tree's regular-file content bytes — each hardlink group counted once,
 overwritten and whited-out files excluded — i.e. what the mounted image's
 files add up to. It is **not** the on-disk cost (content is deduplicated and
 shared across images in the object store) and not the sum of the layer sizes.
-An image pulled before knarr recorded this value shows no row: a pull that
+An image pulled before ocicfs recorded this value shows no row: a pull that
 verifies the image as already present is a cache hit and deliberately does
 not refetch layers just to compute a display metric. The value appears when
 the image is next actually built — after removing its last local ref and
@@ -41,7 +41,7 @@ Per-layer detail — including the diff_ids — is shown by
 Use `--format json` for machine-readable output:
 
 ```sh
-knarr inspect app@sha256:<digest> --format json
+ocicfs inspect app@sha256:<digest> --format json
 # {"root":"sha256:…","platform":"linux/arm64/v8","diff_ids":["sha256:…"],
 #  "composefs":{"mediaType":"…+erofs","digest":"sha256:…","size":12288},
 #  "fsverity":"sha256:…","rootfs_size":123456789}
@@ -55,7 +55,7 @@ digest-verified manifest and config — no layer body is read, and nothing is
 fetched:
 
 ```sh
-knarr inspect --layers app@sha256:<digest>
+ocicfs inspect --layers app@sha256:<digest>
 ```
 
 ```
@@ -91,7 +91,7 @@ config-only steps and consume no layer; when history is absent or does not
 correlate cleanly, the field is omitted rather than guessed):
 
 ```sh
-knarr inspect --layers --format json app@sha256:<digest>
+ocicfs inspect --layers --format json app@sha256:<digest>
 # {…,"layers":[{"index":0,"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip",
 #   "digest":"sha256:…","diffID":"sha256:…","chainID":"sha256:…",
 #   "size":3565158,"createdBy":"ADD rootfs.tar /"}]}
@@ -102,9 +102,9 @@ knarr inspect --layers --format json app@sha256:<digest>
 `inspect` succeeds only when the image is fully materialized locally: its OCI metadata chain
 (manifest → config) resolves from the store **and** a composefs binding is recorded for
 the resolved `{identity, platform}`. Otherwise it fails with an error satisfying
-`errors.Is(err, knarr.ErrNotFound)` and exits non-zero, pointing at `knarr pull`.
+`errors.Is(err, ocicfs.ErrNotFound)` and exits non-zero, pointing at `ocicfs pull`.
 
-- **Not pulled** (metadata or binding absent) → not-found; re-running `knarr pull` is a clean,
+- **Not pulled** (metadata or binding absent) → not-found; re-running `ocicfs pull` is a clean,
   idempotent remedy.
 - **Wrong platform** — an image present only for a different platform is **not** reported as
   not-found; the error names the platform conflict instead.

@@ -1,19 +1,19 @@
-# Listing and forgetting local images (`knarr ls`, `knarr remove`)
+# Listing and forgetting local images (`ocicfs ls`, `ocicfs remove`)
 
-`knarr ls` lists the images in the local store: every pulled reference, then
-every image a hold alone keeps. `knarr remove` forgets one exact reference from
+`ocicfs ls` lists the images in the local store: every pulled reference, then
+every image a hold alone keeps. `ocicfs remove` forgets one exact reference from
 the auxiliary indexes. It does not delete content objects; object reclamation
 is handled by `gc`.
 
 ## Prerequisites
 
-- A knarr store containing at least one pulled image.
-- The exact reference string recorded by `knarr pull`.
+- A ocicfs store containing at least one pulled image.
+- The exact reference string recorded by `ocicfs pull`.
 
 ## 1. List pulled images
 
 ```sh
-knarr ls
+ocicfs ls
 ```
 
 Text output prints one row per reference:
@@ -23,13 +23,13 @@ app@sha256:<digest>	sha256:<digest>	481
 ```
 
 The columns are the exact stored reference, the image identity digest — the
-platform manifest, the same digest `knarr pull` reports — and the size of the
+platform manifest, the same digest `ocicfs pull` reports — and the size of the
 image's composefs image object.
 
 Use `--format json` for machine-readable output:
 
 ```sh
-knarr ls --format json
+ocicfs ls --format json
 # [
 #   {"ref":"app@sha256:...","digest":"sha256:...","size":481}
 # ]
@@ -44,15 +44,15 @@ and the image, once that holder is released. It lists like any other row;
 in JSON it carries the holder:
 
 ```sh
-knarr ls --format json
+ocicfs ls --format json
 # [
 #   {"ref":"index.docker.io/library/nginx:latest","digest":"sha256:...","size":481,"holder":"cfs-build-..."}
 # ]
 ```
 
-`knarr remove` of such a reference declines while the holder stands, the
+`ocicfs remove` of such a reference declines while the holder stands, the
 same as for any held image. An agent that wants the image kept adopts it by
-pulling the name (`knarr pull nginx:latest`), which replaces the runtime
+pulling the name (`ocicfs pull nginx:latest`), which replaces the runtime
 reference with its own, or by holding it.
 
 An image that no reference names at all but a hold keeps is listed after the
@@ -63,22 +63,22 @@ JSON):
 -	sha256:<digest>	481
 ```
 
-Such an image is addressed by its digest: `knarr inspect`, `knarr hold`,
-`knarr release` and `knarr mount` all take `sha256:<digest>`. There is no
+Such an image is addressed by its digest: `ocicfs inspect`, `ocicfs hold`,
+`ocicfs release` and `ocicfs mount` all take `sha256:<digest>`. There is no
 reference to `remove`; releasing its last holder makes it collectable, and
-`knarr gc` reclaims it (see [gc.md](gc.md)).
+`ocicfs gc` reclaims it (see [gc.md](gc.md)).
 
 ## 2. Forget one reference
 
 ```sh
-knarr remove "app@sha256:<digest>"
+ocicfs remove "app@sha256:<digest>"
 ```
 
 Removal keys on the exact reference string. On success the reference no longer
-appears in `knarr ls`, and `knarr mount "app@sha256:<digest>" <target>` fails
+appears in `ocicfs ls`, and `ocicfs mount "app@sha256:<digest>" <target>` fails
 until the image is pulled again.
 
-`knarr remove` deletes the reference record and deletes the image binding for
+`ocicfs remove` deletes the reference record and deletes the image binding for
 the recorded `(identity digest, platform)` only when no other reference still
 points at the same pair. It never deletes files under `objects/`.
 
@@ -93,7 +93,7 @@ image is held by cfs under sha256:<identity>; release the hold or use --force
 
 Holds are keyed by that identity, so a hold taken on the image under one
 reference — or by a bare digest naming its index — is seen here. Drop it with
-`knarr release`, passing the digest the message named, or override with
+`ocicfs release`, passing the digest the message named, or override with
 `--force`, which clears every holder first.
 
 ## Notes
@@ -105,12 +105,12 @@ reference — or by a bare digest naming its index — is seen here. Drop it wit
   pins the index while this one pins the manifest, since both record the same
   identity.
 - **No object reclamation.** Objects remain in the content-addressed store after
-  removal; `knarr gc` is what reclaims content nothing wants (see
+  removal; `ocicfs gc` is what reclaims content nothing wants (see
   [gc.md](gc.md)).
 - **Removing a mounted image is allowed.** Like unlinking an open file:
   `remove` only forgets the index entries — the name is gone, the content
-  stays — so the mount keeps serving until unmounted, but a new `knarr mount`
-  of that reference fails until the image is pulled again. A later `knarr gc`
+  stays — so the mount keeps serving until unmounted, but a new `ocicfs mount`
+  of that reference fails until the image is pulled again. A later `ocicfs gc`
   keeps a mounted image's content through its in-use lock and reclaims it
   after unmount (see [gc.md](gc.md)).
 - **Invalid reference records are skipped.** `ls` warns about and skips a

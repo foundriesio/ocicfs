@@ -9,7 +9,7 @@
 // no-replace, and a collision re-verifies the existing object, so no store-wide
 // lock is needed.
 //
-// The store is private to the knarr process, which runs privileged and performs
+// The store is private to the ocicfs process, which runs privileged and performs
 // the mount itself: object files are owner-only (0600) and protected by
 // fs-verity, so the digest store does not need to be world-readable. Objects are
 // not fsynced individually; a pull makes all of its writes durable with a single
@@ -33,9 +33,9 @@ import (
 	"github.com/opencontainers/go-digest"
 	"golang.org/x/sys/unix"
 
-	"github.com/foundriesio/knarr/internal/digestutil"
-	"github.com/foundriesio/knarr/internal/durable"
-	"github.com/foundriesio/knarr/internal/verity"
+	"github.com/foundriesio/ocicfs/internal/digestutil"
+	"github.com/foundriesio/ocicfs/internal/durable"
+	"github.com/foundriesio/ocicfs/internal/verity"
 )
 
 // verityDirName is the fs-verity view directory under objects/. It is named
@@ -43,7 +43,7 @@ import (
 // convention — self-description, not a multi-algorithm switch.
 const verityDirName = "fsverity-sha256-12"
 
-// Store is the content-addressed object store rooted at the knarr data directory.
+// Store is the content-addressed object store rooted at the ocicfs data directory.
 // Its objects live under <root>/objects and transient build state under <root>/tmp.
 type Store struct {
 	root string
@@ -58,14 +58,14 @@ func New(root string) (*Store, error) {
 	s := &Store{root: root}
 	// Create store directories on first use. The directories are traversable
 	// (0755) but the object files within are owner-only (0600); the store is
-	// read by the privileged knarr process that performs the mount.
-	if err := os.MkdirAll(s.objectPath(""), 0o755); err != nil { // #nosec G301 -- knarr-owned store dir
+	// read by the privileged ocicfs process that performs the mount.
+	if err := os.MkdirAll(s.objectPath(""), 0o755); err != nil { // #nosec G301 -- ocicfs-owned store dir
 		return nil, err
 	}
-	if err := os.MkdirAll(s.viewPath(""), 0o755); err != nil { // #nosec G301 -- knarr-owned store dir
+	if err := os.MkdirAll(s.viewPath(""), 0o755); err != nil { // #nosec G301 -- ocicfs-owned store dir
 		return nil, err
 	}
-	if err := os.MkdirAll(s.TempDir(), 0o755); err != nil { // #nosec G301 -- knarr-owned store dir
+	if err := os.MkdirAll(s.TempDir(), 0o755); err != nil { // #nosec G301 -- ocicfs-owned store dir
 		return nil, err
 	}
 	return s, nil
@@ -141,7 +141,7 @@ func (s *Store) Has(d digest.Digest) (bool, error) {
 	return fi.Mode().IsRegular(), nil
 }
 
-// CheckVerity verifies the store filesystem can enable fs-verity, which knarr
+// CheckVerity verifies the store filesystem can enable fs-verity, which ocicfs
 // requires for every content object. It enables verity on a throwaway probe file
 // so a pull fails fast with a clear error when the store is on a filesystem
 // without fs-verity support, rather than partway through writing objects.
@@ -158,7 +158,7 @@ func (s *Store) CheckVerity() error {
 	}()
 	// fs-verity may reject a zero-length file, so give the probe some content;
 	// the bytes are irrelevant. Close the writable handle before enabling.
-	if _, err := f.WriteString("knarr-verity-preflight"); err != nil {
+	if _, err := f.WriteString("ocicfs-verity-preflight"); err != nil {
 		_ = f.Close()
 		return fmt.Errorf("objectstore: verity preflight: %w", err)
 	}
@@ -173,10 +173,10 @@ func (s *Store) CheckVerity() error {
 	defer func() { _ = rf.Close() }()
 	if err := verity.Enable(rf); err != nil {
 		if errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOTTY) {
-			return fmt.Errorf("the store at %s is not on an fs-verity-capable filesystem, which knarr requires; point the store root at a filesystem with fs-verity support: %w", s.root, err)
+			return fmt.Errorf("the store at %s is not on an fs-verity-capable filesystem, which ocicfs requires; point the store root at a filesystem with fs-verity support: %w", s.root, err)
 		}
 		if errors.Is(err, unix.EINVAL) {
-			return fmt.Errorf("the kernel on this host cannot build a %d-byte fs-verity Merkle block (page size %d), which knarr requires for stable per-file digests: %w", verity.BlockSize, os.Getpagesize(), err)
+			return fmt.Errorf("the kernel on this host cannot build a %d-byte fs-verity Merkle block (page size %d), which ocicfs requires for stable per-file digests: %w", verity.BlockSize, os.Getpagesize(), err)
 		}
 		return fmt.Errorf("objectstore: verity preflight: %w", err)
 	}
@@ -237,7 +237,7 @@ func (s *Store) stage(ctx context.Context, tempPrefix string, expect digest.Dige
 	// fs-verity cannot be enabled while a writable descriptor is open, so the
 	// writable handle is closed here and seal reopens the temp read-only. The
 	// window in between is not a tampering vector: the temp was created 0600 in
-	// the store's private temp dir, owned by the single privileged knarr process,
+	// the store's private temp dir, owned by the single privileged ocicfs process,
 	// so no other principal can open it for writing (one that already holds that
 	// privilege is outside the threat model).
 	if err := f.Close(); err != nil {
@@ -309,7 +309,7 @@ func (s *Store) seal(ctx context.Context, tempPath string, d digest.Digest) (str
 		return s.resolveExisting(finalPath, fsv)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil { // #nosec G301 -- knarr-owned object-store shard dir
+	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil { // #nosec G301 -- ocicfs-owned object-store shard dir
 		return "", fmt.Errorf("objectstore: create shard dir: %w", err)
 	}
 	// Commit with no-replace semantics. On collision compare the staged object
@@ -355,7 +355,7 @@ func presentObject(path string) (bool, error) {
 // corruption.
 func (s *Store) linkView(objectPath, fsv string) error {
 	viewPath := s.viewPath(strings.TrimPrefix(fsv, "sha256:"))
-	if err := os.MkdirAll(filepath.Dir(viewPath), 0o755); err != nil { // #nosec G301 -- knarr-owned view shard dir
+	if err := os.MkdirAll(filepath.Dir(viewPath), 0o755); err != nil { // #nosec G301 -- ocicfs-owned view shard dir
 		return fmt.Errorf("objectstore: create view shard dir: %w", err)
 	}
 	err := os.Link(objectPath, viewPath)
@@ -537,7 +537,7 @@ func (s *Store) ResolveObject(d digest.Digest) (string, int64, error) {
 // before writing the binding that references its objects, rather than fsyncing
 // each object, so a crash leaves either a complete pull or one with no binding.
 func (s *Store) Sync() error {
-	d, err := os.Open(s.root) // #nosec G304 -- knarr-owned store root
+	d, err := os.Open(s.root) // #nosec G304 -- ocicfs-owned store root
 	if err != nil {
 		return fmt.Errorf("objectstore: open store root: %w", err)
 	}
@@ -704,7 +704,7 @@ func (s *Store) SweepViewOrphans(ctx context.Context, keep func(name string) boo
 				return nil
 			}
 		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) { // #nosec G122 -- knarr-private store tree, path from the walk itself
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) { // #nosec G122 -- ocicfs-private store tree, path from the walk itself
 			return fmt.Errorf("objectstore: remove view orphan %s: %w", path, err)
 		}
 		removed++

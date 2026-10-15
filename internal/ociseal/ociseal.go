@@ -22,13 +22,13 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/foundriesio/knarr/internal/composefs"
-	"github.com/foundriesio/knarr/internal/digestutil"
-	"github.com/foundriesio/knarr/internal/objectstore"
-	"github.com/foundriesio/knarr/internal/ocichain"
-	"github.com/foundriesio/knarr/internal/ocilayout"
-	"github.com/foundriesio/knarr/internal/rootfs"
-	"github.com/foundriesio/knarr/internal/verity"
+	"github.com/foundriesio/ocicfs/internal/composefs"
+	"github.com/foundriesio/ocicfs/internal/digestutil"
+	"github.com/foundriesio/ocicfs/internal/objectstore"
+	"github.com/foundriesio/ocicfs/internal/ocichain"
+	"github.com/foundriesio/ocicfs/internal/ocilayout"
+	"github.com/foundriesio/ocicfs/internal/rootfs"
+	"github.com/foundriesio/ocicfs/internal/verity"
 )
 
 const (
@@ -38,14 +38,14 @@ const (
 	ConfigAnnotation = "composefs.config.fsverity-sha256-12"
 
 	// FallbackMergedAnnotation records the merged fs-verity digest of a
-	// non-canonical (fallback) construction. It lives in knarr's own
+	// non-canonical (fallback) construction. It lives in ocicfs's own
 	// namespace because the shared namespace above promises a digest the
 	// upstream canonical algorithm reproduces, which a fallback digest is
 	// not.
-	FallbackMergedAnnotation = "io.foundries.knarr.composefs.fallback.v1.fsverity-sha256-12"
+	FallbackMergedAnnotation = "io.foundries.ocicfs.composefs.fallback.v1.fsverity-sha256-12"
 	// FallbackConfigAnnotation is the config-digest companion of
 	// FallbackMergedAnnotation.
-	FallbackConfigAnnotation = "io.foundries.knarr.composefs.config.fsverity-sha256-12"
+	FallbackConfigAnnotation = "io.foundries.ocicfs.composefs.config.fsverity-sha256-12"
 )
 
 // ErrNotCanonical reports that an image's composefs construction diverges from
@@ -341,7 +341,7 @@ func sealPlatform(ctx context.Context, src ocichain.BlobSource, root digest.Dige
 		return sealedManifest{}, fmt.Errorf("ociseal: build entries: %w", err)
 	}
 	if !canonical && !allowFallback {
-		return sealedManifest{}, fmt.Errorf("ociseal: platform %s: %w (pass --allow-non-canonical to seal the fallback construction under the knarr annotations)", scrubPlatform(&res.Platform), ErrNotCanonical)
+		return sealedManifest{}, fmt.Errorf("ociseal: platform %s: %w (pass --allow-non-canonical to seal the fallback construction under the ocicfs annotations)", scrubPlatform(&res.Platform), ErrNotCanonical)
 	}
 	merged, err := mergedDigest(ctx, entries)
 	if err != nil {
@@ -376,7 +376,7 @@ func sealPlatform(ctx context.Context, src ocichain.BlobSource, root digest.Dige
 }
 
 func mergedDigest(ctx context.Context, entries []composefs.Entry) (string, error) {
-	dir, err := os.MkdirTemp("", "knarr-seal-*")
+	dir, err := os.MkdirTemp("", "ocicfs-seal-*")
 	if err != nil {
 		return "", fmt.Errorf("ociseal: create temp directory: %w", err)
 	}
@@ -410,7 +410,7 @@ func mergedDigest(ctx context.Context, entries []composefs.Entry) (string, error
 }
 
 // annotateManifest records merged and config under the standard annotations
-// for a canonical construction and under the knarr fallback annotations
+// for a canonical construction and under the ocicfs fallback annotations
 // otherwise: the standard namespace must only ever carry digests the upstream
 // algorithm reproduces. A non-canonical manifest that already carries any
 // standard merged annotation is refused — such an image is rejected at pull

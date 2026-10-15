@@ -1,10 +1,10 @@
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package cli holds the command-line presentation layer shared by the knarr
+// Package cli holds the command-line presentation layer shared by the ocicfs
 // subcommands: output formatting (text and JSON), exit-code mapping, and
 // argument validation. Result data is written to stdout; diagnostics and logs
-// go to stderr, so a caller driving knarr can capture machine-readable output
+// go to stderr, so a caller driving ocicfs can capture machine-readable output
 // regardless of log verbosity.
 package cli
 
@@ -21,9 +21,9 @@ import (
 	"github.com/opencontainers/go-digest"
 	"github.com/spf13/cobra"
 
-	"github.com/foundriesio/knarr/internal/ocilayout"
-	"github.com/foundriesio/knarr/internal/ociseal"
-	"github.com/foundriesio/knarr/pkg/knarr"
+	"github.com/foundriesio/ocicfs/internal/ocilayout"
+	"github.com/foundriesio/ocicfs/internal/ociseal"
+	"github.com/foundriesio/ocicfs/pkg/ocicfs"
 )
 
 // Format selects how a command renders its result. It satisfies pflag.Value so
@@ -63,7 +63,7 @@ func AddFormatFlag(cmd *cobra.Command, f *Format) {
 }
 
 // ImageOutput is the JSON/text shape for an image in command output. Its JSON
-// field names are a stable contract for callers that parse knarr's output.
+// field names are a stable contract for callers that parse ocicfs's output.
 // Ref is empty for an image no reference names — one a hold alone keeps —
 // which the text form renders as "-". Holder, JSON only, is set for a
 // runtime reference: one a holder named the image under, which pins nothing.
@@ -74,12 +74,12 @@ type ImageOutput struct {
 	Holder string `json:"holder,omitempty"`
 }
 
-func newImageOutput(img knarr.Image) ImageOutput {
+func newImageOutput(img ocicfs.Image) ImageOutput {
 	return ImageOutput{Ref: img.Ref, Digest: img.Digest, Size: img.Size, Holder: img.Holder}
 }
 
 // WriteImage renders a single image to w in the requested format.
-func WriteImage(w io.Writer, format Format, img *knarr.Image) error {
+func WriteImage(w io.Writer, format Format, img *ocicfs.Image) error {
 	out := newImageOutput(*img)
 	if format == FormatJSON {
 		return emitJSON(w, out)
@@ -90,7 +90,7 @@ func WriteImage(w io.Writer, format Format, img *knarr.Image) error {
 
 // WriteImages renders a list of images to w in the requested format. JSON
 // always yields an array, including the empty case ("[]").
-func WriteImages(w io.Writer, format Format, imgs []knarr.Image) error {
+func WriteImages(w io.Writer, format Format, imgs []ocicfs.Image) error {
 	out := make([]ImageOutput, 0, len(imgs))
 	for _, img := range imgs {
 		out = append(out, newImageOutput(img))
@@ -110,8 +110,8 @@ func WriteImages(w io.Writer, format Format, imgs []knarr.Image) error {
 	return nil
 }
 
-// HoldOutput is the JSON/text shape for `knarr hold`/`knarr release` output.
-// Its JSON field names are a stable contract for callers that parse knarr's
+// HoldOutput is the JSON/text shape for `ocicfs hold`/`ocicfs release` output.
+// Its JSON field names are a stable contract for callers that parse ocicfs's
 // output; Held is true for a recorded hold and false for a released one.
 type HoldOutput struct {
 	Ref    string `json:"ref"`
@@ -134,8 +134,8 @@ func WriteHold(w io.Writer, format Format, ref, holder string, held bool) error 
 	return err
 }
 
-// ImageInfoOutput is the JSON/text shape for `knarr inspect` output. Its JSON
-// field names are a stable contract for callers that parse knarr's output.
+// ImageInfoOutput is the JSON/text shape for `ocicfs inspect` output. Its JSON
+// field names are a stable contract for callers that parse ocicfs's output.
 // RootfsSize is the merged rootfs's apparent size in bytes (regular-file
 // content, hardlink groups counted once), omitted when the local binding
 // predates the field.
@@ -169,7 +169,7 @@ type LayerOutput struct {
 	CreatedBy string `json:"createdBy,omitempty"`
 }
 
-// SealResultOutput is the JSON shape for `knarr seal` output. Every digest is
+// SealResultOutput is the JSON shape for `ocicfs seal` output. Every digest is
 // paired with the reference that names it in the sealed repository, so sealing
 // the next platform of an index consumes the previous call's output verbatim
 // instead of rebuilding the reference from its parts.
@@ -181,7 +181,7 @@ type SealResultOutput struct {
 	Platforms   []SealPlatformOutput `json:"platforms"`
 }
 
-// SealPlatformOutput is one platform manifest in `knarr seal` output. For an
+// SealPlatformOutput is one platform manifest in `ocicfs seal` output. For an
 // index reference the top-level digests are the index's, so the manifest this
 // platform had before sealing is reported here; equal original and sealed
 // manifests mean the platform was already sealed.
@@ -243,7 +243,7 @@ func digestRef(repo string, d digest.Digest) string {
 // withLayers appends the per-layer view — an aligned table in text output,
 // the layers array in JSON; without it the output is unchanged from before
 // the layer view existed.
-func WriteImageInfo(w io.Writer, format Format, info *knarr.ImageInfo, withLayers bool) error {
+func WriteImageInfo(w io.Writer, format Format, info *ocicfs.ImageInfo, withLayers bool) error {
 	diffIDs := make([]string, 0, len(info.DiffIDs))
 	for _, d := range info.DiffIDs {
 		diffIDs = append(diffIDs, d.String())
@@ -416,16 +416,16 @@ func HandleExit(cmd *cobra.Command, err error, errOut io.Writer) int {
 	case err == nil:
 		return 0
 	case errors.Is(err, context.Canceled):
-		_, _ = fmt.Fprintln(errOut, "knarr: cancelled")
+		_, _ = fmt.Fprintln(errOut, "ocicfs: cancelled")
 		return 130
 	case isUsageError(err):
-		_, _ = fmt.Fprintf(errOut, "knarr: %s\n", err.Error())
+		_, _ = fmt.Fprintf(errOut, "ocicfs: %s\n", err.Error())
 		if cmd != nil {
 			_, _ = fmt.Fprint(errOut, cmd.UsageString())
 		}
 		return 2
 	default:
-		_, _ = fmt.Fprintf(errOut, "knarr: %s\n", err.Error())
+		_, _ = fmt.Fprintf(errOut, "ocicfs: %s\n", err.Error())
 		return 1
 	}
 }
@@ -443,8 +443,8 @@ func isUsageError(err error) bool {
 		strings.HasPrefix(msg, "unknown shorthand")
 }
 
-// GCOutput is the JSON/text shape for `knarr gc` output. Its JSON field
-// names are a stable contract for callers that parse knarr's output.
+// GCOutput is the JSON/text shape for `ocicfs gc` output. Its JSON field
+// names are a stable contract for callers that parse ocicfs's output.
 // RemovedObjects is present only when the caller asked for the listing.
 type GCOutput struct {
 	ObjectsRemoved  int      `json:"objectsRemoved"`
@@ -469,7 +469,7 @@ type GCOutputOptions struct {
 }
 
 // WriteGCReport renders a collection report to w in the requested format.
-func WriteGCReport(w io.Writer, format Format, r *knarr.GCReport, opts GCOutputOptions) error {
+func WriteGCReport(w io.Writer, format Format, r *ocicfs.GCReport, opts GCOutputOptions) error {
 	out := GCOutput{
 		ObjectsRemoved:  r.ObjectsRemoved,
 		BytesFreed:      r.BytesFreed,

@@ -3,7 +3,7 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Build the knarr .deb inside the knarr-debuild container (Makefile deb
+# Build the ocicfs .deb inside the ocicfs-debuild container (Makefile deb
 # target). Expects the source tree mounted read-only at /src, a writable
 # output directory at /out, and VERSION, REVISION and DEB_VERSION in the
 # environment: the Makefile's git-derived fallbacks would silently stamp a
@@ -12,15 +12,15 @@ set -eu
 
 : "${VERSION:?}" "${REVISION:?}" "${DEB_VERSION:?}"
 
-cp -a /src /build/knarr
-cd /build/knarr
+cp -a /src /build/ocicfs
+cd /build/ocicfs
 
 cat > debian/changelog <<EOF
-knarr (${DEB_VERSION}) unstable; urgency=medium
+ocicfs (${DEB_VERSION}) unstable; urgency=medium
 
-  * Automated build of knarr ${VERSION}.
+  * Automated build of ocicfs ${VERSION}.
   * Source revision: ${REVISION}
-  * Release notes: https://github.com/foundriesio/knarr/releases
+  * Release notes: https://github.com/foundriesio/ocicfs/releases
 
  -- Mykhaylo Sul <mykhaylo.sul@oss.qualcomm.com>  $(date -R -u)
 EOF
@@ -31,6 +31,6 @@ debuild --preserve-envvar=VERSION --preserve-envvar=REVISION \
         --preserve-envvar=PATH \
         --no-lintian -b -us -uc
 
-mv /build/knarr_*.deb /out/
-mv /build/knarr_*.changes /out/
-mv /build/knarr_*.buildinfo /out/ 2>/dev/null || true
+mv /build/ocicfs_*.deb /out/
+mv /build/ocicfs_*.changes /out/
+mv /build/ocicfs_*.buildinfo /out/ 2>/dev/null || true

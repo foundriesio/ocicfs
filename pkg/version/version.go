@@ -1,7 +1,7 @@
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package version exposes the build version of knarr. The values are injected
+// Package version exposes the build version of ocicfs. The values are injected
 // at build time via -ldflags (see the Makefile); they default to "dev"/"none"
 // for `go build`/`go run` without those flags.
 package version

@@ -8,13 +8,13 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/foundriesio/knarr/pkg/knarr"
+	"github.com/foundriesio/ocicfs/pkg/ocicfs"
 )
 
 // TestWriteImagesHeldOnlyRef: an image no reference names renders "-" in the
 // reference column of the text listing and an empty ref in JSON.
 func TestWriteImagesHeldOnlyRef(t *testing.T) {
-	imgs := []knarr.Image{{Digest: "sha256:abc", Size: 7}}
+	imgs := []ocicfs.Image{{Digest: "sha256:abc", Size: 7}}
 
 	var text bytes.Buffer
 	if err := WriteImages(&text, FormatText, imgs); err != nil {

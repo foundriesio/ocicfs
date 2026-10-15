@@ -61,7 +61,7 @@ func TestWriteFileRemovesTemp(t *testing.T) {
 	if err := WriteFile(path, []byte("data"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	matches, err := filepath.Glob(filepath.Join(dir, ".knarr-*"))
+	matches, err := filepath.Glob(filepath.Join(dir, ".ocicfs-*"))
 	if err != nil {
 		t.Fatalf("Glob: %v", err)
 	}

@@ -24,8 +24,8 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/foundriesio/knarr/internal/ociseal"
-	"github.com/foundriesio/knarr/internal/octest"
+	"github.com/foundriesio/ocicfs/internal/ociseal"
+	"github.com/foundriesio/ocicfs/internal/octest"
 )
 
 func TestSealRegistryAndReseal(t *testing.T) {
@@ -358,7 +358,7 @@ func TestSealIndexPreservesUnknownFieldsAndAttestation(t *testing.T) {
 
 // TestSealFallbackAllowed covers --allow-non-canonical: a non-canonical
 // construction is sealed with its deterministic fallback digest under the
-// knarr fallback annotations — never the standard namespace — resealing it
+// ocicfs fallback annotations — never the standard namespace — resealing it
 // is a no-op, and a non-canonical manifest already wearing a standard merged
 // annotation is refused even with the permission, since pull rejects that
 // combination and sealing must not launder it.

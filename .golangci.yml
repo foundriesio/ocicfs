@@ -19,7 +19,7 @@ linters:
           - gosec
         text: "G30(1|6)"
 
-# gofumpt is the formatter used across the containers/ ecosystem knarr mirrors.
+# gofumpt is the formatter used across the containers/ ecosystem ocicfs mirrors.
 formatters:
   enable:
     - gofmt

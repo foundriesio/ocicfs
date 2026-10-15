@@ -1,4 +1,4 @@
-# Releasing knarr
+# Releasing ocicfs
 
 Maintainer-facing policy and procedure. The release pipeline is automated:
 pushing a version tag builds, validates, and publishes the release; the
@@ -73,7 +73,7 @@ Known issues
 - <or "None">
 ```
 
-The very first release (`v0.1.0`) is introduction-style: what knarr is, the
+The very first release (`v0.1.0`) is introduction-style: what ocicfs is, the
 verb set, the format stack, the compatibility floor, known limitations —
 no change list, since there is nothing to diff against.
 

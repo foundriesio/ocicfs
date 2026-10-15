@@ -15,8 +15,8 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/foundriesio/knarr/internal/digestutil"
-	"github.com/foundriesio/knarr/internal/verity"
+	"github.com/foundriesio/ocicfs/internal/digestutil"
+	"github.com/foundriesio/ocicfs/internal/verity"
 )
 
 // Spec describes one read-only composefs mount.
@@ -32,10 +32,10 @@ type Spec struct {
 var ErrNotMounted = errors.New("mount: target is not mounted")
 
 // runDir hosts the transient per-mount scratch directories. It is on tmpfs, so
-// any residue a hard crash leaves behind clears at reboot, and knarr controls
+// any residue a hard crash leaves behind clears at reboot, and ocicfs controls
 // every byte of the path, which keeps the overlay option string free of the
 // delimiter bytes an environment-chosen directory could carry.
-const runDir = "/run/knarr"
+const runDir = "/run/ocicfs"
 
 // overlaySource is the filesystem source name the composefs overlay mounts are
 // registered under, so /proc/mounts identifies them.
@@ -227,7 +227,7 @@ func lockLinked(img *os.File) error {
 		return fmt.Errorf("mount: stat image: %w", err)
 	}
 	if st.Nlink == 0 {
-		return errors.New("mount: image removed by gc; run `knarr pull` first")
+		return errors.New("mount: image removed by gc; run `ocicfs pull` first")
 	}
 	return nil
 }
@@ -283,7 +283,7 @@ func attachLoop(img *os.File) (*os.File, error) {
 // itself on first use.
 func scratchDir() (string, error) {
 	// Owner-only: the scratch mountpoints are touched exclusively by the
-	// privileged knarr process that assembles the mount.
+	// privileged ocicfs process that assembles the mount.
 	if err := os.MkdirAll(runDir, 0o700); err != nil {
 		return "", fmt.Errorf("mount: create %s: %w", runDir, err)
 	}
@@ -305,7 +305,7 @@ func overlayOptions(scratch, basedir string) string {
 // validateSpec checks a composefs mount spec before any I/O: no empty fields,
 // a well-formed sha256 fs-verity digest, and a basedir free of the delimiter
 // bytes that would split the overlay option string (',' separates options and
-// ':' separates lower layers; the scratch path is knarr-generated under
+// ':' separates lower layers; the scratch path is ocicfs-generated under
 // runDir, so a violation there would be a bug, not an input).
 func validateSpec(s Spec) error {
 	switch {

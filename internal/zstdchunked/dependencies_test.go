@@ -20,7 +20,7 @@ func TestPackageDependencies(t *testing.T) {
 
 	for _, dep := range strings.Fields(string(out)) {
 		switch {
-		case dep == "github.com/foundriesio/knarr/internal/oci":
+		case dep == "github.com/foundriesio/ocicfs/internal/oci":
 			t.Errorf("internal/zstdchunked depends on internal/oci")
 		case strings.HasPrefix(dep, "github.com/google/go-containerregistry/"):
 			t.Errorf("internal/zstdchunked depends on registry client package %s", dep)

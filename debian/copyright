@@ -1,7 +1,7 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: knarr
+Upstream-Name: ocicfs
 Upstream-Contact: Mykhaylo Sul <mykhaylo.sul@oss.qualcomm.com>
-Source: https://github.com/foundriesio/knarr
+Source: https://github.com/foundriesio/ocicfs
 
 Files: *
 Copyright: Copyright (c) 2026 Qualcomm Technologies, Inc. and/or its subsidiaries.

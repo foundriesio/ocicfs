@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/foundriesio/knarr/internal/digestutil"
+	"github.com/foundriesio/ocicfs/internal/digestutil"
 	"github.com/opencontainers/go-digest"
 )
 

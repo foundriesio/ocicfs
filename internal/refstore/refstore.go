@@ -23,7 +23,7 @@
 // the platforms pulled and, for a runtime reference, the holder it names the
 // image for. The file is written atomically and durably.
 //
-//	{ "schema": "application/vnd.knarr.ref.v2+json",
+//	{ "schema": "application/vnd.ocicfs.ref.v2+json",
 //	  "ref": "registry.example.com/team/app@sha256:...",
 //	  "refKey":   {"algorithm":"sha256","digest":"sha256:..."},
 //	  "resolved": {"mediaType":"...","digest":"sha256:...","size":N},
@@ -66,12 +66,12 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/foundriesio/knarr/internal/digestutil"
-	"github.com/foundriesio/knarr/internal/durable"
-	"github.com/foundriesio/knarr/internal/holdstore"
+	"github.com/foundriesio/ocicfs/internal/digestutil"
+	"github.com/foundriesio/ocicfs/internal/durable"
+	"github.com/foundriesio/ocicfs/internal/holdstore"
 )
 
-// Store writes reference provenance under the knarr store root.
+// Store writes reference provenance under the ocicfs store root.
 type Store struct {
 	root string
 }
@@ -292,7 +292,7 @@ func (s *Store) PruneEmptyDirs() error {
 	return nil
 }
 
-const refSchema = "application/vnd.knarr.ref.v2+json"
+const refSchema = "application/vnd.ocicfs.ref.v2+json"
 
 // The on-disk ref JSON documents.
 type (

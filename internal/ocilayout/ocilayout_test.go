@@ -19,7 +19,7 @@ import (
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/foundriesio/knarr/internal/ocichain"
+	"github.com/foundriesio/ocicfs/internal/ocichain"
 )
 
 type fixture struct {

@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Container entrypoint for the knarr dev / CI image.
+# Container entrypoint for the ocicfs dev / CI image.
 #
 # fs-verity needs a real backing filesystem (tmpfs and overlayfs cannot provide
 # it), so when running privileged this creates a loop-backed ext4 filesystem with
-# the verity feature and mounts it at the knarr default data root. Manual
-# `knarr pull` and the privileged end-to-end tests use it directly; when the mount
+# the verity feature and mounts it at the ocicfs default data root. Manual
+# `ocicfs pull` and the privileged end-to-end tests use it directly; when the mount
 # cannot be created (unprivileged run, missing tooling) the tests detect the
 # absence and skip.
 #
 # It is idempotent and execs the container's command afterwards.
 #
 # Env:
-#   KNARR_TEST_VERITY_SIZE_MB   loop image size in MiB (default 256)
+#   OCICFS_TEST_VERITY_SIZE_MB   loop image size in MiB (default 256)
 
 set -euo pipefail
 
-# The knarr default data root, shared with the e2e tests (internal/devtest.verityDir).
-ROOT="/var/lib/knarr"
-IMG="/var/tmp/knarr-verity.img"
-SIZE_MB="${KNARR_TEST_VERITY_SIZE_MB:-256}"
+# The ocicfs default data root, shared with the e2e tests (internal/devtest.verityDir).
+ROOT="/var/lib/ocicfs"
+IMG="/var/tmp/ocicfs-verity.img"
+SIZE_MB="${OCICFS_TEST_VERITY_SIZE_MB:-256}"
 
 setup_verity_mount() {
 	# Already mounted (container restart or repeated invocation).
@@ -51,7 +51,7 @@ setup_verity_mount() {
 }
 
 # The persistent zot registry: a local OCI registry at 127.0.0.1:5000 for
-# manual push -> seal -> pull testing (`knarr seal 127.0.0.1:5000/...`). Its
+# manual push -> seal -> pull testing (`ocicfs seal 127.0.0.1:5000/...`). Its
 # storage lives outside the verity mount, so registry state is independent of
 # it; the smoke test never uses this instance — it runs its own ephemeral one
 # on another port. Idempotent: an instance already answering keeps running.

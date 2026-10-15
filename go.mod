@@ -1,4 +1,4 @@
-module github.com/foundriesio/knarr
+module github.com/foundriesio/ocicfs
 
 go 1.26.0
 

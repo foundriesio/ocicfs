@@ -1,8 +1,8 @@
-# Mounting a pulled image (`knarr mount`)
+# Mounting a pulled image (`ocicfs mount`)
 
-`knarr mount` exposes an already-pulled image as a read-only composefs
+`ocicfs mount` exposes an already-pulled image as a read-only composefs
 filesystem. It does not pull, rebuild, or execute anything; it reads the local
-binding and object store produced by `knarr pull`. The reference may pin a
+binding and object store produced by `ocicfs pull`. The reference may pin a
 digest (`name@sha256:<hex>` or a bare `sha256:<hex>`) or be any ref string a
 previous pull recorded, such as a tag: an unpinned ref resolves locally —
 never over the network — to the identity its most recent pull recorded, and a
@@ -29,10 +29,10 @@ If the host filesystem does not support fs-verity, back the store with a
 loopback ext4 that does (fs-verity needs a 4096-byte block size):
 
 ```sh
-sudo fallocate -l 2G /var/lib/knarr.ext4
-sudo mkfs.ext4 -F -b 4096 -O verity -m 0 /var/lib/knarr.ext4
-sudo mkdir -p /var/lib/knarr
-sudo mount -o loop /var/lib/knarr.ext4 /var/lib/knarr
+sudo fallocate -l 2G /var/lib/ocicfs.ext4
+sudo mkfs.ext4 -F -b 4096 -O verity -m 0 /var/lib/ocicfs.ext4
+sudo mkdir -p /var/lib/ocicfs
+sudo mount -o loop /var/lib/ocicfs.ext4 /var/lib/ocicfs
 ```
 
 ## 1. Pull a digest-pinned image
@@ -42,12 +42,12 @@ store:
 
 ```sh
 digest=$(jq -r '.manifests[0].digest' ./layout/index.json)
-knarr pull --from-dir ./layout "app@$digest"
+ocicfs pull --from-dir ./layout "app@$digest"
 ```
 
 ## 2. Create the mount target
 
-knarr does not create or clean the target directory:
+ocicfs does not create or clean the target directory:
 
 ```sh
 sudo mkdir -p /mnt/app
@@ -56,7 +56,7 @@ sudo mkdir -p /mnt/app
 ## 3. Mount read-only
 
 ```sh
-sudo knarr mount "app@$digest" /mnt/app
+sudo ocicfs mount "app@$digest" /mnt/app
 ```
 
 Before anything else, mount resolves and digest-verifies the stored metadata
@@ -67,7 +67,7 @@ fs-verity digest to enforce: the manifest's merged-image sealing annotation
 when one is present, the digest the binding recorded at pull otherwise. It
 re-measures the referenced composefs image object against that value on the
 very file descriptor it attaches to a read-only loop device, mounts the
-image's EROFS metadata on a private scratch directory under `/run/knarr`, and
+image's EROFS metadata on a private scratch directory under `/run/ocicfs`, and
 assembles the mount at the target as a single read-only overlay with the
 store's object directory as a data-only lower layer and fs-verity required on
 every backing object. The scratch mountpoint is lazily detached before the
@@ -86,7 +86,7 @@ cat /mnt/app/etc/config.txt
 ## 4. Unmount
 
 ```sh
-sudo knarr unmount /mnt/app
+sudo ocicfs unmount /mnt/app
 ```
 
 `unmount` tears down the mount at the target path. It does not remove the target
@@ -99,15 +99,15 @@ or a script-driven agent) mounts only the image's verified EROFS metadata and
 folds the store's object directory into that overlay as a data-only lower:
 
 ```sh
-sudo knarr mount --metadata-only "app@$digest" /mnt/app-meta
+sudo ocicfs mount --metadata-only "app@$digest" /mnt/app-meta
 sudo mount -t overlay overlay -o \
-  "lowerdir=/mnt/app-meta::/var/lib/knarr/objects/fsverity-sha256-12,upperdir=$upper,workdir=$work,redirect_dir=on,metacopy=on,verity=require" \
+  "lowerdir=/mnt/app-meta::/var/lib/ocicfs/objects/fsverity-sha256-12,upperdir=$upper,workdir=$work,redirect_dir=on,metacopy=on,verity=require" \
   /mnt/app
 ```
 
 The metadata mount alone serves no file data; content is read only through the
 overlay, and `verity=require` keeps the kernel enforcing fs-verity on every
-backing object. A raw EROFS mount has no kernel digest option, so knarr
+backing object. A raw EROFS mount has no kernel digest option, so ocicfs
 enforces the expected digest itself: it measures the image on the very file
 descriptor it attaches to the loop device, making the mounted metadata the
 measured metadata. This flat overlay is the supported writable pattern: stacking a
@@ -126,20 +126,20 @@ stacking depth. The upper and work directories must not live on an overlayfs.
 - **Read-only only.** `--rw` and writable overlay options are rejected with
   `writable mounts are not supported`. A writable rootfs is assembled by the
   consumer over a `--metadata-only` mount instead (see above).
-- **Fail closed.** knarr requires fs-verity for the composefs image and backing
+- **Fail closed.** ocicfs requires fs-verity for the composefs image and backing
   objects. There is no unverified mount fallback.
 - **Mounts mark in use for gc.** A mount holds the store lock shared during
   setup and takes a shared flock on the image object — the in-use signal
-  `knarr gc` probes before deleting. On both mount paths the lock rides the
+  `ocicfs gc` probes before deleting. On both mount paths the lock rides the
   loop device, so it lives exactly as long as the mount and survives the
-  knarr process; it still ends at unmount or reboot, so hold an image that
+  ocicfs process; it still ends at unmount or reboot, so hold an image that
   must stay protected beyond that (see [gc.md](gc.md)). A mount that loses
   the unlink race with a concurrent collection is refused with the pull
   remedy instead of serving a deleted image.
 - **Crash residue.** A hard kill in the narrow window between the scratch
   EROFS mount and its lazy detach leaves that scratch mount, its loop device,
   and the image's in-use lock behind until reboot. The residue lives on tmpfs
-  (`/run/knarr`) and only over-retains store objects for one boot; it never
+  (`/run/ocicfs`) and only over-retains store objects for one boot; it never
   loses data.
 - **What the verity check binds.** The expected fs-verity digest — the sealing
   annotation of the digest-verified identity manifest for a sealed image, the

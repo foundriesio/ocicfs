@@ -30,10 +30,10 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/foundriesio/knarr/internal/digestutil"
-	"github.com/foundriesio/knarr/internal/ocichain"
-	"github.com/foundriesio/knarr/internal/ocilayout"
-	"github.com/foundriesio/knarr/internal/ociseal"
+	"github.com/foundriesio/ocicfs/internal/digestutil"
+	"github.com/foundriesio/ocicfs/internal/ocichain"
+	"github.com/foundriesio/ocicfs/internal/ocilayout"
+	"github.com/foundriesio/ocicfs/internal/ociseal"
 )
 
 // Options controls what Seal targets and which registry writes it performs.
@@ -50,7 +50,7 @@ type Options struct {
 	// it already holds the blobs they reference.
 	FromDir string
 	// AllowNonCanonical permits sealing a non-canonical construction: its
-	// deterministic fallback digest is recorded under the knarr fallback
+	// deterministic fallback digest is recorded under the ocicfs fallback
 	// annotations instead of declining. A canonical construction is sealed
 	// under the standard annotations regardless of this option.
 	AllowNonCanonical bool

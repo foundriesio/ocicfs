@@ -340,7 +340,7 @@ func TestGetRejectsSupersededSchemaNamingTheRemedy(t *testing.T) {
 	ref := "app@sha256:abc"
 	seedRecord(t, s, ref)
 	rewriteRecord(t, root, ref, func(doc map[string]any) {
-		doc["schema"] = "application/vnd.knarr.ref.v1+json"
+		doc["schema"] = "application/vnd.ocicfs.ref.v1+json"
 		delete(doc, "identity")
 	})
 
@@ -367,7 +367,7 @@ func TestListSkipsSupersededSchemaRecord(t *testing.T) {
 	seedRecord(t, s, "healthy:v1")
 	seedRecord(t, s, "stale:v1")
 	rewriteRecord(t, root, "stale:v1", func(doc map[string]any) {
-		doc["schema"] = "application/vnd.knarr.ref.v1+json"
+		doc["schema"] = "application/vnd.ocicfs.ref.v1+json"
 		delete(doc, "identity")
 	})
 
