@@ -75,9 +75,9 @@ descended one level, inside the index's own digest-verified bytes, to the
 manifest it offers for the host platform, and that manifest's digest is what
 `images/`, `holds/`, and every verb use. Pulling one image by its index digest
 and by its platform manifest digest therefore stores it once, under one key,
-with one set of holds. The digest `ocicfs pull`, `ocicfs ls`, and `ocicfs inspect`
-report is the identity, which may differ from the digest the reference pinned;
-it is the digest to pin, hold, and look the image up by. See
+with one set of holds. The digest `ocicfs pull`, `ocicfs ls`, and
+`ocicfs inspect` report is the identity, which may differ from the digest the
+reference pinned; it is the digest to pin, hold, and look the image up by. See
 [ADR 0002](adr/0002-image-identity.md).
 
 ## `images/` — image bindings (auxiliary)
@@ -234,11 +234,11 @@ already named the manifest. A record carrying an older schema is rejected on rea
 naming the remedy (recreate the store); `ls` skips such a record with a warning
 rather than failing the whole listing.
 
-`ocicfs ls` reads these records and reports one row per stored reference, showing
-the identity digest. `ocicfs remove <ref>` deletes the matching ref record and
-any unshared image binding for the recorded identity digest and platform; it
-does not delete content from `objects/` — `ocicfs gc` reclaims objects nothing
-references (see [gc.md](gc.md)).
+`ocicfs ls` reads these records and reports one row per stored reference,
+showing the identity digest. `ocicfs remove <ref>` deletes the matching ref
+record and any unshared image binding for the recorded identity digest and
+platform; it does not delete content from `objects/` — `ocicfs gc` reclaims
+objects nothing references (see [gc.md](gc.md)).
 
 ## `holds/` — GC-protection holds (auxiliary)
 

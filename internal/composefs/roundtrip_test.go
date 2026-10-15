@@ -71,12 +71,12 @@ func TestWriteImageMatchesUpstream(t *testing.T) {
 // byte-compatible with upstream tooling for files small enough that directory-mode
 // mkcomposefs inlines them (<=64 bytes). The reference image is built with upstream
 // tools ONLY — never WriteImage: a directory-mode build (which inlines the small
-// files) is dumped, every regular-file line is rewritten into ocicfs's by-digest
-// form (PAYLOAD and DIGEST both the file's fs-verity digest from composefs-info
-// measure-file), and mkcomposefs --from-file rebuilds a no-inline image from that
-// dump. WriteImage then rebuilds the same dump and must reproduce the reference
-// byte-for-byte, with the small file stored by digest rather than re-inlined.
-// Needs mkcomposefs and composefs-info on PATH.
+// files) is dumped, every regular-file line is rewritten into ocicfs's
+// by-digest form (PAYLOAD and DIGEST both the file's fs-verity digest from
+// composefs-info measure-file), and mkcomposefs --from-file rebuilds a
+// no-inline image from that dump. WriteImage then rebuilds the same dump and
+// must reproduce the reference byte-for-byte, with the small file stored by
+// digest rather than re-inlined. Needs mkcomposefs and composefs-info on PATH.
 func TestWriteImageNoInlineMatchesUpstream(t *testing.T) {
 	mkcomposefs := lookPathOrSkip(t, "mkcomposefs")
 	cfsInfo := lookPathOrSkip(t, "composefs-info")

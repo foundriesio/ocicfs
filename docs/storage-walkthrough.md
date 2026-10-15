@@ -1,10 +1,10 @@
 # Hands-on: building and verifying a composefs image (publisher → device)
 
-This is a runnable walkthrough of ocicfs's on-disk substrate: a content-addressed
-object store, per-file fs-verity, and a composefs/EROFS image that redirects
-into the store. It uses only the upstream `mkcomposefs` and `composefs-info` tools so
-you can build and inspect the exact artifacts ocicfs produces — by hand — before
-reading the code.
+This is a runnable walkthrough of ocicfs's on-disk substrate: a
+content-addressed object store, per-file fs-verity, and a composefs/EROFS image
+that redirects into the store. It uses only the upstream `mkcomposefs` and
+`composefs-info` tools so you can build and inspect the exact artifacts ocicfs
+produces — by hand — before reading the code.
 
 ocicfs's trust model has **two sides**, and every step below is tagged with the one it
 belongs to:

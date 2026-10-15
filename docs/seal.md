@@ -221,10 +221,10 @@ and against a restart over an already-stored image.
 `scripts/seal-crosscheck.sh <image-uri>` verifies the sealed digest for any
 image (current platform of an index) against three independent implementations:
 `cfsctl oci compute-id` must reproduce it bit-for-bit, the Rust `mkcomposefs`
-(`cfsctl mkcomposefs --from-file`, the drop-in for the C binary ocicfs runs) must
-rebuild the sealed image's own dump into the identical bytes, and a fourth build
-from an `umoci` flatten through the C `mkcomposefs` must agree at least on the
-full tree (bit-for-bit when the image carries no hardlinks — see the script
+(`cfsctl mkcomposefs --from-file`, the drop-in for the C binary ocicfs runs)
+must rebuild the sealed image's own dump into the identical bytes, and a fourth
+build from an `umoci` flatten through the C `mkcomposefs` must agree at least on
+the full tree (bit-for-bit when the image carries no hardlinks — see the script
 header).
 
 ## Authority boundary

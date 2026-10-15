@@ -72,8 +72,8 @@ If you use a coding agent in this repository, it must also follow the rules in
 ocicfs follows the composefs (Linux-kernel) commit style:
 
 - **Subject:** `<context>: Capitalized imperative subject`, where `<context>` is
-  the area of change (e.g. `pull`, `mount`, `cas`, `cmd/ocicfs`, `docs`). Aim for
-  under 50 characters (72 max), and do not end it with a period.
+  the area of change (e.g. `pull`, `mount`, `cas`, `cmd/ocicfs`, `docs`). Aim
+  for under 50 characters (72 max), and do not end it with a period.
 - **Body:** separate it from the subject with a blank line, wrap it at 72
   characters, and explain *what* changed and *why*.
 - If your commit fixes an issue, end the body with `Closes: #<number>`.
@@ -91,9 +91,9 @@ for more.
   make test       # unit tests
   make build
   ```
-- Changes that touch ocicfs's privileged paths (mount, fs-verity, CAS build) must
-  pass the privileged test target, which requires root or a full-mapping user
-  namespace:
+- Changes that touch ocicfs's privileged paths (mount, fs-verity, CAS build)
+  must pass the privileged test target, which requires root or a full-mapping
+  user namespace:
   ```bash
   sudo -E PATH=$PATH make root-test   # or: podman unshare make root-test
   ```

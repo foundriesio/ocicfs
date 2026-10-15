@@ -51,8 +51,8 @@ holder that could not be dropped would linger forever.
 - One image has one binding, one holder directory, and one lock, however it was
   named. `remove` keeps its single-lock check-then-delete shape, and a hold
   taken through one door is seen by a `remove` that arrives through the other.
-- The digest ocicfs prints, lists, and reports from `inspect` is the identity. It
-  may differ from the digest the caller pinned; it is the digest to hold, to
+- The digest ocicfs prints, lists, and reports from `inspect` is the identity.
+  It may differ from the digest the caller pinned; it is the digest to hold, to
   pin, and to look the image up by.
 - Identity is a function of the stored bytes *and* the platform selector. ocicfs
   selects a platform entry exactly and rejects ambiguity, so an index offering

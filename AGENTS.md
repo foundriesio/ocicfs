@@ -1,9 +1,9 @@
 # AI Agent Operational Rules & Engineering Standards
 
-These rules govern automated coding agents working in the ocicfs repository. They
-exist to keep agentic development **secure, professional, and acceptable to the
-composefs community**, under whose [organization](https://github.com/composefs)
-this project intends to be homed.
+These rules govern automated coding agents working in the ocicfs repository.
+They exist to keep agentic development **secure, professional, and acceptable to
+the composefs community**, under whose
+[organization](https://github.com/composefs) this project intends to be homed.
 
 ## 0. Authoritative community rules (these override everything below)
 
@@ -30,10 +30,11 @@ composefs project's published guidelines, **composefs wins**. In particular:
   fs-verity.
 - **Scope discipline (load-bearing):** ocicfs provides **primitives, not lifecycle
   policy**. The verbs are `pull`, `verify`, `mount`, `unmount`, `hold`, `release`,
-  `gc`, plus the publisher-side `publish`. ocicfs **does not execute containers**
-  and owns no version-management, activation, rollback, or update-orchestration
-  logic. Do **not** add `run`/`deploy`/`update`/`stop`/`logs`-style behavior — it
-  is out of scope by design and belongs to the upper-layer agent that drives ocicfs.
+  `gc`, plus the publisher-side `publish`. ocicfs **does not execute
+  containers** and owns no version-management, activation, rollback, or
+  update-orchestration logic. Do **not** add
+  `run`/`deploy`/`update`/`stop`/`logs`-style behavior — it is out of scope by
+  design and belongs to the upper-layer agent that drives ocicfs.
 - You have **read-only remote** repository access. Never run `git push`,
   `git remote` mutations, or `gh` PR/issue-writing commands. Do not use the `gh`
   CLI to mutate state without explicit human permission.
