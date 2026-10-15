@@ -70,7 +70,7 @@ systems, not OCI-native application content. composefs gives the right integrity
 and mount substrate but not the pull, resume, air-gap, trust, and hold/release
 primitives a device update agent needs.
 
-ocicfs fills that composition gap: it keeps the OCI ecosystem on the wire, stores
-only verified decompressed content on disk, mounts prepared trees through
+ocicfs fills that composition gap: it keeps the OCI ecosystem on the wire,
+stores only verified decompressed content on disk, mounts prepared trees through
 composefs, and leaves lifecycle policy to the layer that already owns update
 decisions.

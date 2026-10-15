@@ -28,10 +28,10 @@ var ErrNoVerity = errors.New("devtest: verity-capable test root unavailable")
 const verityDir = "/var/lib/ocicfs"
 
 // VerityRoot returns a fresh empty directory on the dev container's
-// verity-capable filesystem for use as a ocicfs store root, along with a cleanup
-// function to remove it. It returns ErrNoVerity when that filesystem is not
-// mounted or is not usable by this process (for example a root-owned default
-// store left over from a host run), so the caller skips.
+// verity-capable filesystem for use as an ocicfs store root, along with a
+// cleanup function to remove it. It returns ErrNoVerity when that filesystem is
+// not mounted or is not usable by this process (for example a root-owned
+// default store left over from a host run), so the caller skips.
 func VerityRoot() (dir string, cleanup func(), err error) {
 	if fi, statErr := os.Stat(verityDir); statErr != nil || !fi.IsDir() {
 		return "", nil, ErrNoVerity

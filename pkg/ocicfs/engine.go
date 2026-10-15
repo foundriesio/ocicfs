@@ -376,7 +376,8 @@ func WithForce() RemoveOption {
 	return func(o *RemoveOptions) { o.Force = true }
 }
 
-// Engine performs the ocicfs primitives against a local content-addressed store.
+// Engine performs the ocicfs primitives against a local content-addressed
+// store.
 type Engine interface {
 	// Publish builds the tree at dir into a zstd:chunked OCI image and pushes
 	// it to dest.

@@ -5,8 +5,8 @@
 #
 # storage-demo.sh — runnable companion to docs/storage-walkthrough.md.
 #
-# Plays both sides of ocicfs's trust model on one machine using only the upstream
-# mkcomposefs and composefs-info tools:
+# Plays both sides of ocicfs's trust model on one machine using only the
+# upstream mkcomposefs and composefs-info tools:
 #   [publisher] builds a composefs image from a sample tree — files over 64 bytes
 #               stored by content sha256 with an fs-verity-keyed hardlink view and
 #               redirects keyed by fs-verity, files of 64 bytes or fewer inlined

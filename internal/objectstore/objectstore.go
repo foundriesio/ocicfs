@@ -9,13 +9,14 @@
 // no-replace, and a collision re-verifies the existing object, so no store-wide
 // lock is needed.
 //
-// The store is private to the ocicfs process, which runs privileged and performs
-// the mount itself: object files are owner-only (0600) and protected by
-// fs-verity, so the digest store does not need to be world-readable. Objects are
-// not fsynced individually; a pull makes all of its writes durable with a single
-// store-wide Sync before it writes the binding that references them, so a crash
-// leaves either a complete, durable pull or one with no binding. An interrupted
-// pull is recovered by re-running it, since every write is idempotent.
+// The store is private to the ocicfs process, which runs privileged and
+// performs the mount itself: object files are owner-only (0600) and protected
+// by fs-verity, so the digest store does not need to be world-readable. Objects
+// are not fsynced individually; a pull makes all of its writes durable with a
+// single store-wide Sync before it writes the binding that references them, so
+// a crash leaves either a complete, durable pull or one with no binding. An
+// interrupted pull is recovered by re-running it, since every write is
+// idempotent.
 package objectstore
 
 import (

@@ -7,7 +7,7 @@ is handled by `gc`.
 
 ## Prerequisites
 
-- A ocicfs store containing at least one pulled image.
+- An ocicfs store containing at least one pulled image.
 - The exact reference string recorded by `ocicfs pull`.
 
 ## 1. List pulled images

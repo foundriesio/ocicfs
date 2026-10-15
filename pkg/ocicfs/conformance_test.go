@@ -19,10 +19,10 @@ import (
 
 // The conformance oracle is a cfsctl repository initialised with ocicfs's
 // fs-verity algorithm and EROFS format, so the merged image it builds matches
-// the one ocicfs must reproduce. cfsctl's init default is fsverity-sha512 (EROFS
-// V1 is its init default), so the algorithm is set explicitly and the repository
-// metadata cfsctl wrote is asserted before any comparison, so a drifted default
-// cannot silently change what the oracle computes.
+// the one ocicfs must reproduce. cfsctl's init default is fsverity-sha512
+// (EROFS V1 is its init default), so the algorithm is set explicitly and the
+// repository metadata cfsctl wrote is asserted before any comparison, so a
+// drifted default cannot silently change what the oracle computes.
 const (
 	oracleAlgorithm    = "fsverity-sha256-12"
 	oracleErofsVersion = 1 // EROFS format V1, C mkcomposefs 1.0.8-compatible
