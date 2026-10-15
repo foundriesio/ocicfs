@@ -28,14 +28,14 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/foundriesio/knarr/internal/devtest"
-	"github.com/foundriesio/knarr/internal/imagestore"
-	"github.com/foundriesio/knarr/internal/objectstore"
-	"github.com/foundriesio/knarr/internal/ocichain"
-	"github.com/foundriesio/knarr/internal/ocilayout"
-	"github.com/foundriesio/knarr/internal/ociseal"
-	"github.com/foundriesio/knarr/internal/octest"
-	"github.com/foundriesio/knarr/internal/rootfs"
+	"github.com/foundriesio/ocicfs/internal/devtest"
+	"github.com/foundriesio/ocicfs/internal/imagestore"
+	"github.com/foundriesio/ocicfs/internal/objectstore"
+	"github.com/foundriesio/ocicfs/internal/ocichain"
+	"github.com/foundriesio/ocicfs/internal/ocilayout"
+	"github.com/foundriesio/ocicfs/internal/ociseal"
+	"github.com/foundriesio/ocicfs/internal/octest"
+	"github.com/foundriesio/ocicfs/internal/rootfs"
 )
 
 // canonicalLayerFiles is a standard-layout single-layer tree — /usr and its
@@ -54,7 +54,7 @@ func TestMaterializeMatchesDirectoryAndMemorySources(t *testing.T) {
 	}
 	lay, err := octest.BuildSingleLayerGzip(t.TempDir(), ocispec.Platform{OS: "linux", Architecture: "amd64"},
 		// Over the inline threshold, so it is stored as a CAS object (FileDigest).
-		octest.File{Name: "etc/config.txt", Mode: 0o644, Body: "hello from knarr - a config payload larger than the sixty-four byte inline limit\n"},
+		octest.File{Name: "etc/config.txt", Mode: 0o644, Body: "hello from ocicfs - a config payload larger than the sixty-four byte inline limit\n"},
 		octest.File{Name: "usr/bin/app", Mode: 0o755, Body: "#!/bin/sh\n"},
 	)
 	if err != nil {
@@ -261,7 +261,7 @@ func TestMaterializeCorruptLayerWritesNoBinding(t *testing.T) {
 		t.Skip("mkcomposefs not found in PATH")
 	}
 	lay, err := octest.BuildSingleLayerGzip(t.TempDir(), ocispec.Platform{OS: "linux", Architecture: "amd64"},
-		octest.File{Name: "etc/config.txt", Mode: 0o644, Body: "hello from knarr\n"},
+		octest.File{Name: "etc/config.txt", Mode: 0o644, Body: "hello from ocicfs\n"},
 	)
 	if err != nil {
 		t.Fatalf("build layout: %v", err)
@@ -303,7 +303,7 @@ func TestMaterializeRejectsTamperedSealingAnnotations(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			lay, err := octest.BuildSingleLayerGzip(t.TempDir(), ocispec.Platform{OS: "linux", Architecture: "amd64"},
-				canonicalLayerFiles("hello from knarr - a payload past the inline limit\n")...,
+				canonicalLayerFiles("hello from ocicfs - a payload past the inline limit\n")...,
 			)
 			if err != nil {
 				t.Fatalf("build layout: %v", err)

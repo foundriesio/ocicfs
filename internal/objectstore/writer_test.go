@@ -14,7 +14,7 @@ import (
 
 	"github.com/opencontainers/go-digest"
 
-	"github.com/foundriesio/knarr/internal/verity"
+	"github.com/foundriesio/ocicfs/internal/verity"
 )
 
 // tempDirEmpty fails the test if any staging temp is left in the store.

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package digestutil validates and parses sha256 digests, the only digest
-// algorithm knarr's content-addressed store uses.
+// algorithm ocicfs's content-addressed store uses.
 //
 // A digest is validated exactly where it is not yet trustworthy: where outside
 // bytes become a digest (a parsed reference, decoded JSON) and where a digest

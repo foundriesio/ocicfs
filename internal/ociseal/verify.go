@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/foundriesio/knarr/internal/objectstore"
-	"github.com/foundriesio/knarr/internal/ocichain"
+	"github.com/foundriesio/ocicfs/internal/objectstore"
+	"github.com/foundriesio/ocicfs/internal/ocichain"
 )
 
 // MergedAnnotationPrefix is the namespace every merged-EROFS sealing
@@ -30,10 +30,10 @@ const MergedAnnotationPrefix = "composefs.merged.erofs.v1."
 // A non-canonical construction cannot reproduce the value a standard sealing
 // annotation claims, so any annotation under the merged-EROFS namespace fails
 // closed regardless of its suffix or value; what it does reproduce is its own
-// deterministic fallback digest, which the knarr fallback annotation records.
+// deterministic fallback digest, which the ocicfs fallback annotation records.
 //
 // The config annotation is keyed by the canonical flag: the standard key on a
-// canonical construction, the knarr fallback key otherwise, with the same
+// canonical construction, the ocicfs fallback key otherwise, with the same
 // fail-closed mismatch handling.
 func VerifyAnnotations(ctx context.Context, store *objectstore.Store, res ocichain.Resolved, mergedFsverity string, canonical bool) error {
 	if store == nil {
@@ -73,7 +73,7 @@ func VerifyAnnotations(ctx context.Context, store *objectstore.Store, res ocicha
 // SelectMergedAnnotation selects the merged-image sealing annotation a
 // manifest is held to and returns its key and the fs-verity digest it
 // records, or an empty key when the manifest carries none. Selection is by
-// annotation presence alone. The standard key wins over the knarr fallback
+// annotation presence alone. The standard key wins over the ocicfs fallback
 // key when both are present, and the fallback's value is then not read. A
 // malformed value and a merged-image annotation of an unrecognized digest
 // kind both fail closed: the publisher sealed the image, so treating it as

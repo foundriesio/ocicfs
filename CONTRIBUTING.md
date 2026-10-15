@@ -1,6 +1,6 @@
-# Contributing to knarr
+# Contributing to ocicfs
 
-Thanks for your interest in contributing! knarr is developed in the open with the
+Thanks for your interest in contributing! ocicfs is developed in the open with the
 goal of homing under the [composefs](https://github.com/composefs) organization,
 and aims to follow that community's conventions. Please also read the
 [composefs contribution guide](https://github.com/composefs/composefs/blob/main/CONTRIBUTING.md),
@@ -69,10 +69,10 @@ If you use a coding agent in this repository, it must also follow the rules in
 
 ## Git commit style
 
-knarr follows the composefs (Linux-kernel) commit style:
+ocicfs follows the composefs (Linux-kernel) commit style:
 
 - **Subject:** `<context>: Capitalized imperative subject`, where `<context>` is
-  the area of change (e.g. `pull`, `mount`, `cas`, `cmd/knarr`, `docs`). Aim for
+  the area of change (e.g. `pull`, `mount`, `cas`, `cmd/ocicfs`, `docs`). Aim for
   under 50 characters (72 max), and do not end it with a period.
 - **Body:** separate it from the subject with a blank line, wrap it at 72
   characters, and explain *what* changed and *why*.
@@ -91,7 +91,7 @@ for more.
   make test       # unit tests
   make build
   ```
-- Changes that touch knarr's privileged paths (mount, fs-verity, CAS build) must
+- Changes that touch ocicfs's privileged paths (mount, fs-verity, CAS build) must
   pass the privileged test target, which requires root or a full-mapping user
   namespace:
   ```bash

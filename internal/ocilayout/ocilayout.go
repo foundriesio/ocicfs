@@ -19,8 +19,8 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/foundriesio/knarr/internal/digestutil"
-	"github.com/foundriesio/knarr/internal/ocichain"
+	"github.com/foundriesio/ocicfs/internal/digestutil"
+	"github.com/foundriesio/ocicfs/internal/ocichain"
 )
 
 // Open opens the OCI image layout rooted at dir.

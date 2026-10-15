@@ -24,7 +24,7 @@ func WriteFile(path string, data []byte, perm os.FileMode) error {
 		return errors.New("durable: empty path")
 	}
 	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, ".knarr-*") // #nosec G304 -- caller-selected metadata directory
+	f, err := os.CreateTemp(dir, ".ocicfs-*") // #nosec G304 -- caller-selected metadata directory
 	if err != nil {
 		return fmt.Errorf("durable: create temp: %w", err)
 	}

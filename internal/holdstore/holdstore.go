@@ -39,11 +39,11 @@ import (
 
 	"github.com/opencontainers/go-digest"
 
-	"github.com/foundriesio/knarr/internal/digestutil"
-	"github.com/foundriesio/knarr/internal/durable"
+	"github.com/foundriesio/ocicfs/internal/digestutil"
+	"github.com/foundriesio/ocicfs/internal/durable"
 )
 
-// Store records holds under the knarr store root.
+// Store records holds under the ocicfs store root.
 type Store struct {
 	root string
 }

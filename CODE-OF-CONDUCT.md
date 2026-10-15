@@ -1,6 +1,6 @@
-## The knarr Project Community Code of Conduct
+## The ocicfs Project Community Code of Conduct
 
-knarr is developed in the open with the goal of homing under the
+ocicfs is developed in the open with the goal of homing under the
 [composefs](https://github.com/composefs) organization, and follows that
-community's conventions. Like the composefs project, knarr adopts the
+community's conventions. Like the composefs project, ocicfs adopts the
 [Containers Community Code of Conduct](https://github.com/containers/common/blob/main/CODE-OF-CONDUCT.md).

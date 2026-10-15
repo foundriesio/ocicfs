@@ -21,14 +21,14 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/foundriesio/knarr/internal/composefs"
-	"github.com/foundriesio/knarr/internal/digestutil"
-	"github.com/foundriesio/knarr/internal/objectstore"
+	"github.com/foundriesio/ocicfs/internal/composefs"
+	"github.com/foundriesio/ocicfs/internal/digestutil"
+	"github.com/foundriesio/ocicfs/internal/objectstore"
 )
 
 // MediaTypeComposefsImage is the descriptor media type for generated composefs
 // image blobs stored in CAS.
-const MediaTypeComposefsImage = "application/vnd.knarr.composefs.image.v1+erofs"
+const MediaTypeComposefsImage = "application/vnd.ocicfs.composefs.image.v1+erofs"
 
 // Image is the generated composefs blob and its measured fs-verity digest.
 // RootfsSize is the apparent size of the merged rootfs: the regular-file
@@ -789,12 +789,12 @@ func (l *Layer) resolve() error {
 // inode, and any other entry installs its node. The bool reports whether the
 // entry diverged from the upstream-reproducible construction: it (or a marker)
 // reached a name whose immediate parent was absent at that moment — upstream
-// errors there while knarr synthesises the parent later — or an opaque marker
+// errors there while ocicfs synthesises the parent later — or an opaque marker
 // cleared same-layer content.
 func mergeRecord(tree map[string]*node, rec record, idx int) (bool, error) {
 	dir, _ := splitPath(rec.name)
 	// Upstream resolves the parent chain before inserting a name or applying a
-	// marker and errors if any component is missing or not a directory; knarr
+	// marker and errors if any component is missing or not a directory; ocicfs
 	// instead repairs the tree after merging, so a name whose immediate parent
 	// is absent — or present as a non-directory — right now is a divergence.
 	// The immediate-parent check accumulates the whole chain by induction: a
@@ -956,7 +956,7 @@ func removeChildren(tree map[string]*node, dir string) {
 // implementing an opaque-directory marker; same- and higher-layer entries stay.
 // It reports whether any same-layer entry already sits under dir at this point:
 // the upstream construction clears the whole directory on the marker and so
-// drops such entries, while knarr keeps them per OCI layer semantics — a
+// drops such entries, while ocicfs keeps them per OCI layer semantics — a
 // divergence.
 func removeOpaque(tree map[string]*node, dir string, idx int) bool {
 	prefix := dir + "/"

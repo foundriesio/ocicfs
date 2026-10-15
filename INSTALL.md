@@ -1,6 +1,6 @@
-# Installing knarr
+# Installing ocicfs
 
-knarr runs on Linux, amd64 and arm64. No Go toolchain is needed to install
+ocicfs runs on Linux, amd64 and arm64. No Go toolchain is needed to install
 a release. Pick the path that matches your system:
 
 | Your system                        | Install path                        |
@@ -10,39 +10,39 @@ a release. Pick the path that matches your system:
 | building yourself (Go 1.26+)       | [3. From source](#3-from-source)    |
 
 Release artifacts live on the
-[releases page](https://github.com/foundriesio/knarr/releases). `<ver>` is
+[releases page](https://github.com/foundriesio/ocicfs/releases). `<ver>` is
 the release version (e.g. `0.1.0`), `<arch>` is `amd64` or `arm64`.
 
 ## 1. Debian package
 
-Download `knarr_<ver>_<arch>.deb` and `knarr_<ver>_checksums.txt`, then:
+Download `ocicfs_<ver>_<arch>.deb` and `ocicfs_<ver>_checksums.txt`, then:
 
 ```sh
-sha256sum --check --ignore-missing knarr_<ver>_checksums.txt
-sudo apt install ./knarr_<ver>_<arch>.deb
+sha256sum --check --ignore-missing ocicfs_<ver>_checksums.txt
+sudo apt install ./ocicfs_<ver>_<arch>.deb
 ```
 
-This installs `/usr/bin/knarr` plus bash and zsh completions.
+This installs `/usr/bin/ocicfs` plus bash and zsh completions.
 
-- **Upgrade:** `sudo apt install ./knarr_<newver>_<arch>.deb`
-- **Rollback:** `sudo apt install --allow-downgrades ./knarr_<oldver>_<arch>.deb`
-- **Uninstall:** `sudo apt remove knarr`
+- **Upgrade:** `sudo apt install ./ocicfs_<newver>_<arch>.deb`
+- **Rollback:** `sudo apt install --allow-downgrades ./ocicfs_<oldver>_<arch>.deb`
+- **Uninstall:** `sudo apt remove ocicfs`
 
 ## 2. Binary archive
 
-Download `knarr_<ver>_linux_<arch>.tar.gz` and
-`knarr_<ver>_checksums.txt`, then:
+Download `ocicfs_<ver>_linux_<arch>.tar.gz` and
+`ocicfs_<ver>_checksums.txt`, then:
 
 ```sh
-sha256sum --check --ignore-missing knarr_<ver>_checksums.txt
-tar -xzf knarr_<ver>_linux_<arch>.tar.gz
-sudo install -m 0755 knarr_<ver>_linux_<arch>/knarr /usr/local/bin/knarr
+sha256sum --check --ignore-missing ocicfs_<ver>_checksums.txt
+tar -xzf ocicfs_<ver>_linux_<arch>.tar.gz
+sudo install -m 0755 ocicfs_<ver>_linux_<arch>/ocicfs /usr/local/bin/ocicfs
 ```
 
 The archive also carries `LICENSE`, `README.md`, and this file.
 
 - **Upgrade / rollback:** install the other version's binary the same way.
-- **Uninstall:** `sudo rm /usr/local/bin/knarr`
+- **Uninstall:** `sudo rm /usr/local/bin/ocicfs`
 
 ## 3. From source
 
@@ -50,8 +50,8 @@ Needs Go 1.26 or newer. Build from a git checkout, not a source tarball, so
 the binary reports its real version:
 
 ```sh
-git clone https://github.com/foundriesio/knarr.git
-cd knarr
+git clone https://github.com/foundriesio/ocicfs.git
+cd ocicfs
 make build
 sudo make install
 ```
@@ -59,19 +59,19 @@ sudo make install
 `make install` places the binary under `/usr/local/bin`; override with
 `PREFIX=/usr` or `DESTDIR=<staging>` for packaging.
 
-- **Uninstall:** `sudo rm /usr/local/bin/knarr` (or your `PREFIX`)
+- **Uninstall:** `sudo rm /usr/local/bin/ocicfs` (or your `PREFIX`)
 
 ## Check the installation
 
 ```sh
-knarr --version
+ocicfs --version
 ```
 
-prints `knarr v<ver> (<commit>)` for a release build.
+prints `ocicfs v<ver> (<commit>)` for a release build.
 
 ## Runtime requirements
 
-Installation works on any Linux; *using* knarr needs:
+Installation works on any Linux; *using* ocicfs needs:
 
 - **Kernel: Linux 6.6 or newer** for mounting — EROFS, fs-verity, and
   overlayfs with data-only lower layers and verity validation. A vendor
@@ -97,10 +97,10 @@ attestation — proof it was built by this repository's release workflow from
 the tagged commit (needs the [GitHub CLI](https://cli.github.com/)):
 
 ```sh
-gh attestation verify knarr_<ver>_linux_<arch>.tar.gz --repo foundriesio/knarr
+gh attestation verify ocicfs_<ver>_linux_<arch>.tar.gz --repo foundriesio/ocicfs
 ```
 
-An SPDX SBOM per binary (`knarr_<ver>_linux_<arch>.spdx.json`) is attached
+An SPDX SBOM per binary (`ocicfs_<ver>_linux_<arch>.spdx.json`) is attached
 to each release.
 
 ## First steps
@@ -108,11 +108,11 @@ to each release.
 Pull an image from Docker Hub, mount it, look inside, unmount:
 
 ```sh
-sudo knarr pull ubuntu          # docker.io/library/ubuntu:latest
+sudo ocicfs pull ubuntu          # docker.io/library/ubuntu:latest
 sudo mkdir -p /mnt/image
-sudo knarr mount ubuntu /mnt/image
+sudo ocicfs mount ubuntu /mnt/image
 ls /mnt/image
-sudo knarr unmount /mnt/image
+sudo ocicfs unmount /mnt/image
 ```
 
 In production, pull digest-pinned references (`<image>@sha256:<digest>`) —

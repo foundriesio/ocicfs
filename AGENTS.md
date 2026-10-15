@@ -1,13 +1,13 @@
 # AI Agent Operational Rules & Engineering Standards
 
-These rules govern automated coding agents working in the knarr repository. They
+These rules govern automated coding agents working in the ocicfs repository. They
 exist to keep agentic development **secure, professional, and acceptable to the
 composefs community**, under whose [organization](https://github.com/composefs)
 this project intends to be homed.
 
 ## 0. Authoritative community rules (these override everything below)
 
-knarr aims to follow the [composefs](https://github.com/composefs/composefs)
+ocicfs aims to follow the [composefs](https://github.com/composefs/composefs)
 community conventions. Where any rule in this document conflicts with the
 composefs project's published guidelines, **composefs wins**. In particular:
 
@@ -23,17 +23,17 @@ composefs project's published guidelines, **composefs wins**. In particular:
 
 ## 1. Core role & scope
 
-- You are an automated software engineer working on **knarr**: an OCI-native
+- You are an automated software engineer working on **ocicfs**: an OCI-native
   content delivery and mount engine for IoT/Edge devices. It pulls standard OCI
   v1.1 images — fetching only missing content from `zstd:chunked` layers — and
   serves them from a single content-addressed store using composefs + EROFS +
   fs-verity.
-- **Scope discipline (load-bearing):** knarr provides **primitives, not lifecycle
+- **Scope discipline (load-bearing):** ocicfs provides **primitives, not lifecycle
   policy**. The verbs are `pull`, `verify`, `mount`, `unmount`, `hold`, `release`,
-  `gc`, plus the publisher-side `publish`. knarr **does not execute containers**
+  `gc`, plus the publisher-side `publish`. ocicfs **does not execute containers**
   and owns no version-management, activation, rollback, or update-orchestration
   logic. Do **not** add `run`/`deploy`/`update`/`stop`/`logs`-style behavior — it
-  is out of scope by design and belongs to the upper-layer agent that drives knarr.
+  is out of scope by design and belongs to the upper-layer agent that drives ocicfs.
 - You have **read-only remote** repository access. Never run `git push`,
   `git remote` mutations, or `gh` PR/issue-writing commands. Do not use the `gh`
   CLI to mutate state without explicit human permission.
@@ -63,7 +63,7 @@ Run the project's standard targets; do not invent ad-hoc invocations.
 ## 4. Architecture & layout rules
 
 - **Standard Go layout — keep the repository root free of implementation.** Code
-  lives under `cmd/` (main packages, e.g. `cmd/knarr`), `internal/` (non-importable
+  lives under `cmd/` (main packages, e.g. `cmd/ocicfs`), `internal/` (non-importable
   implementation), and `pkg/` (public API), with `docs/` for documentation.
 - **The format stack is non-negotiable.** On the wire: standard OCI v1.1, no
   proprietary format — the optimized network pull uses **`zstd:chunked`** layers,
@@ -71,7 +71,7 @@ Run the project's standard targets; do not invent ad-hoc invocations.
   accepts plain OCI layers (e.g. `tar+gzip`), forgoing that optimization. On disk:
   a *single decompressed copy* in a sha256-keyed
   content-addressed store (CAS); the compressed wire form is never persisted; mount
-  is one `mount -t composefs` syscall. Every EROFS knarr builds or verifies is
+  is one `mount -t composefs` syscall. Every EROFS ocicfs builds or verifies is
   **composefs-c 1.0.8-compatible V1**.
 - **Backend abstraction:** keep storage, pull, and mount behavior behind narrow
   interfaces rather than ad-hoc calls scattered through command handlers.
@@ -102,7 +102,7 @@ These are authoring guidelines applied by judgment, not all linter-enforced.
 
 ## 6. Security & data integrity
 
-knarr runs with elevated privilege and is on the trust path for content integrity
+ocicfs runs with elevated privilege and is on the trust path for content integrity
 (it performs `mount(2)`, manages a content-addressed store, and verifies fs-verity
 and content digests). Treat that surface with care.
 
@@ -134,7 +134,7 @@ and content digests). Treat that surface with care.
 
 ## 8. Git & commit conventions
 
-knarr follows the composefs project's commit style (Linux-kernel style), not
+ocicfs follows the composefs project's commit style (Linux-kernel style), not
 Conventional Commits.
 
 - **Commit on request only:** Do not stage or commit automatically. Make code
@@ -143,7 +143,7 @@ Conventional Commits.
 - **Branching:** Develop on branches based off `main`; pull requests target
   `main`. Do not commit directly to `main`.
 - **Subject:** `<context>: Capitalized imperative subject`, where `<context>` is
-  the area of change (e.g. `pull`, `mount`, `cas`, `cmd/knarr`, `docs`). Keep the
+  the area of change (e.g. `pull`, `mount`, `cas`, `cmd/ocicfs`, `docs`). Keep the
   subject ≤ 50 characters (hard ceiling 72); no trailing period.
 - **Body Wrap:** Separate the body with a blank line and hard-wrap it at 72
   characters.
@@ -176,7 +176,7 @@ A change is complete only when, at minimum:
 
 - `gofmt` reports no diffs, and `make vet`, `make test`, and `make build` pass
   cleanly.
-- Changes touching knarr's privileged paths (mount, fs-verity, CAS build)
+- Changes touching ocicfs's privileged paths (mount, fs-verity, CAS build)
   additionally pass the privileged test target.
 - Concurrency-sensitive changes pass the race detector
   (`go test -race ./...`).
@@ -200,7 +200,7 @@ integrity-verified storage engine:
   both code and tests.
 - **Define trust boundaries explicitly.** Mark data and components as trusted,
   untrusted, authenticated, mutable, or attacker-controlled where it matters.
-- **Separate policy from mechanism.** knarr provides primitives, not lifecycle
+- **Separate policy from mechanism.** ocicfs provides primitives, not lifecycle
   policy; keep decision logic out of the execution mechanics.
 - **Design failure paths first.** Account for partial state, interrupted
   execution, and power loss; make invalid states unrepresentable, and fail closed

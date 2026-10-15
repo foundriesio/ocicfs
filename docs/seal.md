@@ -1,6 +1,6 @@
-# Sealing an image (`knarr seal`)
+# Sealing an image (`ocicfs seal`)
 
-`knarr seal` is a publisher-side command that seals **one platform per call**.
+`ocicfs seal` is a publisher-side command that seals **one platform per call**.
 For a digest-pinned image manifest it computes the composefs integrity digests
 and records them as annotations, then pushes the annotated manifest back to
 the same repository. It reconstructs the platform's merged composefs image
@@ -15,11 +15,11 @@ writes two annotations:
 Both values are recorded as bare lowercase hex. The annotations are defined
 by the upstream
 [composefs OCI sealing specification](https://github.com/composefs/composefs-rs/blob/main/crates/composefs-oci/src/sealing_spec.rs),
-which knarr follows verbatim.
+which ocicfs follows verbatim.
 
 ```sh
 digest=$(crane digest ghcr.io/example/app:1.2.3)
-knarr seal "ghcr.io/example/app@$digest"
+ocicfs seal "ghcr.io/example/app@$digest"
 ```
 
 When the reference names a multi-platform **image index**, `--platform`
@@ -32,8 +32,8 @@ even fetched. The printed sealed digest is the **updated index's**, so a whole
 index is sealed by chaining calls, each feeding the previous output digest:
 
 ```sh
-s1=$(knarr seal "ghcr.io/example/app@$digest" --platform linux/amd64 --format json | jq -r .sealed_ref)
-s2=$(knarr seal "$s1" --platform linux/arm64 --format json | jq -r .sealed_ref)
+s1=$(ocicfs seal "ghcr.io/example/app@$digest" --platform linux/amd64 --format json | jq -r .sealed_ref)
+s2=$(ocicfs seal "$s1" --platform linux/arm64 --format json | jq -r .sealed_ref)
 ```
 
 A partially sealed index is a valid intermediate state: an unsealed platform
@@ -99,13 +99,13 @@ own calls.
 images and OCI artifacts delivered as tar layers — ML models, data bundles —
 whose trees carry no `/usr` for the
 [canonical transforms](https://github.com/composefs/composefs-rs/blob/main/crates/composefs-oci/src/design.rs)
-to work from. knarr builds such trees with a deterministic fallback
-construction, and the option records that fallback digest under knarr's own
+to work from. ocicfs builds such trees with a deterministic fallback
+construction, and the option records that fallback digest under ocicfs's own
 annotations:
 
-- `io.foundries.knarr.composefs.fallback.v1.fsverity-sha256-12` on the
+- `io.foundries.ocicfs.composefs.fallback.v1.fsverity-sha256-12` on the
   manifest, and
-- `io.foundries.knarr.composefs.config.fsverity-sha256-12` on the config
+- `io.foundries.ocicfs.composefs.config.fsverity-sha256-12` on the config
   descriptor.
 
 The shared `composefs.merged.erofs.v1.*` namespace is never used for a
@@ -140,7 +140,7 @@ already holds every byte seal needs:
 docker buildx build --provenance=false -o type=oci,tar=false,dest=./layout .
 crane push ./layout ghcr.io/example/app:1.2.3
 digest=$(crane digest ghcr.io/example/app:1.2.3)
-knarr seal --from-dir ./layout "ghcr.io/example/app@$digest"
+ocicfs seal --from-dir ./layout "ghcr.io/example/app@$digest"
 ```
 
 Or export an already-published image with `crane pull`. With `--platform`
@@ -150,7 +150,7 @@ layout's own index entry:
 ```sh
 crane pull --platform linux/amd64 --format=oci ghcr.io/example/app:1.2.3 ./layout
 digest=$(jq -r '.manifests[0].digest' ./layout/index.json)
-knarr seal --from-dir ./layout "ghcr.io/example/app@$digest"
+ocicfs seal --from-dir ./layout "ghcr.io/example/app@$digest"
 ```
 
 `docker save` piped through `tar` is a third source when the daemon runs the
@@ -163,7 +163,7 @@ published — don't seal from those:
 ```sh
 docker save ghcr.io/example/app:1.2.3 | tar -x -C ./layout
 digest=$(jq -r '.manifests[0].digest' ./layout/index.json)
-knarr seal --from-dir ./layout "ghcr.io/example/app@$digest" --platform linux/amd64
+ocicfs seal --from-dir ./layout "ghcr.io/example/app@$digest" --platform linux/amd64
 ```
 
 Only the reads move local: the annotated manifests are still pushed to the
@@ -182,15 +182,15 @@ the command is fully offline.
 
 The dev container serves zot, a real OCI registry, at `127.0.0.1:5000`, and
 keeps the workspace `bin/` directory on `PATH`, so after `make build` the
-examples' bare `knarr` resolves to the freshly built binary and sealing is
+examples' bare `ocicfs` resolves to the freshly built binary and sealing is
 testable end to end by hand without external push access (busybox is a
 multi-arch index, so the platform must be selected):
 
 ```sh
 crane copy docker.io/library/busybox:latest 127.0.0.1:5000/app
 digest=$(crane digest 127.0.0.1:5000/app:latest)
-knarr seal "127.0.0.1:5000/app@$digest" --platform linux/amd64
-knarr pull "127.0.0.1:5000/app@<sealed digest>"
+ocicfs seal "127.0.0.1:5000/app@$digest" --platform linux/amd64
+ocicfs pull "127.0.0.1:5000/app@<sealed digest>"
 ```
 
 The registry persists for the container's lifetime (storage under
@@ -206,11 +206,11 @@ manifest under its own new digest and prints its reference (resealing is a
 no-op, so rerunning seal just reports the sealed manifest's reference):
 
 ```sh
-mref=$(knarr seal "127.0.0.1:5000/app@$digest" --platform linux/amd64 \
+mref=$(ocicfs seal "127.0.0.1:5000/app@$digest" --platform linux/amd64 \
         --format json | jq -r '.platforms[0].sealed_manifest_ref')
 tampered=$(crane mutate "$mref" \
         --annotation composefs.merged.erofs.v1.fsverity-sha256-12=$(printf '%064d' 0))
-knarr pull "$tampered"
+ocicfs pull "$tampered"
 ```
 
 The pull materializes the content, measures it, finds the recorded annotation
@@ -221,7 +221,7 @@ and against a restart over an already-stored image.
 `scripts/seal-crosscheck.sh <image-uri>` verifies the sealed digest for any
 image (current platform of an index) against three independent implementations:
 `cfsctl oci compute-id` must reproduce it bit-for-bit, the Rust `mkcomposefs`
-(`cfsctl mkcomposefs --from-file`, the drop-in for the C binary knarr runs) must
+(`cfsctl mkcomposefs --from-file`, the drop-in for the C binary ocicfs runs) must
 rebuild the sealed image's own dump into the identical bytes, and a fourth build
 from an `umoci` flatten through the C `mkcomposefs` must agree at least on the
 full tree (bit-for-bit when the image carries no hardlinks — see the script

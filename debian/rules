@@ -20,14 +20,14 @@ override_dh_auto_test:
 	:
 
 override_dh_auto_install:
-	install -D -m 0755 bin/knarr debian/knarr/usr/bin/knarr
-	bin/knarr completion bash > knarr.bash
-	install -D -m 0644 knarr.bash debian/knarr/usr/share/bash-completion/completions/knarr
-	bin/knarr completion zsh > knarr.zsh
-	install -D -m 0644 knarr.zsh debian/knarr/usr/share/zsh/vendor-completions/_knarr
+	install -D -m 0755 bin/ocicfs debian/ocicfs/usr/bin/ocicfs
+	bin/ocicfs completion bash > ocicfs.bash
+	install -D -m 0644 ocicfs.bash debian/ocicfs/usr/share/bash-completion/completions/ocicfs
+	bin/ocicfs completion zsh > ocicfs.zsh
+	install -D -m 0644 ocicfs.zsh debian/ocicfs/usr/share/zsh/vendor-completions/_ocicfs
 
 override_dh_auto_clean:
-	rm -rf bin knarr.bash knarr.zsh
+	rm -rf bin ocicfs.bash ocicfs.zsh
 
 # The binary is already stripped (-s -w); there is no DWARF for dwz.
 override_dh_dwz:

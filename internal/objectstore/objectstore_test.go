@@ -17,8 +17,8 @@ import (
 	"github.com/opencontainers/go-digest"
 	"golang.org/x/sys/unix"
 
-	"github.com/foundriesio/knarr/internal/devtest"
-	"github.com/foundriesio/knarr/internal/verity"
+	"github.com/foundriesio/ocicfs/internal/devtest"
+	"github.com/foundriesio/ocicfs/internal/verity"
 )
 
 // newTestStore opens a store on a plain temp dir, for paths that do not exercise
@@ -76,7 +76,7 @@ func skipIfNoVerity(t *testing.T, err error) {
 func TestWriteObjectRoundTrip(t *testing.T) {
 	s := newVerityStore(t)
 	ctx := context.Background()
-	content := []byte("hello knarr object")
+	content := []byte("hello ocicfs object")
 
 	d, fsv, err := writeObject(t, s, ctx, bytes.NewReader(content))
 	skipIfNoVerity(t, err)

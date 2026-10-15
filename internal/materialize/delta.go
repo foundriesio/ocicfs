@@ -19,12 +19,12 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sys/unix"
 
-	"github.com/foundriesio/knarr/internal/composefs"
-	"github.com/foundriesio/knarr/internal/imagestore"
-	"github.com/foundriesio/knarr/internal/objectstore"
-	"github.com/foundriesio/knarr/internal/ocichain"
-	"github.com/foundriesio/knarr/internal/rootfs"
-	"github.com/foundriesio/knarr/internal/zstdchunked"
+	"github.com/foundriesio/ocicfs/internal/composefs"
+	"github.com/foundriesio/ocicfs/internal/imagestore"
+	"github.com/foundriesio/ocicfs/internal/objectstore"
+	"github.com/foundriesio/ocicfs/internal/ocichain"
+	"github.com/foundriesio/ocicfs/internal/rootfs"
+	"github.com/foundriesio/ocicfs/internal/zstdchunked"
 )
 
 // The bounds within which a layer's missing files are fetched as byte ranges;

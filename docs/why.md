@@ -1,6 +1,6 @@
-# Why knarr exists
+# Why ocicfs exists
 
-knarr is an OCI-native content delivery and mount engine for IoT and edge
+ocicfs is an OCI-native content delivery and mount engine for IoT and edge
 devices. It exists because the mainstream container stack was designed for
 data-center assumptions: reliable networks, plentiful CPU and memory, large
 storage, and always-reachable registries.
@@ -31,7 +31,7 @@ bandwidth, storage, and boot time that many products cannot afford.
 
 ## Constraints
 
-knarr is deliberately constrained so it can fit into existing OSS and device
+ocicfs is deliberately constrained so it can fit into existing OSS and device
 ecosystems:
 
 - Wire format is standard OCI v1.1, no new media types.
@@ -50,14 +50,14 @@ ecosystems:
 
 ## Non-goals
 
-knarr provides primitives, not lifecycle policy. It does not own deployment
+ocicfs provides primitives, not lifecycle policy. It does not own deployment
 decisions, rollout state, service supervision, rollback policy, or container
 execution.
 
-Specifically, knarr does not provide `run`, `deploy`, `update`, `stop`, or
+Specifically, ocicfs does not provide `run`, `deploy`, `update`, `stop`, or
 `logs`-style lifecycle behavior. Those decisions belong to the upper-layer
-agent or runtime that calls knarr. In the container runtime integration path,
-docker/containerd uses `cfs-snapshotter` as the adapter; knarr itself prepares
+agent or runtime that calls ocicfs. In the container runtime integration path,
+docker/containerd uses `cfs-snapshotter` as the adapter; ocicfs itself prepares
 and mounts content.
 
 ## Why existing tools are not enough
@@ -70,7 +70,7 @@ systems, not OCI-native application content. composefs gives the right integrity
 and mount substrate but not the pull, resume, air-gap, trust, and hold/release
 primitives a device update agent needs.
 
-knarr fills that composition gap: it keeps the OCI ecosystem on the wire, stores
+ocicfs fills that composition gap: it keeps the OCI ecosystem on the wire, stores
 only verified decompressed content on disk, mounts prepared trees through
 composefs, and leaves lifecycle policy to the layer that already owns update
 decisions.

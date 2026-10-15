@@ -8,7 +8,7 @@
 #
 # Usage:
 #   release-artifacts.sh version           print the artifact version string
-#   release-artifacts.sh archive <arch>    pack bin/knarr into the .tar.gz
+#   release-artifacts.sh archive <arch>    pack bin/ocicfs into the .tar.gz
 #   release-artifacts.sh checksums         write the checksums file over dist/
 #
 # The artifact version is the release tag without the leading v (0.1.0,
@@ -26,12 +26,12 @@ version() {
 archive() {
     arch=${1:?usage: release-artifacts.sh archive <arch>}
     ver=$(version)
-    base="knarr_${ver}_linux_${arch}"
+    base="ocicfs_${ver}_linux_${arch}"
 
     stage=$(mktemp -d)
     trap 'rm -rf "$stage"' EXIT
     mkdir -p "$stage/$base" dist
-    install -m 0755 bin/knarr "$stage/$base/knarr"
+    install -m 0755 bin/ocicfs "$stage/$base/ocicfs"
     install -m 0644 LICENSE README.md INSTALL.md "$stage/$base/"
 
     # Deterministic contents: fixed order, numeric root ownership, commit
@@ -45,19 +45,19 @@ archive() {
 
 checksums() {
     ver=$(version)
-    out="knarr_${ver}_checksums.txt"
+    out="ocicfs_${ver}_checksums.txt"
     cd dist
     rm -f "$out"
     # GitHub replaces "~" in release asset names, so an rc .deb
     # (0.1.0~rc.1) would be served under a name the checksums file does
     # not list. Apply the same substitution before checksumming; dpkg
     # reads the version from the package metadata, not the filename.
-    for f in knarr_*~*; do
+    for f in ocicfs_*~*; do
         if [ -e "$f" ]; then
             mv "$f" "$(printf '%s' "$f" | tr '~' '.')"
         fi
     done
-    sha256sum knarr_* > "$out"
+    sha256sum ocicfs_* > "$out"
     echo "dist/$out"
 }
 

@@ -19,10 +19,10 @@ import (
 	"github.com/opencontainers/go-digest"
 	"golang.org/x/sys/unix"
 
-	"github.com/foundriesio/knarr/internal/devtest"
-	"github.com/foundriesio/knarr/internal/objectstore"
-	"github.com/foundriesio/knarr/internal/rootfs"
-	"github.com/foundriesio/knarr/internal/verity"
+	"github.com/foundriesio/ocicfs/internal/devtest"
+	"github.com/foundriesio/ocicfs/internal/objectstore"
+	"github.com/foundriesio/ocicfs/internal/rootfs"
+	"github.com/foundriesio/ocicfs/internal/verity"
 )
 
 // mountBody is the fixture file's payload. It exceeds the inline threshold, so
@@ -59,8 +59,8 @@ func TestReadOnlyRejectsInvalidSpec(t *testing.T) {
 // object, and the source name mounts are identified by — so a refactor
 // dropping any of them fails here.
 func TestOverlayOptionsPinTrustPosture(t *testing.T) {
-	got := overlayOptions("/run/knarr/mount-1", "/objects")
-	want := "lowerdir=/run/knarr/mount-1::/objects,redirect_dir=on,metacopy=on,verity=require"
+	got := overlayOptions("/run/ocicfs/mount-1", "/objects")
+	want := "lowerdir=/run/ocicfs/mount-1::/objects,redirect_dir=on,metacopy=on,verity=require"
 	if got != want {
 		t.Fatalf("options = %q, want %q", got, want)
 	}

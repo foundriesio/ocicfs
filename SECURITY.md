@@ -1,6 +1,6 @@
 # Security Policy
 
-We take the security of knarr seriously. Because knarr runs with elevated
+We take the security of ocicfs seriously. Because ocicfs runs with elevated
 privileges (it performs `mount(2)`, manages a content-addressed store, and
 verifies fs-verity / content digests), security reports are handled with care and
 under coordinated disclosure.
@@ -39,7 +39,7 @@ We follow a Coordinated Vulnerability Disclosure (CVD) process:
 
 ## On Homing under composefs
 
-knarr is developed with the goal of homing under the
+ocicfs is developed with the goal of homing under the
 [composefs](https://github.com/composefs) organization. Upon acceptance, security
 handling will follow that community's process, and this document will be updated
 at that time.

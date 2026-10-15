@@ -30,14 +30,14 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/foundriesio/knarr/internal/composefs"
-	"github.com/foundriesio/knarr/internal/imagestore"
-	"github.com/foundriesio/knarr/internal/objectstore"
-	"github.com/foundriesio/knarr/internal/ocichain"
-	"github.com/foundriesio/knarr/internal/ocilayout"
-	"github.com/foundriesio/knarr/internal/octest"
-	"github.com/foundriesio/knarr/internal/rootfs"
-	"github.com/foundriesio/knarr/internal/zstdchunked"
+	"github.com/foundriesio/ocicfs/internal/composefs"
+	"github.com/foundriesio/ocicfs/internal/imagestore"
+	"github.com/foundriesio/ocicfs/internal/objectstore"
+	"github.com/foundriesio/ocicfs/internal/ocichain"
+	"github.com/foundriesio/ocicfs/internal/ocilayout"
+	"github.com/foundriesio/ocicfs/internal/octest"
+	"github.com/foundriesio/ocicfs/internal/rootfs"
+	"github.com/foundriesio/ocicfs/internal/zstdchunked"
 )
 
 // The zstd:chunked fixture layouts, all built for linux/amd64.

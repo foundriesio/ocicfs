@@ -1,12 +1,12 @@
 # Hands-on: building and verifying a composefs image (publisher → device)
 
-This is a runnable walkthrough of knarr's on-disk substrate: a content-addressed
+This is a runnable walkthrough of ocicfs's on-disk substrate: a content-addressed
 object store, per-file fs-verity, and a composefs/EROFS image that redirects
 into the store. It uses only the upstream `mkcomposefs` and `composefs-info` tools so
-you can build and inspect the exact artifacts knarr produces — by hand — before
+you can build and inspect the exact artifacts ocicfs produces — by hand — before
 reading the code.
 
-knarr's trust model has **two sides**, and every step below is tagged with the one it
+ocicfs's trust model has **two sides**, and every step below is tagged with the one it
 belongs to:
 
 - **[publisher]** (CI side) builds the composefs image, measures its fs-verity, and
@@ -33,7 +33,7 @@ From the repo root, open a shell in the dev container (it has `mkcomposefs` and
 
 No elevated privilege is needed: `composefs-info measure-file` computes a file's
 fs-verity digest in userspace, so you do not need an fs-verity-capable mount to see
-the digests. (On a real device knarr also *enables* kernel fs-verity on each object;
+the digests. (On a real device ocicfs also *enables* kernel fs-verity on each object;
 the digest values are the same.)
 
 Prefer one command? [`docs/storage-demo.sh`](storage-demo.sh) runs this entire
@@ -62,7 +62,7 @@ into the EROFS metadata (its bytes in the `CONTENT` column, no object), exactly 
 ```sh
 cd "$(mktemp -d)"
 mkdir -p tree/etc tree/bin
-printf 'hello from knarr' > tree/hello        # 16 bytes
+printf 'hello from ocicfs' > tree/hello        # 16 bytes
 printf 'k=v\n'            > tree/etc/app.conf  # 4 bytes
 head -c 200 /dev/random   > tree/bin/tool      # 200 random bytes (a stand-in binary)
 ```
@@ -74,8 +74,8 @@ head -c 200 /dev/random   > tree/bin/tool      # 200 random bytes (a stand-in bi
 
 Rather than hand-write a dump, build one straight from the tree and let
 `composefs-info` print it. Note that `mkcomposefs` **inlines** files ≤ 64 bytes — their
-content lands in the `CONTENT` column with no backing object. knarr inlines at the
-same threshold, so these small-file lines are already in knarr's form:
+content lands in the `CONTENT` column with no backing object. ocicfs inlines at the
+same threshold, so these small-file lines are already in ocicfs's form:
 
 ```sh
 mkcomposefs --use-epoch --skip-xattrs --min-version=1 --max-version=1 tree inlined.cfs
@@ -86,12 +86,12 @@ composefs-info dump inlined.cfs
 / 4096 40755 4 0 0 0 0.0 - - -
 /bin/tool 200 100644 1 0 0 0 0.0 28/4c22bb..20c7 - 284c22bb..20c7   <- by-digest (>64 B)
 /etc/app.conf 4 100644 1 0 0 0 0.0 - k=v\n -                        <- inlined (<=64 B)
-/hello 16 100644 1 0 0 0 0.0 - hello\x20from\x20knarr -             <- inlined (<=64 B)
+/hello 16 100644 1 0 0 0 0.0 - hello\x20from\x20ocicfs -             <- inlined (<=64 B)
 ```
 
 ### 3. [publisher] Externalize the files over 64 bytes
 
-knarr keeps files ≤ 64 bytes inlined (just as `mkcomposefs` already emitted them)
+ocicfs keeps files ≤ 64 bytes inlined (just as `mkcomposefs` already emitted them)
 and turns only **larger** regular files into by-digest objects. This filter, for
 each regular file over 64 bytes, stores it under its content sha256, hardlinks it
 into the fs-verity view, then emits `PAYLOAD` = the `<vv>/<rest>` fs-verity
@@ -100,7 +100,7 @@ small files, directories, and symlinks pass through unchanged:
 
 ```sh
 mkdir -p objects/sha256 objects/fsverity-sha256-12
-to_knarr() {
+to_ocicfs() {
   while IFS= read -r line; do
     set -- $line                       # PATH SIZE MODE NLINK UID GID RDEV MTIME PAYLOAD CONTENT DIGEST
     case $1 in *\\*) echo "escaped PATH unsupported: $1" >&2; exit 1;; esac
@@ -119,14 +119,14 @@ to_knarr() {
     fi
   done
 }
-composefs-info dump inlined.cfs | to_knarr > image.dump
+composefs-info dump inlined.cfs | to_ocicfs > image.dump
 cat image.dump
 ```
 
 ```
 /bin/tool 200 100644 1 0 0 0 0.0 28/4c22bb..20c7 - 284c22bb..20c7   <- externalized (>64 B)
 /etc/app.conf 4 100644 1 0 0 0 0.0 - k=v\n -                        <- still inlined (<=64 B)
-/hello 16 100644 1 0 0 0 0.0 - hello\x20from\x20knarr -             <- still inlined (<=64 B)
+/hello 16 100644 1 0 0 0 0.0 - hello\x20from\x20ocicfs -             <- still inlined (<=64 B)
 ```
 
 Only `tool` (over 64 bytes) becomes by-digest; the two small files keep their inline
@@ -135,7 +135,7 @@ derive from its fs-verity digest — the redirect resolves through the
 fs-verity view, exactly like upstream's `--digest-store` layout. This is the
 `internal/composefs` `Entry`/`WriteDump` format, and the lines map one-to-one onto
 the [composefs-dump(5)](https://github.com/composefs/composefs/blob/v1.0.8/man/composefs-dump.md)
-columns. (knarr still *stores* each object under its content sha256 — the name the
+columns. (ocicfs still *stores* each object under its content sha256 — the name the
 OCI layer TOC already carries, which is what dedup and delta fetch key on — and the
 view hardlink gives the same inode its fs-verity name for the mount data plane.)
 
@@ -151,7 +151,7 @@ echo "sealed fs-verity digest: $SEAL"
 # e.g. 57a706da69bdedab74d77389613d40bd87ae8097d93ef576baf10a2225fdd8eb
 ```
 
-In real knarr the publisher ships standard zstd:chunked OCI layers and publishes `$SEAL`
+In real ocicfs the publisher ships standard zstd:chunked OCI layers and publishes `$SEAL`
 in the image's OCI metadata; `image.dump` + `objects/` here stand in for the content the
 device will reconstruct.
 
@@ -190,7 +190,7 @@ is exactly the set the device would still need to pull — the kernel of delta f
 
 ## How this maps to the code
 
-| Walkthrough | knarr code | Tests |
+| Walkthrough | ocicfs code | Tests |
 |---|---|---|
 | fs-verity enable/measure | `internal/verity` | `internal/verity/verity_test.go` |
 | content-addressed object store | `internal/objectstore` | `internal/objectstore/objectstore_test.go` |
@@ -208,7 +208,7 @@ go test -v -run TestWriteImage ./internal/composefs/
 
 The publisher seal verifies on the device only because both builds use the same
 recipe: V1 format (`--min-version=1`), per-file mtimes (here pinned with
-`--use-epoch` so this hand-run reproduces; real knarr carries each file's mtime
+`--use-epoch` so this hand-run reproduces; real ocicfs carries each file's mtime
 from the layer tar), files ≤ 64 bytes inlined (`CONTENT` = the file bytes) and
 larger files by digest (fs-verity-keyed redirects), sorted entries, and consistent
 xattr handling. Both sides feed the **same** `--from-file` dump, so every column —
@@ -220,6 +220,6 @@ inputs give a byte-identical EROFS, hence an identical fs-verity digest.
 This walkthrough stops at building and verifying. Mounting an image — the
 EROFS metadata over a loop device plus an overlay with
 `objects/fsverity-sha256-12` as its data-only lower — needs root privilege
-and kernel support (EROFS, fs-verity, overlayfs). Mounting is knarr's `mount`
+and kernel support (EROFS, fs-verity, overlayfs). Mounting is ocicfs's `mount`
 verb — see [mount.md](mount.md) — and is exercised there rather than in this
 substrate walkthrough.

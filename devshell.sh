@@ -3,7 +3,7 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: Apache-2.0
 #
-# devshell.sh — run a shell or a command in the knarr dev container (.devcontainer).
+# devshell.sh — run a shell or a command in the ocicfs dev container (.devcontainer).
 #
 #   ./devshell.sh             Bring the dev container up, open a shell in it, and
 #                             remove the container when that shell exits.

@@ -31,7 +31,7 @@
 // rootfs's apparent size as display metadata (optional; absent in bindings
 // written before it existed). The file is written atomically and durably.
 //
-//	{ "schema": "application/vnd.knarr.cfs-binding.v1+json",
+//	{ "schema": "application/vnd.ocicfs.cfs-binding.v1+json",
 //	  "platform": {"os":"linux","architecture":"arm64","variant":"v8"},
 //	  "rootfs": { "type":"composefs",
 //	    "descriptor":  {"mediaType":"...composefs.image.v1+erofs","digest":"sha256:...","size":N},
@@ -68,11 +68,11 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/foundriesio/knarr/internal/digestutil"
-	"github.com/foundriesio/knarr/internal/durable"
+	"github.com/foundriesio/ocicfs/internal/digestutil"
+	"github.com/foundriesio/ocicfs/internal/durable"
 )
 
-// Store writes prepared-image bindings under the knarr store root.
+// Store writes prepared-image bindings under the ocicfs store root.
 type Store struct {
 	root string
 }
@@ -419,7 +419,7 @@ func bindingPlatform(path, name string) (ocispec.Platform, error) {
 }
 
 const (
-	bindingSchema = "application/vnd.knarr.cfs-binding.v1+json"
+	bindingSchema = "application/vnd.ocicfs.cfs-binding.v1+json"
 
 	// The object-store tuple is the binding's compatibility key: a binding
 	// carrying any other tuple is rejected as a cache miss, so the schema string
@@ -518,7 +518,7 @@ func validateBinding(doc bindingDoc, wantPlatform platformDoc) error {
 		// A binding written under a superseded object-store scheme (or any other
 		// tuple) is a cache miss: the caller rebuilds it rather than reusing a
 		// binding whose redirects resolve through a different view. Joining
-		// ErrNotFound routes it through the same "run knarr pull" guidance a
+		// ErrNotFound routes it through the same "run ocicfs pull" guidance a
 		// missing binding gets.
 		return fmt.Errorf("imagestore: unsupported object store %#v: %w", doc.RootFS.ObjectStore, ErrNotFound)
 	}

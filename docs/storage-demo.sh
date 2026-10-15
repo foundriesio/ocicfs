@@ -5,7 +5,7 @@
 #
 # storage-demo.sh — runnable companion to docs/storage-walkthrough.md.
 #
-# Plays both sides of knarr's trust model on one machine using only the upstream
+# Plays both sides of ocicfs's trust model on one machine using only the upstream
 # mkcomposefs and composefs-info tools:
 #   [publisher] builds a composefs image from a sample tree — files over 64 bytes
 #               stored by content sha256 with an fs-verity-keyed hardlink view and
@@ -14,9 +14,9 @@
 #   [device]    rebuilds the image from the same dump + objects and verifies the
 #               measured digest matches the seal.
 #
-# It deliberately uses only upstream tools and no knarr code, so it validates the
-# composefs/fs-verity format and trust-model guarantees that knarr's implementation
-# builds on, independently of knarr itself. It is a demonstration of the substrate,
+# It deliberately uses only upstream tools and no ocicfs code, so it validates the
+# composefs/fs-verity format and trust-model guarantees that ocicfs's implementation
+# builds on, independently of ocicfs itself. It is a demonstration of the substrate,
 # not a general-purpose image builder. Run it inside the dev container (./devshell.sh); no privilege is needed —
 # composefs-info measures fs-verity in userspace.
 
@@ -35,7 +35,7 @@ cd "$work"
 
 echo "== [publisher] sample tree =="
 mkdir -p tree/etc tree/bin
-printf 'hello from knarr' >tree/hello       # 16 B  -> mkcomposefs inlines
+printf 'hello from ocicfs' >tree/hello       # 16 B  -> mkcomposefs inlines
 printf 'k=v\n' >tree/etc/app.conf           # 4 B   -> mkcomposefs inlines
 head -c 200 /dev/random >tree/bin/tool      # 200 B -> by-digest (random content)
 find tree -mindepth 1 -printf '%y %8s  %p\n' | sort -k3
@@ -48,7 +48,7 @@ composefs-info dump inlined.cfs
 echo
 echo "== [publisher] externalize files over 64 bytes (+ build object store and fs-verity view) =="
 mkdir -p objects/sha256 objects/fsverity-sha256-12
-to_knarr() {
+to_ocicfs() {
 	while IFS= read -r line; do
 		# shellcheck disable=SC2086 # dump fields are space-separated and unescaped here
 		set -- $line # PATH SIZE MODE NLINK UID GID RDEV MTIME PAYLOAD CONTENT DIGEST
@@ -61,7 +61,7 @@ to_knarr() {
 			;;
 		esac
 		f="tree$1"
-		# knarr inlines files of <=64 bytes exactly as mkcomposefs already did, so
+		# ocicfs inlines files of <=64 bytes exactly as mkcomposefs already did, so
 		# those dump lines pass through untouched; only larger regular files become
 		# by-digest objects. A regular file's SIZE column ($2) is its byte length.
 		if [ -f "$f" ] && [ ! -L "$f" ] && [ "$2" -gt 64 ]; then
@@ -77,7 +77,7 @@ to_knarr() {
 		fi
 	done
 }
-composefs-info dump inlined.cfs | to_knarr >image.dump
+composefs-info dump inlined.cfs | to_ocicfs >image.dump
 cat image.dump
 
 echo

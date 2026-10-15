@@ -1,11 +1,11 @@
-# Pulling images (`knarr pull`)
+# Pulling images (`ocicfs pull`)
 
-`knarr pull` materializes an OCI image into the local store: it verifies the
+`ocicfs pull` materializes an OCI image into the local store: it verifies the
 descriptor chain, writes the decompressed per-file content and the metadata
 chain into the fs-verity-sealed object store, builds the composefs image, and
 records the image binding and reference.
 
-By default, knarr pulls from an OCI registry. `--from-dir` sideloads from a local
+By default, ocicfs pulls from an OCI registry. `--from-dir` sideloads from a local
 OCI image layout directory instead, for air-gapped or test workflows. A layer
 with a usable saved file list from an earlier pull is not read again (see
 [Layers Already Read](#layers-already-read)). `--delta` fetches only the files
@@ -15,7 +15,7 @@ the store lacks from zstd:chunked layers, for updates
 ## Prerequisites
 
 - A store on an **fs-verity-capable filesystem** (e.g. ext4 made with `-b 4096`).
-  knarr fails fast if the store root cannot enable fs-verity.
+  ocicfs fails fast if the store root cannot enable fs-verity.
 - `mkcomposefs` on `PATH` (from the composefs tools).
 - A registry reference (digest-pinned for production, tagged for testing), or a
   local OCI image layout and a digest-pinned reference when using `--from-dir`.
@@ -23,15 +23,15 @@ the store lacks from zstd:chunked layers, for updates
 ## Registry Pull
 
 In production, pull a digest-pinned reference — the pinned digest is the trust
-anchor, chosen and verified by whatever drives knarr:
+anchor, chosen and verified by whatever drives ocicfs:
 
 ```sh
 digest=$(crane digest ghcr.io/example/app:1.2.3)
-knarr pull "ghcr.io/example/app@$digest"
+ocicfs pull "ghcr.io/example/app@$digest"
 ```
 
-The store defaults to `/var/lib/knarr`; pass `--root <dir>` to use another
-location. On success, knarr prints the ref and stored digest:
+The store defaults to `/var/lib/ocicfs`; pass `--root <dir>` to use another
+location. On success, ocicfs prints the ref and stored digest:
 
 ```
 ghcr.io/example/app@sha256:<digest>	sha256:<digest>
@@ -40,18 +40,18 @@ ghcr.io/example/app@sha256:<digest>	sha256:<digest>
 Use `--format json` for machine-readable output:
 
 ```sh
-knarr pull "ghcr.io/example/app@$digest" --format json
+ocicfs pull "ghcr.io/example/app@$digest" --format json
 # {"ref":"ghcr.io/example/app@sha256:...","digest":"sha256:...","size":12288}
 ```
 
 For testing, a tag works too:
 
 ```sh
-knarr pull ghcr.io/example/app:1.2.3
+ocicfs pull ghcr.io/example/app:1.2.3
 # ghcr.io/example/app:1.2.3	sha256:<resolved digest>
 ```
 
-A tag is a mutable alias, not a trust anchor: knarr resolves it to the digest
+A tag is a mutable alias, not a trust anchor: ocicfs resolves it to the digest
 the registry currently serves (one extra round-trip) and from there runs the
 same digest-verified pull as a pinned reference. The resolution step trusts the
 registry, so pin digests in production — the printed digest is the one to pin.
@@ -63,13 +63,13 @@ recent pull recorded.
 ## The Printed Digest Is the Image Identity
 
 A tag usually resolves to an image *index*, which lists one manifest per
-platform. knarr keys an image by the manifest for the host platform, descending
+platform. ocicfs keys an image by the manifest for the host platform, descending
 one level inside the index's own digest-verified bytes to find it, so the digest
 `pull` prints is that manifest's — the image's **identity** — and not
 necessarily the digest the reference pinned:
 
 ```sh
-knarr pull ghcr.io/example/app:1.2.3
+ocicfs pull ghcr.io/example/app:1.2.3
 # ghcr.io/example/app:1.2.3	sha256:<the host platform's manifest>
 ```
 
@@ -91,7 +91,7 @@ Pull scans layers concurrently: `--ingest-workers N` sets how many layers are
 scanned at once (default 2). On a registry pull each layer is streamed from the
 registry as it is scanned, so N is also the number of concurrent blob
 downloads. The cap is per engine, shared by every build that engine runs; a
-`knarr pull` run beside a daemon adds its own workers to the daemon's. Scanning
+`ocicfs pull` run beside a daemon adds its own workers to the daemon's. Scanning
 is bound by the store's write and fs-verity sealing throughput, so more than
 the default helps only on fast storage; on an SD card or eMMC the default is
 the right setting.
@@ -110,7 +110,7 @@ This yields `./layout/` containing `oci-layout`, `index.json`, and
 
 ```sh
 digest=$(jq -r '.manifests[0].digest' ./layout/index.json)
-knarr pull --from-dir ./layout "app@$digest"
+ocicfs pull --from-dir ./layout "app@$digest"
 ```
 
 The layout's `index.json` may name an index rather than a manifest; pinning it
@@ -138,8 +138,8 @@ or it does not decode. An update that keeps its lower layers, with their
 file lists in place, then reads only the layers that changed:
 
 ```sh
-knarr pull "ghcr.io/example/app@$previous"
-knarr pull "ghcr.io/example/app@$next"   # reads only the layers $previous lacks
+ocicfs pull "ghcr.io/example/app@$previous"
+ocicfs pull "ghcr.io/example/app@$next"   # reads only the layers $previous lacks
 ```
 
 The file list names every stored file by its sha256 and size and carries the
@@ -167,7 +167,7 @@ a warning, and the layer is read. A file list that cannot be saved, or is
 too large to be, is a warning too, never a failed pull.
 
 A saved file list is local state, relied on as the image binding is: on the
-assumption that nothing but knarr writes to the store. Its checksum catches
+assumption that nothing but ocicfs writes to the store. Its checksum catches
 corruption, not a deliberate change, and nothing re-checks it against the
 `diff_id` afterwards. What a pull builds from it is checked against a value
 the publisher pinned only for a sealed image (see
@@ -186,7 +186,7 @@ leave them in place.
 
 This applies to a registry pull, to `--from-dir`, to an embedder's
 `NewBuild`, and in a `--delta` pull to the layers without a usable table of
-contents. `knarr gc` deletes the saved file lists of layers no wanted image
+contents. `ocicfs gc` deletes the saved file lists of layers no wanted image
 lists (see [gc.md](gc.md)).
 
 ## Delta Pull
@@ -198,21 +198,21 @@ its table of contents and the files the store does not already hold, as byte
 ranges of the layer blob:
 
 ```sh
-knarr hold --holder delta-base "ghcr.io/example/app@$previous"
-knarr pull --delta "ghcr.io/example/app@$next"
+ocicfs hold --holder delta-base "ghcr.io/example/app@$previous"
+ocicfs pull --delta "ghcr.io/example/app@$next"
 # ... switch the workload over to $next ...
-knarr release --holder delta-base "ghcr.io/example/app@$previous"
-knarr remove "ghcr.io/example/app@$previous"
-knarr gc
+ocicfs release --holder delta-base "ghcr.io/example/app@$previous"
+ocicfs remove "ghcr.io/example/app@$previous"
+ocicfs gc
 ```
 
 The hold is the point: a delta saves bytes only while the previous release's
 files are still in the store, and `gc` reclaims an image nothing wants. The
-agent driving knarr holds release N−1 under a holder of its own — `delta-base`
+agent driving ocicfs holds release N−1 under a holder of its own — `delta-base`
 above — before pulling N, so that whatever else it does meanwhile (repointing
 a tag, removing the old reference to make room) cannot cost the base, and
 releases it once N is in place; a plain `remove` declines while the hold
-stands, so the release comes first. knarr adds no keep-previous policy of its
+stands, so the release comes first. ocicfs adds no keep-previous policy of its
 own. The same sequence works with `--from-dir` against a layout directory.
 
 What a delta can save is bounded by the share of file bytes the two releases
@@ -297,7 +297,7 @@ rather than silently fetching whole layers. It is a `Pull` option only:
 Pull writes the object store plus the binding and reference indexes:
 
 ```sh
-find /var/lib/knarr -maxdepth 5 -type f | head
+find /var/lib/ocicfs -maxdepth 5 -type f | head
 # .../images/sha256/<aa>/<rest>/linux-amd64.json
 # .../objects/sha256/<aa>/<rest>
 ```
@@ -315,13 +315,13 @@ it.
 The merged-image annotation a pull holds the image to is chosen by what the
 manifest carries, as `mount` chooses it, and never by how the image came
 out: the standard `composefs.merged.erofs.v1.fsverity-sha256-12` when it is
-present, else the knarr fallback annotation
-(`io.foundries.knarr.composefs.fallback.v1.fsverity-sha256-12`, written by
-`knarr seal --allow-non-canonical`). The chosen annotation must match the
+present, else the ocicfs fallback annotation
+(`io.foundries.ocicfs.composefs.fallback.v1.fsverity-sha256-12`, written by
+`ocicfs seal --allow-non-canonical`). The chosen annotation must match the
 measured fs-verity digest of the merged image exactly; a mismatch or a
 malformed value aborts the pull. When both are present the standard one
 decides and the fallback one is not read. A manifest whose only annotation
-under the `composefs.merged.erofs.v1.` prefix is of a kind knarr does not
+under the `composefs.merged.erofs.v1.` prefix is of a kind ocicfs does not
 recognize is sealed in a way it cannot verify, and the pull fails rather
 than treat the image as unsealed. An image carrying no merged-image
 annotation is a valid unsealed pull.
@@ -336,24 +336,24 @@ which is the value the fallback annotation records.
 
 The config annotation, on the config descriptor, follows the construction:
 `composefs.config.fsverity-sha256-12` is checked on a canonical
-construction and `io.foundries.knarr.composefs.config.fsverity-sha256-12`
+construction and `io.foundries.ocicfs.composefs.config.fsverity-sha256-12`
 on a non-canonical one, against the measured fs-verity digest of the stored
 config and with the same fail-closed handling. The upstream annotation keys
 and their meaning are defined by the
 [composefs OCI sealing specification](https://github.com/composefs/composefs-rs/blob/main/crates/composefs-oci/src/sealing_spec.rs),
-which knarr follows verbatim.
+which ocicfs follows verbatim.
 
 ## Embedding: Feeding Layers as They Arrive
 
 `Pull` converts the whole image in one call. An embedder that receives an
 image's layers one at a time — a container runtime unpacking a pull hands its
-snapshotter each layer as it lands — can instead have knarr materialize each
+snapshotter each layer as it lands — can instead have ocicfs materialize each
 layer as it arrives, so the last step does only the last layer plus the image
 write rather than the whole conversion. The engine's `NewBuild` starts such a
 pull and returns a `Build`:
 
 ```go
-b, err := eng.NewBuild(ctx, ref, knarr.WithBlobSource(src), knarr.WithResolvedRoot(root))
+b, err := eng.NewBuild(ctx, ref, ocicfs.WithBlobSource(src), ocicfs.WithResolvedRoot(root))
 if err != nil {
 	return err
 }
@@ -418,13 +418,13 @@ Rules the build enforces:
   to reclaim.
 - **`WithHold` keeps the image by a hold, and names it without pinning it.**
   An embedder that owns an image's lifetime itself — a runtime that drops the
-  image when its own records go — passes `knarr.WithHold(holder)`: `Finish`
+  image when its own records go — passes `ocicfs.WithHold(holder)`: `Finish`
   takes a hold under `holder` on the image's identity digest, after the
   binding is written and before the store is released to `gc`, and records
   `ref` as a *runtime reference*: a name that resolves like any other for
   `inspect`, `mount`, `hold` and `release`, but keeps nothing alive — `gc`
   drops it once `holder` is released, along with the image if nothing else
-  wants it. `knarr ls --format json` shows such a row with its `holder`. A
+  wants it. `ocicfs ls --format json` shows such a row with its `holder`. A
   runtime reference never displaces a reference a plain pull recorded for
   the same name (the image is then held but not named), while a plain pull
   of the name replaces the runtime reference and keeps the image on its
@@ -443,11 +443,11 @@ Rules the build enforces:
   holds is recognized before fs-verity is enabled on it, so an update pays the
   sealing cost only for files that are new.
 - **Mount is separate.** Pull only materializes content into the store; mounting
-  it is a distinct step with `knarr mount`.
+  it is a distinct step with `ocicfs mount`.
 - **The delta-base contract.** `--delta` saves bytes only while the previous
   release's objects are in the store. The agent holds release N−1 under a
   holder such as `delta-base` before pulling N, and releases it after N is
-  activated; knarr adds no keep-previous policy of its own, and a `gc` that
+  activated; ocicfs adds no keep-previous policy of its own, and a `gc` that
   finds N−1 unwanted reclaims it like any other image. A delta pull of an
   image the store already holds is a cache hit, as any pull is. For a
   zstd:chunked layer the `diff_id` is reported (`inspect`, the chain IDs,

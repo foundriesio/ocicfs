@@ -78,7 +78,7 @@ jobs:
             SMOKE_IMAGE=docker.io/library/busybox@sha256:fd8d9aa63ba2f0982b5304e1ee8d3b90a210bc1ffb5314d980eb6962f1a9715d
             SMOKE_LAYOUT="$PWD/.smoke-layout"
             make build test smoke size install DESTDIR=/tmp/install-check
-            && test -x /tmp/install-check/usr/local/bin/knarr
+            && test -x /tmp/install-check/usr/local/bin/ocicfs
           push: never
 
       # The dev container runs as root, leaving bin/ and .smoke-layout
@@ -106,7 +106,7 @@ jobs:
         run: |
           ./scripts/release-artifacts.sh archive ${{ matrix.arch }}
           ./scripts/release-check.sh archive \
-            "dist/knarr_${{ steps.ver.outputs.artifact }}_linux_${{ matrix.arch }}.tar.gz" \
+            "dist/ocicfs_${{ steps.ver.outputs.artifact }}_linux_${{ matrix.arch }}.tar.gz" \
             ${{ matrix.arch }}
 
       # INSTALL.md's archive steps on clean containers — alpine has no
@@ -114,23 +114,23 @@ jobs:
       - name: Install-test the archive
         run: |
           ./scripts/release-check.sh install \
-            "dist/knarr_${{ steps.ver.outputs.artifact }}_linux_${{ matrix.arch }}.tar.gz"
+            "dist/ocicfs_${{ steps.ver.outputs.artifact }}_linux_${{ matrix.arch }}.tar.gz"
 
       - name: Generate the SBOM
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
-          file: bin/knarr
+          file: bin/ocicfs
           format: spdx-json
-          output-file: dist/knarr_${{ steps.ver.outputs.artifact }}_linux_${{ matrix.arch }}.spdx.json
+          output-file: dist/ocicfs_${{ steps.ver.outputs.artifact }}_linux_${{ matrix.arch }}.spdx.json
           upload-artifact: false
           upload-release-assets: false
 
       - name: Collect the deb
-        run: cp bin/deb/knarr_*.deb dist/
+        run: cp bin/deb/ocicfs_*.deb dist/
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: knarr-${{ matrix.arch }}
+          name: ocicfs-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
 
@@ -163,7 +163,7 @@ jobs:
       - name: Generate and verify checksums
         run: |
           ./scripts/release-artifacts.sh checksums
-          cd dist && sha256sum --check --ignore-missing knarr_*_checksums.txt
+          cd dist && sha256sum --check --ignore-missing ocicfs_*_checksums.txt
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -176,7 +176,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          for f in dist/knarr_*.tar.gz dist/knarr_*.deb; do
+          for f in dist/ocicfs_*.tar.gz dist/ocicfs_*.deb; do
             gh attestation verify "$f" --repo "$GITHUB_REPOSITORY"
           done
 
@@ -202,7 +202,7 @@ jobs:
               -f tag_name="$GITHUB_REF_NAME" -f previous_tag_name="$prev" \
               --jq .body >> notes.md
           fi
-          grep -q '[^[:space:]]' notes.md || echo "knarr $GITHUB_REF_NAME" > notes.md
+          grep -q '[^[:space:]]' notes.md || echo "ocicfs $GITHUB_REF_NAME" > notes.md
 
       - name: Create the draft release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3

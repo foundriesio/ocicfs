@@ -6,14 +6,14 @@ GOLANGCI_LINT ?= golangci-lint
 
 # Build artifacts live under bin/.
 BIN := bin
-CMD := knarr
-PKG := github.com/foundriesio/knarr
+CMD := ocicfs
+PKG := github.com/foundriesio/ocicfs
 
 # Install location (overridable, e.g. DESTDIR for packaging).
 PREFIX ?= /usr/local
 DESTDIR ?=
 
-# Device-footprint budget for the knarr binary, in bytes. The total device
+# Device-footprint budget for the ocicfs binary, in bytes. The total device
 # budget is 25 MB including mkcomposefs; the size target checks the binary
 # against this slice of it.
 SIZE_BUDGET ?= 20971520
@@ -29,8 +29,8 @@ LDFLAGS := -s -w -X $(PKG)/pkg/version.Version=$(VERSION) -X $(PKG)/pkg/version.
 .PHONY: all
 all: lint vet test build
 
-# build compiles the knarr CLI into bin/ as a stripped, trimmed binary. Cgo is
-# disabled so the binary is fully static: nothing in knarr needs it, and the
+# build compiles the ocicfs CLI into bin/ as a stripped, trimmed binary. Cgo is
+# disabled so the binary is fully static: nothing in ocicfs needs it, and the
 # release artifacts must not pick up a libc dependency from the build host.
 .PHONY: build
 build:
@@ -41,10 +41,10 @@ build:
 .PHONY: size
 size: build
 	@bytes=$$(wc -c < $(BIN)/$(CMD)); \
-	printf 'knarr binary: %s bytes (%s MiB); budget %s bytes\n' \
+	printf 'ocicfs binary: %s bytes (%s MiB); budget %s bytes\n' \
 		"$$bytes" "$$((bytes / 1024 / 1024))" "$(SIZE_BUDGET)"; \
 	if [ "$$bytes" -gt "$(SIZE_BUDGET)" ]; then \
-		echo "knarr binary exceeds the device budget"; \
+		echo "ocicfs binary exceeds the device budget"; \
 		exit 1; \
 	fi
 
@@ -80,7 +80,7 @@ fmt:
 # functionality. Run it inside the privileged dev container (fs-verity +
 # mkcomposefs), e.g.:
 #   ./devshell.sh                                              # then: make smoke
-#   docker run --rm --privileged -v "$PWD":/work knarr-dev make smoke
+#   docker run --rm --privileged -v "$PWD":/work ocicfs-dev make smoke
 .PHONY: smoke
 smoke: build
 	./scripts/smoke.sh
@@ -93,7 +93,7 @@ smoke: build
 # 0.1.0~rc.1 so finals sort after candidates); an untagged checkout gets a
 # never-releasable snapshot version instead.
 
-DEB_IMAGE ?= knarr-debuild:trixie
+DEB_IMAGE ?= ocicfs-debuild:trixie
 DEB_OUT ?= $(BIN)/deb
 
 RELEASE_TAG := $(shell git describe --tags --exact-match --match 'v*' 2>/dev/null)

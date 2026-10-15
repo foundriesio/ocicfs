@@ -7,7 +7,7 @@ import (
 	"archive/tar"
 	"fmt"
 
-	"github.com/foundriesio/knarr/internal/zstdchunked"
+	"github.com/foundriesio/ocicfs/internal/zstdchunked"
 )
 
 // LayerFromTOC returns layer idx as its zstd:chunked table of contents

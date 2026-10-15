@@ -1,8 +1,8 @@
 # On-disk store layout
 
-This describes what knarr writes under its data root (`--root`, default
-`/var/lib/knarr`) — the tree a `pull` produces and a `mount` reads. The store
-filesystem must support **fs-verity** (e.g. ext4 formatted with `-b 4096`); knarr
+This describes what ocicfs writes under its data root (`--root`, default
+`/var/lib/ocicfs`) — the tree a `pull` produces and a `mount` reads. The store
+filesystem must support **fs-verity** (e.g. ext4 formatted with `-b 4096`); ocicfs
 seals every content object with it and refuses a store that cannot.
 
 ```
@@ -50,7 +50,7 @@ object's measured fs-verity digest (`<vv>` = first two hex chars of that digest,
 `<rest>` the rest; no `sha256:` prefix in the path). It shares one inode with the
 sha256 name, so it adds no content and carries the same fs-verity seal. The view
 is **auxiliary and regenerable** — rebuildable by walking `objects/sha256` and
-re-measuring — never a trust anchor of its own. Objects written by earlier knarr
+re-measuring — never a trust anchor of its own. Objects written by earlier ocicfs
 versions are not backfilled; each gains its view name when a write next
 deduplicates onto it.
 
@@ -75,7 +75,7 @@ descended one level, inside the index's own digest-verified bytes, to the
 manifest it offers for the host platform, and that manifest's digest is what
 `images/`, `holds/`, and every verb use. Pulling one image by its index digest
 and by its platform manifest digest therefore stores it once, under one key,
-with one set of holds. The digest `knarr pull`, `knarr ls`, and `knarr inspect`
+with one set of holds. The digest `ocicfs pull`, `ocicfs ls`, and `ocicfs inspect`
 report is the identity, which may differ from the digest the reference pinned;
 it is the digest to pin, hold, and look the image up by. See
 [ADR 0002](adr/0002-image-identity.md).
@@ -89,11 +89,11 @@ measured fs-verity digest:
 
 ```json
 {
-  "schema": "application/vnd.knarr.cfs-binding.v1+json",
+  "schema": "application/vnd.ocicfs.cfs-binding.v1+json",
   "platform": { "os": "linux", "architecture": "arm64" },
   "rootfs": {
     "type": "composefs",
-    "descriptor": { "mediaType": "application/vnd.knarr.composefs.image.v1+erofs",
+    "descriptor": { "mediaType": "application/vnd.ocicfs.composefs.image.v1+erofs",
                     "digest": "sha256:…", "size": 12288 },
     "objectStore": { "type": "composefs-digest-store", "algorithm": "fsverity-sha256-12", "path": "objects/fsverity-sha256-12" },
     "fsverity": { "mode": "required", "digest": "sha256:…", "source": "local-measurement" },
@@ -115,7 +115,7 @@ verifies the image as already present does not rewrite the binding, so the
 field appears when the image is next actually built (after the binding's last
 ref is removed, or on an image update).
 
-At mount time, knarr first resolves and digest-verifies the stored metadata
+At mount time, ocicfs first resolves and digest-verifies the stored metadata
 chain from `objects/sha256` in a single pass — the index when the reference
 pins one, the platform manifest, and its config — then reads the host-platform
 binding for the verified identity and selects the fs-verity digest to enforce:
@@ -179,7 +179,7 @@ records; a layer whose file list would exceed either is not saved. A file
 over those bounds, one that does not decompress to its end, is of another
 version, holds a record a scan could not have produced, or records another
 blob size or `diff_id` than the image names is ignored, and the layer is read
-again. `knarr gc` deletes the saved layers no wanted image's manifest lists
+again. `ocicfs gc` deletes the saved layers no wanted image's manifest lists
 (see [gc.md](gc.md)).
 
 ## `refs/` — reference records (auxiliary)
@@ -201,7 +201,7 @@ trust anchor:
 
 ```json
 {
-  "schema": "application/vnd.knarr.ref.v2+json",
+  "schema": "application/vnd.ocicfs.ref.v2+json",
   "ref": "app:v1",
   "refKey": { "algorithm": "sha256", "digest": "sha256:…" },
   "resolved": { "mediaType": "", "digest": "sha256:…", "size": 6694 },
@@ -215,7 +215,7 @@ trust anchor:
 
 `holder` is present only on a *runtime reference*, written by a pull made
 under `WithHold`: the record names the image for that holder and pins
-nothing — `knarr gc` keeps the image through the hold, not the name, and
+nothing — `ocicfs gc` keeps the image through the hold, not the name, and
 deletes the record once the holder is released. A record without `holder` is
 an agent's, and keeps its image on its own.
 
@@ -223,7 +223,7 @@ The two descriptors say different things. `resolved` is **provenance**: the
 document the reference itself landed on — an image index for the tag above, and
 the manifest itself for a manifest-pinned reference, in which case the two
 descriptors are the same one. It is unauthenticated local bookkeeping; no trust
-decision takes it as an input, but `knarr gc` resolves it as a wanted root to
+decision takes it as an input, but `ocicfs gc` resolves it as a wanted root to
 keep the pulled document reachable, so a record whose resolved chain is broken
 aborts a collection. `identity` is the platform image manifest the reference
 names, the digest the bindings and holds are keyed by and the one every verb
@@ -234,10 +234,10 @@ already named the manifest. A record carrying an older schema is rejected on rea
 naming the remedy (recreate the store); `ls` skips such a record with a warning
 rather than failing the whole listing.
 
-`knarr ls` reads these records and reports one row per stored reference, showing
-the identity digest. `knarr remove <ref>` deletes the matching ref record and
+`ocicfs ls` reads these records and reports one row per stored reference, showing
+the identity digest. `ocicfs remove <ref>` deletes the matching ref record and
 any unshared image binding for the recorded identity digest and platform; it
-does not delete content from `objects/` — `knarr gc` reclaims objects nothing
+does not delete content from `objects/` — `ocicfs gc` reclaims objects nothing
 references (see [gc.md](gc.md)).
 
 ## `holds/` — GC-protection holds (auxiliary)

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# knarr dev / CI container image.
+# ocicfs dev / CI container image.
 #
 # One image, built by .devcontainer/devcontainer.json for local development
 # and by the CI workflow (via the devcontainers/ci action) for build/test/lint,
@@ -9,7 +9,7 @@
 # Stage 1 (composefs-builder) compiles composefs tools from a pinned composefs
 # release. Stage 2 (cfsctl-builder) compiles cfsctl from a pinned composefs-rs
 # commit — the cross-implementation oracle the canonical-EROFS conformance test
-# measures knarr against. Stage 3 (the dev image) inherits the Go toolchain base,
+# measures ocicfs against. Stage 3 (the dev image) inherits the Go toolchain base,
 # copies both sets of artifacts across, and adds the loop-device / ext4 tooling
 # the privileged fs-verity end-to-end tests need. The entrypoint mounts a
 # loop-backed ext4 filesystem with the verity feature so those tests get real
@@ -59,7 +59,7 @@ RUN MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH)" \
 # ------------------------------------------------------------------
 # cfsctl is the cross-implementation oracle for the canonical merged-EROFS
 # construction: the conformance test compares its `oci compute-id` against the
-# merged image knarr builds for the same layers. The commit is pinned (an
+# merged image ocicfs builds for the same layers. The commit is pinned (an
 # arbitrary SHA, fetched directly) so the oracle cannot drift, and the build
 # asserts the checkout landed on it. Only the `oci` feature is enabled — no
 # containers-storage / ostree / fuse — to keep the stage light; the `oci:`
@@ -133,7 +133,7 @@ RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/ins
 # smoke tests confirm the binaries are on PATH and link against it. composefs-info
 # inspects and measures a built image; the EROFS round-trip test uses its dump and
 # measure-file modes to assert WriteImage reproduces the upstream tool's output.
-# mount.composefs ships with the tools but is no longer used: knarr assembles
+# mount.composefs ships with the tools but is no longer used: ocicfs assembles
 # its mounts natively.
 COPY --from=composefs-builder /out/usr/bin/mkcomposefs /usr/bin/mkcomposefs
 COPY --from=composefs-builder /out/usr/sbin/mount.composefs /usr/bin/mount.composefs
@@ -146,13 +146,13 @@ RUN ldconfig \
  && ldd /usr/bin/mkcomposefs | grep -q libcomposefs
 
 # crane: a lightweight, single-binary tool to pull a registry image into a local
-# OCI image layout for `knarr pull --from-dir`. Copied from its official static
+# OCI image layout for `ocicfs pull --from-dir`. Copied from its official static
 # image rather than building skopeo, which is far heavier (C deps, ~2x the size).
 COPY --from=gcr.io/go-containerregistry/crane:v0.21.7 /ko-app/crane /usr/bin/crane
 RUN command -v crane >/dev/null
 
 # cfsctl: the pinned composefs-rs oracle the canonical-EROFS conformance test
-# compares knarr's merged image against. Built with only the `oci` feature; every
+# compares ocicfs's merged image against. Built with only the `oci` feature; every
 # shared library it links (zlib, pcre2, libgcc, libm, libc) is already present in
 # the base image, so no extra runtime packages are needed.
 COPY --from=cfsctl-builder /usr/bin/cfsctl /usr/bin/cfsctl
@@ -161,7 +161,7 @@ RUN command -v cfsctl >/dev/null
 # zot: a real OCI registry, statically linked, for the smoke test's registry
 # legs and for manual push/seal/pull testing. Unlike an in-process test
 # registry it enforces the distribution spec on manifest PUTs (Content-Type
-# handling, referenced-blob existence), so the `knarr seal` push path is
+# handling, referenced-blob existence), so the `ocicfs seal` push path is
 # exercised against real registry behavior. The entrypoint serves a persistent
 # instance at 127.0.0.1:5000 from the baked config; the smoke test runs its
 # own ephemeral instance on another port.

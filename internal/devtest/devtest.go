@@ -1,7 +1,7 @@
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package devtest provides fixtures for knarr's privileged end-to-end tests: a
+// Package devtest provides fixtures for ocicfs's privileged end-to-end tests: a
 // verity-capable store root. fs-verity needs a real backing filesystem, which
 // tmpfs and overlayfs cannot provide, so the dev container mounts a loop-backed
 // ext4 filesystem with the fs-verity feature and the helpers here root the store
@@ -22,13 +22,13 @@ import (
 // verity-dependent test should skip when it sees this.
 var ErrNoVerity = errors.New("devtest: verity-capable test root unavailable")
 
-// verityDir is the knarr default data root, where the privileged dev container
+// verityDir is the ocicfs default data root, where the privileged dev container
 // mounts a loop-backed ext4 filesystem with the fs-verity feature. Tests root an
 // isolated store in a fresh subdirectory of it.
-const verityDir = "/var/lib/knarr"
+const verityDir = "/var/lib/ocicfs"
 
 // VerityRoot returns a fresh empty directory on the dev container's
-// verity-capable filesystem for use as a knarr store root, along with a cleanup
+// verity-capable filesystem for use as a ocicfs store root, along with a cleanup
 // function to remove it. It returns ErrNoVerity when that filesystem is not
 // mounted or is not usable by this process (for example a root-owned default
 // store left over from a host run), so the caller skips.

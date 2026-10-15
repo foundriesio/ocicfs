@@ -1,14 +1,14 @@
-# Reclaiming store space (`knarr gc`)
+# Reclaiming store space (`ocicfs gc`)
 
-`knarr gc` deletes every store object that is neither **wanted** nor **in
+`ocicfs gc` deletes every store object that is neither **wanted** nor **in
 use**, along with orphan image bindings, saved layers no wanted image lists,
 orphan fs-verity view entries, staging leftovers under `tmp/`, and the empty
 shard directories earlier deletions left behind across the store's fan-out
 trees. It is the reclamation
 half of the two-layer protection model:
 
-- **Wanted** is intent: an image reachable from a reference record (`knarr
-  pull` wrote one, `knarr remove` deletes it) or pinned by a hold (`knarr
+- **Wanted** is intent: an image reachable from a reference record (`ocicfs
+  pull` wrote one, `ocicfs remove` deletes it) or pinned by a hold (`ocicfs
   hold`). Wanted content survives reboots and unmounts and is never
   collected.
 - **In use** is fact: a mounted image holds a kernel-accounted shared lock on
@@ -18,7 +18,7 @@ half of the two-layer protection model:
   falls on the first gc after its unmount.
 
 gc deletes only what is neither. Everything it deletes is re-fetchable with
-`knarr pull`; holds are never touched, nor are the reference records an
+`ocicfs pull`; holds are never touched, nor are the reference records an
 agent's pulls wrote. A runtime reference — one a pull under `WithHold`
 recorded, naming the image for a holder — is dropped once that holder no
 longer stands on the image, since the name lived on the hold's behalf.
@@ -27,7 +27,7 @@ Some garbage is expected immediately after a pull: the pull streams each
 layer and materializes every file it carries, so a file a later layer
 overwrites or deletes is unreferenced by the merged image from the start —
 for Debian-based images the shadowed package-database generations alone can
-add up to a few MiB. The first collection reclaims them. `knarr pull
+add up to a few MiB. The first collection reclaims them. `ocicfs pull
 --delta` knows every zstd:chunked layer's file table up front and skips
 materializing shadowed files instead of leaving them to gc.
 
@@ -45,17 +45,17 @@ holds release N−1 under a holder of its own — `delta-base`, say — before
 pulling N with `--delta`, and releases it once N is activated. The release
 alone reclaims nothing: N−1 stays wanted by its own reference until the
 agent removes that too, and the next gc then reclaims what N−1 alone
-referenced. knarr adds no keep-previous policy of its own. See
+referenced. ocicfs adds no keep-previous policy of its own. See
 [pull.md](pull.md).
 
 ## Usage
 
 ```sh
-knarr gc                 # collect, report what was removed
-knarr gc --dry-run       # report what a collection would remove, removing nothing
-knarr gc --human         # sizes as KiB/MiB/... instead of exact bytes
-knarr gc --list-removed  # also list each removed object's digest
-knarr gc --format json
+ocicfs gc                 # collect, report what was removed
+ocicfs gc --dry-run       # report what a collection would remove, removing nothing
+ocicfs gc --human         # sizes as KiB/MiB/... instead of exact bytes
+ocicfs gc --list-removed  # also list each removed object's digest
+ocicfs gc --format json
 ```
 
 Text output is one line:
@@ -80,8 +80,8 @@ store damage) are counted but not listed.
 A wanted image gc cannot fully enumerate — a reference record that does not
 decode, a chain that does not resolve to the recorded identity, a missing
 binding, an unreadable composefs image — aborts the whole collection with
-nothing deleted, naming the root and the remedy (`knarr pull` to restore it,
-`knarr remove` or `knarr release` to stop wanting it). Keeping garbage one
+nothing deleted, naming the root and the remedy (`ocicfs pull` to restore it,
+`ocicfs remove` or `ocicfs release` to stop wanting it). Keeping garbage one
 cycle longer is always safe; deleting live data an offline device cannot
 re-fetch is not. There is no partial sweep.
 
@@ -135,7 +135,7 @@ sequencing obligation on every caller into a property of the store: gc
 sees the v1 image locked, keeps it and everything it references, and
 reclaims it all on the first collection after the unmount.
 
-All knarr mounts are covered for their lifetime: on both mount paths the
+All ocicfs mounts are covered for their lifetime: on both mount paths the
 locked file description is the one the loop device attaches, so the lock
 lives exactly as long as the mount, surviving the mounting process. In-use
 protection still ends at unmount — and at reboot, which ends every mount and

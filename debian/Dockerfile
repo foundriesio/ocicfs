@@ -1,8 +1,8 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Packaging image for the knarr .deb (Makefile deb-image/deb targets).
-# Debian trixie's golang (1.24) cannot build knarr (go.mod requires 1.26),
+# Packaging image for the ocicfs .deb (Makefile deb-image/deb targets).
+# Debian trixie's golang (1.24) cannot build ocicfs (go.mod requires 1.26),
 # so the toolchain comes from the official golang image instead.
 # Keep GO_VERSION in sync with the top-level Containerfile.
 ARG GO_VERSION=1.26.1

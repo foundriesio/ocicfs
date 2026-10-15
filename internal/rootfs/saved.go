@@ -18,8 +18,8 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/opencontainers/go-digest"
 
-	"github.com/foundriesio/knarr/internal/composefs"
-	"github.com/foundriesio/knarr/internal/digestutil"
+	"github.com/foundriesio/ocicfs/internal/composefs"
+	"github.com/foundriesio/ocicfs/internal/digestutil"
 )
 
 // The format of a saved layer and the bounds it is written and read within.

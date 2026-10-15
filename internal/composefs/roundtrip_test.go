@@ -58,7 +58,7 @@ func TestWriteImageMatchesUpstream(t *testing.T) {
 	}
 
 	// Byte-identical images necessarily measure the same fs-verity digest; assert
-	// both, since the digest is the value knarr records and enforces.
+	// both, since the digest is the value ocicfs records and enforces.
 	if refBytes, oursBytes := mustRead(t, ref), mustRead(t, ours); !bytes.Equal(refBytes, oursBytes) {
 		t.Fatalf("rebuilt image differs from the reference (%d vs %d bytes)", len(refBytes), len(oursBytes))
 	}
@@ -67,11 +67,11 @@ func TestWriteImageMatchesUpstream(t *testing.T) {
 	}
 }
 
-// TestWriteImageNoInlineMatchesUpstream verifies knarr's no-inline path is
+// TestWriteImageNoInlineMatchesUpstream verifies ocicfs's no-inline path is
 // byte-compatible with upstream tooling for files small enough that directory-mode
 // mkcomposefs inlines them (<=64 bytes). The reference image is built with upstream
 // tools ONLY — never WriteImage: a directory-mode build (which inlines the small
-// files) is dumped, every regular-file line is rewritten into knarr's by-digest
+// files) is dumped, every regular-file line is rewritten into ocicfs's by-digest
 // form (PAYLOAD and DIGEST both the file's fs-verity digest from composefs-info
 // measure-file), and mkcomposefs --from-file rebuilds a no-inline image from that
 // dump. WriteImage then rebuilds the same dump and must reproduce the reference
@@ -96,7 +96,7 @@ func TestWriteImageNoInlineMatchesUpstream(t *testing.T) {
 		t.Fatalf("directory-mode build did not inline a small file, so the test is not exercising the no-inline path:\n%s", inlinedDump)
 	}
 
-	// Upstream-only no-inline reference: rewrite every file to knarr's by-digest
+	// Upstream-only no-inline reference: rewrite every file to ocicfs's by-digest
 	// form and rebuild via --from-file. No WriteImage is involved in producing it.
 	// Confirm the once-inlined small file is now by-digest.
 	noinlineDump := rewriteToByDigest(t, cfsInfo, src, inlinedDump)
@@ -106,21 +106,21 @@ func TestWriteImageNoInlineMatchesUpstream(t *testing.T) {
 	ref := filepath.Join(out, "ref.cfs")
 	runCmd(t, mkcomposefs, "--min-version=1", "--max-version=1", "--from-file", dumpPath, ref)
 
-	// knarr side: parse the same no-inline dump into Entries and rebuild via
+	// ocicfs side: parse the same no-inline dump into Entries and rebuild via
 	// WriteImage; it must reproduce the upstream reference exactly.
 	ours := filepath.Join(out, "ours.cfs")
 	if err := WriteImage(context.Background(), ours, parseDump(t, noinlineDump)); err != nil {
 		t.Fatalf("WriteImage: %v", err)
 	}
 	if !bytes.Equal(mustRead(t, ref), mustRead(t, ours)) {
-		t.Fatal("knarr no-inline image differs from the upstream-built no-inline reference")
+		t.Fatal("ocicfs no-inline image differs from the upstream-built no-inline reference")
 	}
 	if refV, oursV := measure(t, cfsInfo, ref), measure(t, cfsInfo, ours); refV == "" || refV != oursV {
-		t.Fatalf("fs-verity digest mismatch: reference %q, knarr %q", refV, oursV)
+		t.Fatalf("fs-verity digest mismatch: reference %q, ocicfs %q", refV, oursV)
 	}
-	// The once-small files must be stored by digest in knarr's image, not re-inlined.
+	// The once-small files must be stored by digest in ocicfs's image, not re-inlined.
 	if hasInlinedRegularFile(runCmd(t, cfsInfo, "dump", ours)) {
-		t.Fatal("knarr image inlined a small file; the no-inline path regressed")
+		t.Fatal("ocicfs image inlined a small file; the no-inline path regressed")
 	}
 }
 
@@ -351,7 +351,7 @@ func hasInlinedRegularFile(dump string) bool {
 	return false
 }
 
-// rewriteToByDigest turns a composefs-info dump into knarr's no-inline by-digest
+// rewriteToByDigest turns a composefs-info dump into ocicfs's no-inline by-digest
 // form using only upstream tools. Every regular-file line — inlined or already
 // by-digest — is rewritten so PAYLOAD is the "<2>/<rest>" redirect for the file's
 // fs-verity digest (from composefs-info measure-file), CONTENT is "-", and DIGEST
@@ -386,7 +386,7 @@ func rewriteToByDigest(t *testing.T, cfsInfo, srcDir, dump string) string {
 
 // assertByDigest fails unless dump holds a by-digest line for path: CONTENT is
 // "-" and the PAYLOAD redirect reconstructs the DIGEST column (the file's
-// fs-verity digest) — the fs-verity-keyed form knarr shares with upstream.
+// fs-verity digest) — the fs-verity-keyed form ocicfs shares with upstream.
 func assertByDigest(t *testing.T, dump, path string) {
 	t.Helper()
 	for _, line := range strings.Split(strings.TrimRight(dump, "\n"), "\n") {

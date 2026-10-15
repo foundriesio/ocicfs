@@ -20,7 +20,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/opencontainers/go-digest"
 
-	"github.com/foundriesio/knarr/internal/composefs"
+	"github.com/foundriesio/ocicfs/internal/composefs"
 )
 
 // TestSavedLayerRoundTrip asserts a layer decoded from its encoding is the

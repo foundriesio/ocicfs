@@ -26,7 +26,7 @@ func TestPutWritesBinding(t *testing.T) {
 	}
 	if err := s.Put(root, ocispec.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"}, Binding{
 		Descriptor: ocispec.Descriptor{
-			MediaType: "application/vnd.knarr.composefs.image.v1+erofs",
+			MediaType: "application/vnd.ocicfs.composefs.image.v1+erofs",
 			Digest:    cfs,
 			Size:      123,
 		},
@@ -326,7 +326,7 @@ func TestPutSerializesCanonicalFalse(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	if err := s.Put(root, ocispec.Platform{OS: "linux", Architecture: "amd64"}, Binding{
-		Descriptor:     ocispec.Descriptor{MediaType: "application/vnd.knarr.composefs.image.v1+erofs", Digest: digest.SHA256.FromString("cfs"), Size: 1},
+		Descriptor:     ocispec.Descriptor{MediaType: "application/vnd.ocicfs.composefs.image.v1+erofs", Digest: digest.SHA256.FromString("cfs"), Size: 1},
 		FsverityDigest: digest.SHA256.FromString("fsv").String(),
 	}); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -344,7 +344,7 @@ func TestPutSerializesCanonicalFalse(t *testing.T) {
 func validTestBinding(cfs, fsv digest.Digest) Binding {
 	return Binding{
 		Descriptor: ocispec.Descriptor{
-			MediaType: "application/vnd.knarr.composefs.image.v1+erofs",
+			MediaType: "application/vnd.ocicfs.composefs.image.v1+erofs",
 			Digest:    cfs,
 			Size:      123,
 		},
@@ -413,7 +413,7 @@ func TestPlatformsRejectsCorruptBinding(t *testing.T) {
 
 	// A binding whose recorded platform does not name its file is a mismatch,
 	// not a listing entry.
-	if err := os.WriteFile(filepath.Join(dir, "linux-arm64.json"), []byte(`{"schema":"application/vnd.knarr.cfs-binding.v1+json","platform":{"os":"linux","architecture":"riscv64"}}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "linux-arm64.json"), []byte(`{"schema":"application/vnd.ocicfs.cfs-binding.v1+json","platform":{"os":"linux","architecture":"riscv64"}}`), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 	if _, err := s.Platforms(context.Background(), root); err == nil || !strings.Contains(err.Error(), "names linux-riscv64.json") {
@@ -574,7 +574,7 @@ func TestWalkLayersListsSavedLayersAndSkipsForeign(t *testing.T) {
 	// Foreign entries are skipped, not fatal: the walk feeds deletion, and a
 	// file it cannot key simply is not deleted.
 	shard := filepath.Join(s.root, "layers", "sha256", first.Hex()[:2])
-	for _, stray := range []string{filepath.Join(s.root, "layers", "sha256", "stray"), filepath.Join(shard, ".knarr-123")} {
+	for _, stray := range []string{filepath.Join(s.root, "layers", "sha256", "stray"), filepath.Join(shard, ".ocicfs-123")} {
 		if err := os.WriteFile(stray, []byte("x"), 0o600); err != nil {
 			t.Fatalf("WriteFile: %v", err)
 		}

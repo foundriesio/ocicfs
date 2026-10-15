@@ -19,11 +19,11 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/foundriesio/knarr/internal/imagestore"
-	"github.com/foundriesio/knarr/internal/objectstore"
-	"github.com/foundriesio/knarr/internal/ocichain"
-	"github.com/foundriesio/knarr/internal/ociseal"
-	"github.com/foundriesio/knarr/internal/rootfs"
+	"github.com/foundriesio/ocicfs/internal/imagestore"
+	"github.com/foundriesio/ocicfs/internal/objectstore"
+	"github.com/foundriesio/ocicfs/internal/ocichain"
+	"github.com/foundriesio/ocicfs/internal/ociseal"
+	"github.com/foundriesio/ocicfs/internal/rootfs"
 )
 
 // Built is the image data materialized into the local stores. Root and RootDesc
