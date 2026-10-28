@@ -1,7 +1,8 @@
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package ocilayout opens local OCI image layout blobs from a directory.
+// Package ocilayout opens local OCI image layout blobs from a directory or
+// from an uncompressed tar of one, as docker save writes it.
 package ocilayout
 
 import (
@@ -66,10 +67,12 @@ type (
 
 	// rangeReader serves one section of an open blob file and fails a Read as
 	// soon as ctx is cancelled, so a long copy is interrupted between reads.
+	// Close closes closer, when there is one: a per-blob file is closed with
+	// its reader, a file shared by every blob of a source is not.
 	rangeReader struct {
 		ctx     context.Context
 		section *io.SectionReader
-		f       *os.File
+		closer  io.Closer
 	}
 )
 
@@ -100,7 +103,7 @@ func (s *source) OpenRange(ctx context.Context, desc ocispec.Descriptor, off, n 
 		}
 		return nil, false, err
 	}
-	return &rangeReader{ctx: ctx, section: io.NewSectionReader(f, off, n), f: f}, false, nil
+	return &rangeReader{ctx: ctx, section: io.NewSectionReader(f, off, n), closer: f}, false, nil
 }
 
 // DescribeMissingRoot returns a diagnostic for a pinned root digest absent from
@@ -116,20 +119,7 @@ func (s *source) DescribeMissingRoot(root digest.Digest, cause error) error {
 	if err != nil || int64(len(data)) > maxMetadataBytes {
 		return fmt.Errorf("ocilayout: root %s not present in the layout: %w", root, cause)
 	}
-	var index ocispec.Index
-	if err := json.Unmarshal(data, &index); err != nil || len(index.Manifests) == 0 {
-		return fmt.Errorf("ocilayout: root %s not present in the layout: %w", root, cause)
-	}
-	refs := make([]string, 0, len(index.Manifests))
-	for _, m := range index.Manifests {
-		s := m.Digest.String()
-		if m.Platform != nil {
-			s += " (" + PlatformString(m.Platform) + ")"
-		}
-		refs = append(refs, s)
-	}
-	return fmt.Errorf("ocilayout: root %s is not present in the layout; its index.json references %s — pin a digest present in the layout, or re-export it preserving the image index",
-		root, strings.Join(refs, ", "))
+	return describeMissingRoot(root, cause, data)
 }
 
 // openBlob opens desc's regular file under blobs/<algorithm>/<encoded> and
@@ -177,7 +167,30 @@ func (r *rangeReader) Read(p []byte) (int, error) {
 }
 
 func (r *rangeReader) Close() error {
-	return r.f.Close()
+	if r.closer == nil {
+		return nil
+	}
+	return r.closer.Close()
+}
+
+// describeMissingRoot renders the diagnostic for a pinned root absent from a
+// layout whose index.json is index: the manifests the index lists, so the
+// caller can pin one of them instead.
+func describeMissingRoot(root digest.Digest, cause error, index []byte) error {
+	var idx ocispec.Index
+	if err := json.Unmarshal(index, &idx); err != nil || len(idx.Manifests) == 0 {
+		return fmt.Errorf("ocilayout: root %s not present in the layout: %w", root, cause)
+	}
+	refs := make([]string, 0, len(idx.Manifests))
+	for _, m := range idx.Manifests {
+		s := m.Digest.String()
+		if m.Platform != nil {
+			s += " (" + PlatformString(m.Platform) + ")"
+		}
+		refs = append(refs, s)
+	}
+	return fmt.Errorf("ocilayout: root %s is not present in the layout; its index.json references %s — pin a digest present in the layout, or re-export it preserving the image index",
+		root, strings.Join(refs, ", "))
 }
 
 const maxMetadataBytes = 32 << 20 // 32 MiB
