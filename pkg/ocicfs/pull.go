@@ -70,7 +70,7 @@ func (e *engine) pullDelta(ctx context.Context, ref string, cfg PullOptions) (*I
 // recordRef records ref, in its normalized form, as resolving to root and
 // keyed by identity for platform.
 func (e *engine) recordRef(ref string, root, identity ocispec.Descriptor, platform ocispec.Platform) error {
-	normalized, err := normalizeRef(ref)
+	normalized, err := NormalizeRef(ref)
 	if err != nil {
 		return err
 	}
@@ -84,7 +84,7 @@ func (e *engine) recordRef(ref string, root, identity ocispec.Descriptor, platfo
 // displaced — the image is then held but not named — while an agent's later
 // pull of the name displaces the runtime reference, adopting the image.
 func (e *engine) recordRuntimeRef(ref string, root, identity ocispec.Descriptor, platform ocispec.Platform, holder string) (bool, error) {
-	normalized, err := normalizeRef(ref)
+	normalized, err := NormalizeRef(ref)
 	if err != nil {
 		return false, err
 	}
@@ -301,7 +301,7 @@ func (e *engine) localAnchor(ref string) (root digest.Digest, pinned bool, err e
 	if strings.ContainsRune(ref, '@') || looksLikeBareDigest(ref) {
 		return "", false, perr
 	}
-	normalized, err := normalizeRef(ref)
+	normalized, err := NormalizeRef(ref)
 	if err != nil {
 		return "", false, err
 	}
@@ -336,7 +336,8 @@ func (e *engine) resolveLocalRef(ctx context.Context, ref string) (digest.Digest
 	return desc.Identity.Digest, nil
 }
 
-// normalizeRef canonicalizes ref for use as the refstore lookup key, so a ref
+// NormalizeRef canonicalizes ref to the form the store records it under —
+// the spelling List reports — so a ref
 // stored by one caller and looked up under a differently-formed but
 // equivalent ref (a short name, a missing tag, a non-Docker-Hub host, or
 // name@digest) resolves to the same record. A bare digest is already
@@ -348,7 +349,7 @@ func (e *engine) resolveLocalRef(ctx context.Context, ref string) (digest.Digest
 // "index.docker.io/library/ubuntu:latest"), and a digest-pinned reference is
 // keyed as name@digest with any tag dropped, since the digest alone names the
 // content.
-func normalizeRef(ref string) (string, error) {
+func NormalizeRef(ref string) (string, error) {
 	if looksLikeBareDigest(ref) {
 		return ref, nil
 	}

@@ -400,6 +400,17 @@ func ExactArgs(n int) cobra.PositionalArgs {
 	}
 }
 
+// MaxArgs returns a positional-argument validator that reports a UsageError
+// when the count exceeds n.
+func MaxArgs(n int) cobra.PositionalArgs {
+	return func(_ *cobra.Command, args []string) error {
+		if len(args) > n {
+			return &UsageError{Err: fmt.Errorf("expected at most %d argument(s), got %d", n, len(args))}
+		}
+		return nil
+	}
+}
+
 // FlagErrorFunc wraps a flag-parsing error as a UsageError so it maps to exit
 // code 2. Install it on the root command with SetFlagErrorFunc.
 func FlagErrorFunc(_ *cobra.Command, err error) error {
