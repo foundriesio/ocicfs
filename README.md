@@ -28,8 +28,8 @@ upper-layer agent that drives ocicfs.
   constraints, and non-goals.
 - [ADR 0001: High-level architecture](docs/adr/0001-high-level-architecture.md):
   the accepted architecture boundary and load-bearing technical decisions.
-- [Pulling images](docs/pull.md): registry pull and the local OCI layout
-  sideload (`--from-dir`).
+- [Pulling images](docs/pull.md): registry pull and the local sideload from an
+  OCI layout directory (`--from-dir`) or a `docker save` archive (`--from-tar`).
 - [Mounting a pulled image](docs/mount.md): read-only composefs mounts and
   metadata-only mounts for overlay consumers.
 - [Inspecting a local image](docs/inspect.md): image identity, the composefs

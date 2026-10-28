@@ -124,7 +124,7 @@ func (e *engine) remove(ctx context.Context, ref string, opts ...RemoveOption) e
 		opt(&cfg)
 	}
 
-	normalized, err := normalizeRef(ref)
+	normalized, err := NormalizeRef(ref)
 	if err != nil {
 		return err
 	}

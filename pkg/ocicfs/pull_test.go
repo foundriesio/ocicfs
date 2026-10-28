@@ -157,7 +157,7 @@ func TestNormalizeRef(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := normalizeRef(tt.ref)
+			got, err := NormalizeRef(tt.ref)
 			if tt.wantErr != "" {
 				if err == nil {
 					t.Fatal("expected error")
@@ -168,10 +168,10 @@ func TestNormalizeRef(t *testing.T) {
 				return
 			}
 			if err != nil {
-				t.Fatalf("normalizeRef: %v", err)
+				t.Fatalf("NormalizeRef: %v", err)
 			}
 			if got != tt.want {
-				t.Fatalf("normalizeRef(%q) = %q, want %q", tt.ref, got, tt.want)
+				t.Fatalf("NormalizeRef(%q) = %q, want %q", tt.ref, got, tt.want)
 			}
 		})
 	}
@@ -183,9 +183,9 @@ func TestNormalizeRef(t *testing.T) {
 // built from a short or unqualified name.
 func mustNormalizeRef(t *testing.T, ref string) string {
 	t.Helper()
-	normalized, err := normalizeRef(ref)
+	normalized, err := NormalizeRef(ref)
 	if err != nil {
-		t.Fatalf("normalizeRef(%q): %v", ref, err)
+		t.Fatalf("NormalizeRef(%q): %v", ref, err)
 	}
 	return normalized
 }

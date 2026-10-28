@@ -20,12 +20,18 @@
 # inspect -> mount -> unmount, then mount --metadata-only with the overlay a
 # writable consumer assembles over it (the objects/fsverity-sha256-12 view as
 # lowerdir, verity=require), then hold (a plain remove must decline naming
-# the holder) -> release -> remove -- three times: for an image
-# sideloaded with pull --from-dir, for the same image pulled digest-pinned from
-# a loopback HTTP registry (zot), and for the same image
-# pulled and addressed by tag (checked to resolve to the same pinned digest),
+# the holder) -> release -> remove -- five times: for an image
+# sideloaded with pull --from-dir, for the same image sideloaded from a tar
+# of that layout with pull --from-tar (the shape docker save writes, pulled
+# with no reference, by the name the archive carries), for its host-platform
+# image sideloaded the same way from a tar of a single-platform layout (the
+# shape docker save --platform writes), for the same image
+# pulled digest-pinned from a loopback
+# HTTP registry (zot), and for the same image pulled and addressed by tag
+# (checked to resolve to the same pinned digest),
 # so the currently implemented functionality can be checked by hand in one
-# command. A final differential leg diffs the mounted rootfs against the same
+# command. With SMOKE_ARCHIVE set, a real docker save archive goes through
+# the same lifecycle too. A final differential leg diffs the mounted rootfs against the same
 # image flattened by crane export, so the layer merge is checked against an
 # independent implementation on a real image. A sealing leg then runs
 # `ocicfs seal` against the registry for the host platform of the multi-arch
@@ -52,10 +58,14 @@
 #   SMOKE_REG_PORT  loopback port for the smoke run's own zot instance
 #                   (default 5001; the dev container's persistent registry
 #                   owns 5000)
+#   SMOKE_ARCHIVE   a docker save archive (uncompressed tar, one image saved
+#                   by name) to run through the lifecycle with pull --from-tar
+#                   and no reference; skipped when unset
 set -euo pipefail
 
 IMAGE="${SMOKE_IMAGE:-docker.io/library/busybox:latest}"
 LAYOUT="${SMOKE_LAYOUT:-/tmp/ocicfs-smoke-layout}"
+ARCHIVE="${SMOKE_ARCHIVE:-}"
 STORE=""
 MNT=""
 OVL=""
@@ -65,6 +75,8 @@ IMGDIR=""
 EXPORTDIR=""
 GCOVL=""
 DSTORE=""
+TARBALL=""
+TARINDEX=""
 
 cleanup() {
 	set +e
@@ -85,6 +97,8 @@ cleanup() {
 	[ -n "$MNT" ] && rm -rf "$MNT"
 	[ -n "$EXPORTDIR" ] && rm -rf "$EXPORTDIR"
 	[ -n "$DSTORE" ] && rm -rf "$DSTORE"
+	[ -n "$TARBALL" ] && rm -f "$TARBALL"
+	[ -n "$TARINDEX" ] && rm -rf "$TARINDEX"
 }
 trap cleanup EXIT
 
@@ -295,6 +309,64 @@ identity="$(host_child "$(cat "$LAYOUT/blobs/sha256/${digest#sha256:}")")"
 
 echo "==== lifecycle 1: image sideloaded from a local directory ===="
 run_lifecycle "smoke@$digest" "$identity" "$digest" pull --from-dir "$LAYOUT" "smoke@$digest"
+
+echo "==== lifecycle 1b: image sideloaded from a tar of the layout (--from-tar) ===="
+# The archive is laid out as docker save writes one: blobs before index.json,
+# and the index entry carrying the reference docker save was given in its
+# name annotation. No reference is passed: the pull takes the name from that
+# annotation, drops its tag, and records it under the index digest, normalized
+# as every reference is.
+TARBALL="$(mktemp --suffix=.tar)"
+TARINDEX="$(mktemp -d)"
+jq '.manifests[0].annotations["io.containerd.image.name"] = "smoke:latest"' "$LAYOUT/index.json" >"$TARINDEX/index.json"
+tar -C "$LAYOUT" -cf "$TARBALL" oci-layout blobs
+tar -C "$TARINDEX" -rf "$TARBALL" index.json
+run_lifecycle "index.docker.io/library/smoke@$digest" "$identity" "$digest" pull --from-tar "$TARBALL"
+
+echo "==== lifecycle 1c: host-platform image sideloaded from a tar of a single-platform layout (--from-tar) ===="
+# The shape docker save --platform writes: index.json points straight at the
+# platform manifest, so the recorded reference lands on that manifest and the
+# identity is the manifest itself, with no index to descend.
+if [ ! -f "$LAYOUT-single/index.json" ]; then
+	echo "== crane pull --platform linux/$(go env GOARCH) $IMAGE -> $LAYOUT-single =="
+	crane pull --format=oci --platform "linux/$(go env GOARCH)" "$IMAGE" "$LAYOUT-single"
+fi
+sdigest="$(jq -r '.manifests[0].digest' "$LAYOUT-single/index.json")"
+[ "$(jq -r '.manifests[0].mediaType' "$LAYOUT-single/index.json")" = "application/vnd.oci.image.manifest.v1+json" ] \
+	|| fail "single-platform layout's index.json does not point at a manifest"
+jq '.manifests[0].annotations["io.containerd.image.name"] = "smoke:latest"' "$LAYOUT-single/index.json" >"$TARINDEX/index.json"
+tar -C "$LAYOUT-single" -cf "$TARBALL" oci-layout blobs
+tar -C "$TARINDEX" -rf "$TARBALL" index.json
+run_lifecycle "index.docker.io/library/smoke@$sdigest" "$sdigest" "$sdigest" pull --from-tar "$TARBALL"
+
+if [ -n "$ARCHIVE" ]; then
+	echo "==== lifecycle 1d: real docker save archive $ARCHIVE (--from-tar, SMOKE_ARCHIVE) ===="
+	tar -tf "$ARCHIVE" 2>/dev/null | grep -qx 'index.json' \
+		|| fail "$ARCHIVE is not an uncompressed OCI layout tar (no index.json listed; docker save writes one, and ocicfs does not read a compressed archive)"
+	aindex="$(tar -xOf "$ARCHIVE" index.json)"
+	[ "$(jq -r '.manifests | length' <<<"$aindex")" = 1 ] \
+		|| fail "$ARCHIVE holds $(jq -r '.manifests | length' <<<"$aindex") images; save exactly one image by name"
+	aname="$(jq -r '.manifests[0].annotations["io.containerd.image.name"] // empty' <<<"$aindex")"
+	[ -n "$aname" ] || fail "$ARCHIVE names no image (no io.containerd.image.name annotation); save the image by name, not by ID"
+	adigest="$(jq -r '.manifests[0].digest' <<<"$aindex")"
+	# The identity is the host child when the entry is an index, the entry
+	# itself when it is a manifest.
+	if [ "$(jq -r '.manifests[0].mediaType' <<<"$aindex")" = "application/vnd.oci.image.index.v1+json" ]; then
+		aidentity="$(host_child "$(tar -xOf "$ARCHIVE" "blobs/sha256/${adigest#sha256:}")")"
+		[[ "$aidentity" == sha256:* ]] || fail "$ARCHIVE's index lists no linux/$(go env GOARCH) manifest"
+	else
+		aidentity="$adigest"
+	fi
+	# The recorded reference is what the pull reports for the archive's name;
+	# it must land on the entry digest, and the lifecycle checks ls, inspect
+	# and the ref record agree with it.
+	aref="$("${KN[@]}" pull --from-tar "$ARCHIVE" --format json | jq -r .ref)"
+	echo "archive $ARCHIVE names $aname; recorded as $aref"
+	[[ "$aref" == *"@$adigest" ]] || fail "recorded reference $aref does not pin the archive's entry $adigest"
+	run_lifecycle "$aref" "$aidentity" "$adigest" pull --from-tar "$ARCHIVE"
+else
+	echo "==== lifecycle 1d skipped: set SMOKE_ARCHIVE=<docker save archive> to run a real archive through the lifecycle ===="
+fi
 
 echo "==== lifecycle 2: image pulled from a loopback HTTP registry ===="
 crane push "$LAYOUT" "127.0.0.1:$port/smoke"
@@ -569,4 +641,4 @@ else
 	echo "== skipped: the delta fixtures are linux/amd64 images =="
 fi
 
-echo "SMOKE OK: purpose-built image sealed, cross-checked four ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir and from a registry, digest-pinned and by tag, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding, a gc round (unwanted reclaimed, in-use survives until unmount on both mount paths, empty store fully reclaimed down to its shard directories), and a delta round (N+1 pulled by ranges over a held N, identical to a plain pull, N reclaimed once released and removed) (checks passed)"
+echo "SMOKE OK: purpose-built image sealed, cross-checked four ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir, from a tar of the layout and from a tar of a single-platform layout by the name they carry via --from-tar (and from a real docker save archive when SMOKE_ARCHIVE is set), and from a registry, digest-pinned and by tag, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding, a gc round (unwanted reclaimed, in-use survives until unmount on both mount paths, empty store fully reclaimed down to its shard directories), and a delta round (N+1 pulled by ranges over a held N, identical to a plain pull, N reclaimed once released and removed) (checks passed)"

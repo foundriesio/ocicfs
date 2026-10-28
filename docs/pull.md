@@ -6,7 +6,8 @@ chain into the fs-verity-sealed object store, builds the composefs image, and
 records the image binding and reference.
 
 By default, ocicfs pulls from an OCI registry. `--from-dir` sideloads from a local
-OCI image layout directory instead, for air-gapped or test workflows. A layer
+OCI image layout directory and `--from-tar` from a `docker save` or
+`skopeo` archive instead, for air-gapped or test workflows. A layer
 with a usable saved file list from an earlier pull is not read again (see
 [Layers Already Read](#layers-already-read)). `--delta` fetches only the files
 the store lacks from zstd:chunked layers, for updates
@@ -18,7 +19,8 @@ the store lacks from zstd:chunked layers, for updates
   ocicfs fails fast if the store root cannot enable fs-verity.
 - `mkcomposefs` on `PATH` (from the composefs tools).
 - A registry reference (digest-pinned for production, tagged for testing), or a
-  local OCI image layout and a digest-pinned reference when using `--from-dir`.
+  local OCI image layout and a digest-pinned reference when using `--from-dir`
+  or `--from-tar`.
 
 ## Registry Pull
 
@@ -119,6 +121,73 @@ prints that identity.
 
 `--ingest-workers N` applies to a sideload exactly as to a registry pull: the
 layers are read from the layout directory and scanned N at a time (default 2).
+
+The layers of a sideloaded image may be gzip, zstd or uncompressed tar: only
+`--delta` needs zstd:chunked layers, and a sideload with `--delta` reads a
+layer without a table of contents whole.
+
+### From a `docker save` or `skopeo` archive
+
+`docker save` and `skopeo copy` to an `oci-archive:` write an OCI image layout
+as an uncompressed tar. `--from-tar` pulls from such an archive in place —
+nothing is extracted:
+
+```sh
+docker save --platform linux/arm64 -o app.tar ghcr.io/example/app:1.2.3
+ocicfs pull --from-tar app.tar
+```
+
+Without a reference, ocicfs records the name the archive carries, with its
+tag or digest replaced by the digest of the single `index.json` entry — here
+`ghcr.io/example/app@<manifest digest>`. The name is the reference
+`docker save` was given, kept in the entry's `io.containerd.image.name`
+annotation, or else a fully qualified reference in its
+`org.opencontainers.image.ref.name` annotation, where skopeo keeps the
+reference given after the archive path:
+
+```sh
+skopeo copy --preserve-digests docker://ghcr.io/example/app:1.2.3 \
+  oci-archive:app.tar:ghcr.io/example/app:1.2.3
+ocicfs pull --from-tar app.tar
+```
+
+A `ref.name` that is not fully qualified, such as the bare tag `docker save`
+also writes there, names no image: an archive without either name needs a
+reference.
+
+The recorded name identifies what the archive holds; it does not authorize
+it. An agent that wants a release authorized by its own trusted metadata
+passes the digest from there instead:
+
+```sh
+ocicfs pull --from-tar app.tar "ghcr.io/example/app@$digest"
+```
+
+The pull fails unless the archive holds that digest, and any seal its
+manifest carries is verified against the image the pull builds, so the pinned
+digest authenticates the files that land. An archive whose manifest was
+rewritten cannot match the pin: a `docker save` from a daemon on the legacy
+graphdriver image store reconstructs a manifest whose digest matches nothing
+published. Save the archive from a daemon on the containerd image store
+(`docker info` reports `io.containerd.snapshotter.v1`), or with skopeo,
+instead.
+
+The reference may be `name@sha256:<hex>`, a bare `sha256:<hex>`, or a bare
+name, which ocicfs pins to the one manifest the archive's `index.json` lists:
+
+```sh
+ocicfs pull --from-tar app.tar ghcr.io/example/app
+```
+
+Note that `docker save --platform` exports the platform's child manifest and
+keeps the reference it was given in the name annotation, so an annotation may
+name the index digest while the archive holds only the child: a pinned
+reference must name a digest the archive actually holds. An archive holding
+several images is refused with the digests and names of its entries; pin one
+of them. The tag of a bare name is not recorded — the image is keyed by
+`name@digest`, as with `--from-dir`. A gzip-, zstd-, xz- or bzip2-compressed
+archive is refused: decompress it first. `--delta` and `--ingest-workers`
+apply as to `--from-dir`.
 
 ## Layers Already Read
 
@@ -438,6 +507,9 @@ Rules the build enforces:
   repository to fetch from. The local `--from-dir` sideload is digest-pinned
   only — a tag cannot be resolved without a registry — and also accepts a bare
   `sha256:<hex>` because the OCI layout directory supplies the source.
+  `--from-tar` accepts the same forms plus a bare name, pinned to the single
+  manifest the archive's `index.json` lists, and no reference at all, taken
+  from the name annotation of that entry.
 - **Idempotent.** Objects are content-addressed and committed without replacement,
   so re-pulling the same image reuses existing content. Content the store already
   holds is recognized before fs-verity is enabled on it, so an update pays the
