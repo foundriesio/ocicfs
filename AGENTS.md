@@ -30,7 +30,7 @@ composefs project's published guidelines, **composefs wins**. In particular:
   fs-verity.
 - **Scope discipline (load-bearing):** ocicfs provides **primitives, not lifecycle
   policy**. The verbs are `pull`, `verify`, `mount`, `unmount`, `hold`, `release`,
-  `gc`, plus the publisher-side `publish`. ocicfs **does not execute
+  `gc`, plus the publisher-side `publish` and `copy`. ocicfs **does not execute
   containers** and owns no version-management, activation, rollback, or
   update-orchestration logic. Do **not** add
   `run`/`deploy`/`update`/`stop`/`logs`-style behavior — it is out of scope by

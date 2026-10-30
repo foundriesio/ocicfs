@@ -8,8 +8,8 @@ filesystem tree with one `mount` syscall instead of unpacking and stacking
 layers.
 
 ocicfs provides **primitives, not lifecycle policy**: `pull`, `verify`, `mount`,
-`unmount`, `hold`, `release`, and `gc` on the device, plus a publisher-side
-`publish`. It does not execute containers and owns no version-management,
+`unmount`, `hold`, `release`, and `gc` on the device, plus the publisher-side
+`publish` and `copy`. It does not execute containers and owns no version-management,
 activation, rollback, or update-orchestration logic — those belong to the
 upper-layer agent that drives ocicfs.
 
@@ -19,7 +19,8 @@ upper-layer agent that drives ocicfs.
 > `--delta`, per-file fetch from the zstd:chunked TOC (see
 > [docs/pull.md](docs/pull.md)); read-only, writable (`--rw`), and
 > metadata-only `mount`; `unmount`, `ls`, `inspect`, `hold`/`release`,
-> `remove`, and `gc`; plus the publisher-side `seal`. The publisher-side
+> `remove`, and `gc`; plus the publisher-side `seal` and `copy`, which writes
+> registry images to an archive for offline delivery. The publisher-side
 > `publish` is still to come.
 
 ## Project docs
@@ -29,7 +30,8 @@ upper-layer agent that drives ocicfs.
 - [ADR 0001: High-level architecture](docs/adr/0001-high-level-architecture.md):
   the accepted architecture boundary and load-bearing technical decisions.
 - [Pulling images](docs/pull.md): registry pull and the local sideload from an
-  OCI layout directory (`--from-dir`) or a `docker save` archive (`--from-tar`).
+  OCI layout directory (`--from-dir`) or an archive (`--from-tar`) written by
+  `ocicfs copy`, `docker save` or skopeo.
 - [Mounting a pulled image](docs/mount.md): read-only composefs mounts and
   metadata-only mounts for overlay consumers.
 - [Inspecting a local image](docs/inspect.md): image identity, the composefs

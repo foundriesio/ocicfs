@@ -4,18 +4,22 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/distribution/reference"
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/spf13/cobra"
 
 	"github.com/foundriesio/ocicfs/internal/cli"
 	"github.com/foundriesio/ocicfs/internal/digestutil"
+	"github.com/foundriesio/ocicfs/internal/ocichain"
 	"github.com/foundriesio/ocicfs/internal/ocilayout"
 	"github.com/foundriesio/ocicfs/pkg/ocicfs"
 )
@@ -66,7 +70,10 @@ func newPullCommand(g *globalOptions) *cobra.Command {
 				if err != nil {
 					return err
 				}
-				if ref, err = archiveRef(index, ref); err != nil {
+				children := func(desc ocispec.Descriptor) ([]digest.Digest, error) {
+					return indexChildren(cmd.Context(), src, desc)
+				}
+				if ref, err = archiveRef(index, ref, children); err != nil {
 					return err
 				}
 				opts = append(opts, ocicfs.WithBlobSource(src))
@@ -96,9 +103,11 @@ func newPullCommand(g *globalOptions) *cobra.Command {
 // index.json lists. No reference at all takes the name of that one entry
 // (see archiveName), with the tag or digest the name carries replaced by the
 // entry's own digest, which is what the archive holds, spelled as the store
-// records it. An archive holding several images needs the caller to pin one
-// of them.
-func archiveRef(index []byte, ref string) (string, error) {
+// records it. An archive that lists an index and one of the index's own
+// manifests, as ocicfs copy writes an image, holds that one image, which is
+// the index; an archive holding several images needs the caller to pin one
+// of them. children lists the manifests an entry indexes.
+func archiveRef(index []byte, ref string, children func(ocispec.Descriptor) ([]digest.Digest, error)) (string, error) {
 	if strings.Contains(ref, "@") || strings.HasPrefix(ref, "sha256:") {
 		return ref, nil
 	}
@@ -111,6 +120,14 @@ func archiveRef(index []byte, ref string) (string, error) {
 		return "", errors.New("the archive's index.json lists no manifests")
 	case 1:
 	default:
+		paired, ok, err := pairedIndex(idx.Manifests, children)
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			idx.Manifests = []ocispec.Descriptor{paired}
+			break
+		}
 		entries := make([]string, 0, len(idx.Manifests))
 		for _, m := range idx.Manifests {
 			s := m.Digest.String()
@@ -133,6 +150,47 @@ func archiveRef(index []byte, ref string) (string, error) {
 		return ocicfs.NormalizeRef(reference.TrimNamed(named).String() + "@" + entry.Digest.String())
 	}
 	return ref + "@" + entry.Digest.String(), nil
+}
+
+// pairedIndex returns the index entry of an archive's two index.json entries
+// when the other one is a manifest of that index, and reports whether it
+// found one.
+func pairedIndex(entries []ocispec.Descriptor, children func(ocispec.Descriptor) ([]digest.Digest, error)) (ocispec.Descriptor, bool, error) {
+	if len(entries) != 2 {
+		return ocispec.Descriptor{}, false, nil
+	}
+	for i, e := range entries {
+		kids, err := children(e)
+		if err != nil {
+			return ocispec.Descriptor{}, false, err
+		}
+		if slices.Contains(kids, entries[1-i].Digest) {
+			return e, true, nil
+		}
+	}
+	return ocispec.Descriptor{}, false, nil
+}
+
+// indexChildren returns the digests of the manifests the archive entry desc
+// lists when it is an index, and none when it is a manifest.
+func indexChildren(ctx context.Context, src ocichain.BlobSource, desc ocispec.Descriptor) ([]digest.Digest, error) {
+	raw, err := ocichain.ReadMetaBlob(ctx, src, desc)
+	if err != nil {
+		return nil, fmt.Errorf("read the archive's index.json entry %s: %w", desc.Digest, err)
+	}
+	isIndex, err := ocichain.IsIndex(raw)
+	if err != nil || !isIndex {
+		return nil, err
+	}
+	var idx ocispec.Index
+	if err := json.Unmarshal(raw, &idx); err != nil {
+		return nil, fmt.Errorf("parse the archive's index %s: %w", desc.Digest, err)
+	}
+	kids := make([]digest.Digest, 0, len(idx.Manifests))
+	for _, m := range idx.Manifests {
+		kids = append(kids, m.Digest)
+	}
+	return kids, nil
 }
 
 // archiveName returns the name an archive's index.json entry gives its
