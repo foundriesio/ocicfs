@@ -28,7 +28,10 @@
 # shape docker save --platform writes), for the same image
 # pulled digest-pinned from a loopback
 # HTTP registry (zot), and for the same image pulled and addressed by tag
-# (checked to resolve to the same pinned digest),
+# (checked to resolve to the same pinned digest); then ocicfs copy writes
+# that tag to an archive, whose index.json entries and host-only blobs are
+# checked, and the image goes through the lifecycle twice more from it with
+# pull --from-tar, unpinned and pinned to the platform manifest,
 # so the currently implemented functionality can be checked by hand in one
 # command. With SMOKE_ARCHIVE set, a real docker save archive goes through
 # the same lifecycle too. A final differential leg diffs the mounted rootfs against the same
@@ -77,6 +80,7 @@ GCOVL=""
 DSTORE=""
 TARBALL=""
 TARINDEX=""
+COPYTAR=""
 
 cleanup() {
 	set +e
@@ -99,6 +103,7 @@ cleanup() {
 	[ -n "$DSTORE" ] && rm -rf "$DSTORE"
 	[ -n "$TARBALL" ] && rm -f "$TARBALL"
 	[ -n "$TARINDEX" ] && rm -rf "$TARINDEX"
+	[ -n "$COPYTAR" ] && rm -f "$COPYTAR"
 }
 trap cleanup EXIT
 
@@ -375,6 +380,23 @@ run_lifecycle "127.0.0.1:$port/smoke@$digest" "$identity" "$digest" pull "127.0.
 echo "==== lifecycle 3: image pulled and addressed by tag ===="
 run_lifecycle "127.0.0.1:$port/smoke:latest" "$identity" "$digest" pull "127.0.0.1:$port/smoke:latest"
 
+echo "==== lifecycle 3b: image written to an archive by ocicfs copy (--from-tar by either digest) ===="
+# copy keeps the blobs of the host platform only and lists the image twice in
+# index.json, by the tag it was copied by and by the platform manifest, each
+# name in both annotations. Pulled with no reference, the archive is the one
+# image the index names; pinned to the platform manifest, it is that.
+COPYTAR="$(mktemp --suffix=.tar)"
+"${KN[@]}" copy -o "$COPYTAR" "127.0.0.1:$port/smoke:latest"
+centries="$(tar -xOf "$COPYTAR" index.json | jq -c '[.manifests[] | [.digest, .annotations["io.containerd.image.name"], .annotations["org.opencontainers.image.ref.name"]]]')"
+cwant="$(jq -nc --arg d "$digest" --arg i "$identity" --arg r "127.0.0.1:$port/smoke" \
+	'[[$d, ($r + ":latest"), ($r + ":latest")], [$i, ($r + "@" + $i), ($r + "@" + $i)]]')"
+[ "$centries" = "$cwant" ] || fail "ocicfs copy wrote the index.json entries $centries, want $cwant"
+for child in $(jq -r --arg i "$identity" '.manifests[] | select(.digest != $i) | .digest' "$LAYOUT/blobs/sha256/${digest#sha256:}"); do
+	! tar -tf "$COPYTAR" | grep -qx "blobs/sha256/${child#sha256:}" || fail "ocicfs copy wrote $child, the manifest of another platform"
+done
+run_lifecycle "127.0.0.1:$port/smoke@$digest" "$identity" "$digest" pull --from-tar "$COPYTAR"
+run_lifecycle "127.0.0.1:$port/smoke@$identity" "$identity" "$identity" pull --from-tar "$COPYTAR" "127.0.0.1:$port/smoke@$identity"
+
 echo "==== differential: mounted rootfs vs crane's image-level flatten ===="
 # crane export flattens the image the same way ocicfs's merge must (docker
 # export would not do: it dumps a *container*, whose runtime artifacts --
@@ -641,4 +663,4 @@ else
 	echo "== skipped: the delta fixtures are linux/amd64 images =="
 fi
 
-echo "SMOKE OK: purpose-built image sealed, cross-checked four ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir, from a tar of the layout and from a tar of a single-platform layout by the name they carry via --from-tar (and from a real docker save archive when SMOKE_ARCHIVE is set), and from a registry, digest-pinned and by tag, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding, a gc round (unwanted reclaimed, in-use survives until unmount on both mount paths, empty store fully reclaimed down to its shard directories), and a delta round (N+1 pulled by ranges over a held N, identical to a plain pull, N reclaimed once released and removed) (checks passed)"
+echo "SMOKE OK: purpose-built image sealed, cross-checked four ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir, from a tar of the layout and from a tar of a single-platform layout by the name they carry via --from-tar (and from a real docker save archive when SMOKE_ARCHIVE is set), and from a registry, digest-pinned and by tag, and from an ocicfs copy archive of that tag unpinned and pinned to the platform manifest, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding, a gc round (unwanted reclaimed, in-use survives until unmount on both mount paths, empty store fully reclaimed down to its shard directories), and a delta round (N+1 pulled by ranges over a held N, identical to a plain pull, N reclaimed once released and removed) (checks passed)"
