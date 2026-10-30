@@ -40,6 +40,13 @@ check: lint vet test
 build:
 	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -trimpath -ldflags "$(LDFLAGS)" -o $(BIN)/$(CMD) ./cmd/$(CMD)
 
+# ocicfs-size compiles the off-device storage-estimate tool into bin/. It is
+# built only on request: no default target, install, package or release
+# artifact includes it. test and vet still cover its sources.
+.PHONY: ocicfs-size
+ocicfs-size:
+	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -trimpath -ldflags "$(LDFLAGS)" -o $(BIN)/ocicfs-size ./cmd/ocicfs-size
+
 # size builds the stripped binary and checks it against the device budget so the
 # footprint is tracked with data rather than estimates.
 .PHONY: size

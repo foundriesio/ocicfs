@@ -68,6 +68,9 @@ Run the project's standard targets; do not invent ad-hoc invocations.
 - **Standard Go layout — keep the repository root free of implementation.** Code
   lives under `cmd/` (main packages, e.g. `cmd/ocicfs`), `internal/` (non-importable
   implementation), and `pkg/` (public API), with `docs/` for documentation.
+  `cmd/ocicfs-size` is an off-device analysis tool (storage estimates for image
+  sets), not an ocicfs verb; it is built only by `make ocicfs-size` and ships in
+  neither the .deb nor the release archive.
 - **The format stack is non-negotiable.** On the wire: standard OCI v1.1, no
   proprietary format — the `--delta` pull uses **`zstd:chunked`** layers, whose
   per-file TOC enables file-level range fetch; plain pulls (registry or
