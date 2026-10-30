@@ -34,7 +34,7 @@ import (
 
 func TestCommandsCoverM1Verbs(t *testing.T) {
 	root, _ := newRootCommand(io.Discard, io.Discard)
-	want := []string{"gc", "hold", "inspect", "ls", "mount", "publish", "pull", "release", "remove", "seal", "unmount"}
+	want := []string{"copy", "gc", "hold", "inspect", "ls", "mount", "publish", "pull", "release", "remove", "seal", "unmount"}
 
 	// cobra adds its own "help" and "completion" commands; compare only ocicfs's.
 	builtins := map[string]bool{"help": true, "completion": true}
@@ -296,6 +296,65 @@ func TestRunPullFromDirE2E(t *testing.T) {
 	}
 }
 
+// noChildren lists no manifests for any archive entry.
+func noChildren(ocispec.Descriptor) ([]digest.Digest, error) { return nil, nil }
+
+// TestArchiveRefPairedIndex covers an archive that lists an index beside one
+// of its own manifests, as ocicfs copy writes an image: it holds one image,
+// the index, while an index beside a manifest it does not list is two.
+func TestArchiveRefPairedIndex(t *testing.T) {
+	idx := digest.SHA256.FromString("index")
+	child := digest.SHA256.FromString("child")
+	other := digest.SHA256.FromString("other")
+	children := func(d ocispec.Descriptor) ([]digest.Digest, error) {
+		if d.Digest == idx {
+			return []digest.Digest{child, digest.SHA256.FromString("absent")}, nil
+		}
+		return nil, nil
+	}
+	index := func(entries ...ocispec.Descriptor) []byte {
+		b, err := json.Marshal(ocispec.Index{Versioned: specs.Versioned{SchemaVersion: 2}, Manifests: entries})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	named := func(d digest.Digest, name string) ocispec.Descriptor {
+		return ocispec.Descriptor{Digest: d, Annotations: map[string]string{"io.containerd.image.name": name}}
+	}
+
+	tests := []struct {
+		name  string
+		index []byte
+		ref   string
+		want  string
+	}{
+		{"no ref, index first", index(named(idx, "ghcr.io/team/app:1"), named(child, "ghcr.io/team/app@"+child.String())), "", "ghcr.io/team/app@" + idx.String()},
+		{"no ref, index second", index(named(child, "ghcr.io/team/app@"+child.String()), named(idx, "ghcr.io/team/app:1")), "", "ghcr.io/team/app@" + idx.String()},
+		{"bare name", index(named(child, "ghcr.io/team/app@"+child.String()), named(idx, "ghcr.io/team/app:1")), "app", "app@" + idx.String()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := archiveRef(tt.index, tt.ref, children)
+			if err != nil {
+				t.Fatalf("archiveRef: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("archiveRef = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	_, err := archiveRef(index(named(idx, "ghcr.io/team/app:1"), named(other, "ghcr.io/team/other:1")), "", children)
+	if err == nil || !strings.Contains(err.Error(), "2 images") {
+		t.Fatalf("an index beside a manifest it does not list: err = %v, want the two images listed", err)
+	}
+	failing := func(ocispec.Descriptor) ([]digest.Digest, error) { return nil, errors.New("unreadable") }
+	if _, err := archiveRef(index(named(idx, "a:1"), named(child, "b:1")), "", failing); err == nil || !strings.Contains(err.Error(), "unreadable") {
+		t.Fatalf("an unreadable entry: err = %v, want it reported", err)
+	}
+}
+
 func TestArchiveRef(t *testing.T) {
 	one := digest.SHA256.FromString("one")
 	two := digest.SHA256.FromString("two")
@@ -349,7 +408,7 @@ func TestArchiveRef(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := archiveRef(tt.index, tt.ref)
+			got, err := archiveRef(tt.index, tt.ref, noChildren)
 			if len(tt.wantErr) == 0 {
 				if err != nil {
 					t.Fatalf("archiveRef: %v", err)
@@ -524,7 +583,7 @@ func TestRunPullFromTarDeltaE2E(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read index: %v", err)
 		}
-		ref, err := archiveRef(index, "release")
+		ref, err := archiveRef(index, "release", noChildren)
 		if err != nil {
 			t.Fatalf("pin the fixture %s: %v", dir, err)
 		}

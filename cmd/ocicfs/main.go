@@ -3,7 +3,7 @@
 
 // Command ocicfs is the command-line front end for the ocicfs content delivery
 // and mount engine. It dispatches a small set of primitive verbs (publish,
-// seal, pull, mount, unmount, inspect, ls, remove) to the ocicfs engine. All verbs
+// seal, copy, pull, mount, unmount, inspect, ls, remove) to the ocicfs engine. All verbs
 // but publish are wired; publish returns "not implemented".
 package main
 

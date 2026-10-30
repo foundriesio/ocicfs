@@ -6,8 +6,8 @@ chain into the fs-verity-sealed object store, builds the composefs image, and
 records the image binding and reference.
 
 By default, ocicfs pulls from an OCI registry. `--from-dir` sideloads from a local
-OCI image layout directory and `--from-tar` from a `docker save` or
-`skopeo` archive instead, for air-gapped or test workflows. A layer
+OCI image layout directory and `--from-tar` from an archive written by
+`ocicfs copy`, `docker save` or skopeo instead, for air-gapped or test workflows. A layer
 with a usable saved file list from an earlier pull is not read again (see
 [Layers Already Read](#layers-already-read)). `--delta` fetches only the files
 the store lacks from zstd:chunked layers, for updates
@@ -184,10 +184,45 @@ keeps the reference it was given in the name annotation, so an annotation may
 name the index digest while the archive holds only the child: a pinned
 reference must name a digest the archive actually holds. An archive holding
 several images is refused with the digests and names of its entries; pin one
-of them. The tag of a bare name is not recorded — the image is keyed by
+of them. An archive `ocicfs copy` wrote for one index image lists the index
+and its platform manifest, and holds that one image: without a pin, ocicfs
+records the index. The tag of a bare name is not recorded — the image is keyed by
 `name@digest`, as with `--from-dir`. A gzip-, zstd-, xz- or bzip2-compressed
 archive is refused: decompress it first. `--delta` and `--ingest-workers`
 apply as to `--from-dir`.
+
+### Writing an archive with `ocicfs copy`
+
+`ocicfs copy` fetches images from their registry and writes them to one
+archive that `--from-tar` and `docker load` read. It needs no store and no
+privilege, so it runs on a build host or in CI: a factory build that ships
+images to devices offline packs them there, with no docker daemon.
+
+```sh
+ocicfs copy --platform linux/arm64 -o images.tar \
+  ghcr.io/example/app:1.2.3 ghcr.io/example/db@sha256:<digest>
+```
+
+On the device, sideload each image, pinned to the digest its compose file
+names, then load the archive once:
+
+```sh
+ocicfs pull --from-tar images.tar "ghcr.io/example/app@$pin"
+ocicfs pull --from-tar images.tar "ghcr.io/example/db@$pin"
+docker load -i images.tar
+```
+
+The archive keeps the registry's bytes, so every digest and the publisher's
+seal survive, and only the blobs of one platform, `--platform` (default: the
+host's). An image whose root is an index is listed twice in `index.json`:
+by the index, named by the reference it was copied by — its tag, or its digest
+when the reference carries only a digest — and by the platform's manifest,
+named by that manifest's digest. A pin on either digest then resolves, both
+for `--from-tar` and for the image docker loads. Both name annotations,
+`io.containerd.image.name` and `org.opencontainers.image.ref.name`, carry the
+full name. Blobs the images share are written once. Every blob is verified as
+it is copied, and the archive appears under its name only once complete. The
+command prints each `index.json` entry it wrote, as `<name>\t<digest>`.
 
 ## Layers Already Read
 
