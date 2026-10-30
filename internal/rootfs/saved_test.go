@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -529,4 +530,83 @@ func flipByte(data []byte, i int) []byte {
 	out := append([]byte{}, data...)
 	out[i] ^= 0xff
 	return out
+}
+
+// TestMergeEntriesMatchesBuildEntries asserts merging layers scanned one by
+// one, or decoded from their saved form, yields the inventory BuildEntries
+// builds from the same streams: identical for scanned layers, and identical
+// but for the fs-verity digests a decoded layer leaves to the caller.
+func TestMergeEntriesMatchesBuildEntries(t *testing.T) {
+	ctx := context.Background()
+	for name, layers := range savedFixtures(t) {
+		t.Run(name, func(t *testing.T) {
+			diffIDs := make([]digest.Digest, len(layers))
+			for i, layer := range layers {
+				diffIDs[i] = digest.FromBytes(layer)
+			}
+			want, wantCanonical, err := BuildEntries(ctx, digestSink{}, openTestLayers(t, layers...), diffIDs)
+			if err != nil {
+				t.Fatalf("BuildEntries: %v", err)
+			}
+
+			scanned := make([]*Layer, len(layers))
+			decoded := make([]*Layer, len(layers))
+			for i, layer := range layers {
+				l, err := ScanLayer(ctx, digestSink{}, bytes.NewReader(layer), diffIDs[i], i)
+				if err != nil {
+					t.Fatalf("ScanLayer(%d): %v", i, err)
+				}
+				data, err := EncodeLayer(l, 0, diffIDs[i])
+				if err != nil {
+					t.Fatalf("EncodeLayer(%d): %v", i, err)
+				}
+				if decoded[i], err = DecodeLayer(data, i, 0, diffIDs[i]); err != nil {
+					t.Fatalf("DecodeLayer(%d): %v", i, err)
+				}
+				scanned[i] = l
+			}
+
+			got, canonical, err := MergeEntries(scanned, func(digest.Digest) digest.Digest {
+				t.Fatal("a scanned layer has no pending payload")
+				return ""
+			})
+			if err != nil {
+				t.Fatalf("MergeEntries(scanned): %v", err)
+			}
+			if !reflect.DeepEqual(got, want) || canonical != wantCanonical {
+				t.Fatalf("MergeEntries(scanned) = %+v, %t; want %+v, %t", got, canonical, want, wantCanonical)
+			}
+
+			got, canonical, err = MergeEntries(decoded, func(d digest.Digest) digest.Digest { return d })
+			if err != nil {
+				t.Fatalf("MergeEntries(decoded): %v", err)
+			}
+			for i := range got {
+				if got[i].Digest != "" && got[i].Verity != got[i].Digest {
+					t.Fatalf("%s: Verity = %s, want the content digest %s", got[i].Path, got[i].Verity, got[i].Digest)
+				}
+				got[i].Verity = ""
+			}
+			stripped := slices.Clone(want)
+			for i := range stripped {
+				stripped[i].Verity = ""
+			}
+			if !reflect.DeepEqual(got, stripped) || canonical != wantCanonical {
+				t.Fatalf("MergeEntries(decoded) = %+v, %t; want %+v, %t", got, canonical, stripped, wantCanonical)
+			}
+		})
+	}
+}
+
+// TestMergeEntriesRejectsMisplacedLayer asserts a layer scanned for one
+// position is not merged at another.
+func TestMergeEntriesRejectsMisplacedLayer(t *testing.T) {
+	layer := metadataLayer(t)
+	l, err := ScanLayer(context.Background(), digestSink{}, bytes.NewReader(layer), digest.FromBytes(layer), 1)
+	if err != nil {
+		t.Fatalf("ScanLayer: %v", err)
+	}
+	if _, _, err := MergeEntries([]*Layer{l}, func(d digest.Digest) digest.Digest { return d }); err == nil {
+		t.Fatal("MergeEntries accepted layer 1 at position 0")
+	}
 }

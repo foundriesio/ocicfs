@@ -551,6 +551,45 @@ func BuildEntries(ctx context.Context, sink ObjectSink, openLayer func(int) (io.
 	return m.entries()
 }
 
+// ScanLayer reads layer idx's decompressed tar stream and returns its
+// entries, every stored file streamed into sink, after verifying the whole
+// stream hashes to diffID at end of stream. It needs no builder: the layer
+// is merged with MergeEntries, or encoded with EncodeLayer first.
+func ScanLayer(ctx context.Context, sink ObjectSink, layer io.Reader, diffID digest.Digest, idx int) (*Layer, error) {
+	return scanLayer(ctx, sink, layer, diffID, idx)
+}
+
+// MergeEntries merges already-scanned layers, the one at position i scanned
+// or decoded as layer i, into one tree and returns the merged composefs
+// inventory as BuildEntries does. A stored payload whose fs-verity digest is
+// still pending, as in a decoded layer, is given verity of its content
+// digest. The layers are consumed: merging changes their nodes. The bool
+// reports whether the tree was built without any divergence from the
+// upstream-reproducible construction.
+func MergeEntries(layers []*Layer, verity func(digest.Digest) digest.Digest) ([]composefs.Entry, bool, error) {
+	m := newMerge()
+	for i, l := range layers {
+		if l.idx != i {
+			return nil, false, fmt.Errorf("rootfs: layer at position %d was scanned as layer %d", i, l.idx)
+		}
+		if err := m.merge(l); err != nil {
+			return nil, false, err
+		}
+	}
+	for _, n := range m.tree {
+		if n.link != nil {
+			n = n.link
+		}
+		if n.digest != "" && n.verity == "" && n.sealed == nil && n.size > composefs.InlineContentMax {
+			n.verity = verity(n.digest)
+		}
+	}
+	if err := m.resolve(); err != nil {
+		return nil, false, err
+	}
+	return m.entries()
+}
+
 // merge is one image's layers being applied in order into one tree. diverged
 // records whether any layer so far diverged from the upstream-reproducible
 // construction.
