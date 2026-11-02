@@ -33,10 +33,11 @@
 # checked, and the image goes through the lifecycle twice more from it with
 # pull --from-tar, unpinned and pinned to the platform manifest,
 # so the currently implemented functionality can be checked by hand in one
-# command. With SMOKE_ARCHIVE set, a real docker save archive goes through
-# the same lifecycle too. A final differential leg diffs the mounted rootfs against the same
-# image flattened by crane export, so the layer merge is checked against an
-# independent implementation on a real image. A sealing leg then runs
+# command. With SMOKE_ARCHIVE set, a real archive (docker save, or
+# docker buildx -o type=oci) goes through the same lifecycle too. A final
+# differential leg diffs the mounted rootfs against the same image flattened
+# by crane export, so the layer merge is checked against an independent
+# implementation on a real image. A sealing leg then runs
 # `ocicfs seal` against the registry for the host platform of the multi-arch
 # image -- dry-run parity, the annotation check on the raw pushed manifest,
 # and the sealed image's own full lifecycle, whose pull verifies the seal
@@ -61,9 +62,10 @@
 #   SMOKE_REG_PORT  loopback port for the smoke run's own zot instance
 #                   (default 5001; the dev container's persistent registry
 #                   owns 5000)
-#   SMOKE_ARCHIVE   a docker save archive (uncompressed tar, one image saved
-#                   by name) to run through the lifecycle with pull --from-tar
-#                   and no reference; skipped when unset
+#   SMOKE_ARCHIVE   a docker save or docker buildx -o type=oci archive
+#                   (uncompressed tar, one image saved by name) to run
+#                   through the lifecycle with pull --from-tar and no
+#                   reference; skipped when unset
 set -euo pipefail
 
 IMAGE="${SMOKE_IMAGE:-docker.io/library/busybox:latest}"
@@ -345,9 +347,9 @@ tar -C "$TARINDEX" -rf "$TARBALL" index.json
 run_lifecycle "index.docker.io/library/smoke@$sdigest" "$sdigest" "$sdigest" pull --from-tar "$TARBALL"
 
 if [ -n "$ARCHIVE" ]; then
-	echo "==== lifecycle 1d: real docker save archive $ARCHIVE (--from-tar, SMOKE_ARCHIVE) ===="
+	echo "==== lifecycle 1d: real archive $ARCHIVE (--from-tar, SMOKE_ARCHIVE) ===="
 	tar -tf "$ARCHIVE" 2>/dev/null | grep -qx 'index.json' \
-		|| fail "$ARCHIVE is not an uncompressed OCI layout tar (no index.json listed; docker save writes one, and ocicfs does not read a compressed archive)"
+		|| fail "$ARCHIVE is not an uncompressed OCI layout tar (no index.json listed; docker save and buildx write one, and ocicfs does not read a compressed archive)"
 	aindex="$(tar -xOf "$ARCHIVE" index.json)"
 	[ "$(jq -r '.manifests | length' <<<"$aindex")" = 1 ] \
 		|| fail "$ARCHIVE holds $(jq -r '.manifests | length' <<<"$aindex") images; save exactly one image by name"
@@ -370,7 +372,7 @@ if [ -n "$ARCHIVE" ]; then
 	[[ "$aref" == *"@$adigest" ]] || fail "recorded reference $aref does not pin the archive's entry $adigest"
 	run_lifecycle "$aref" "$aidentity" "$adigest" pull --from-tar "$ARCHIVE"
 else
-	echo "==== lifecycle 1d skipped: set SMOKE_ARCHIVE=<docker save archive> to run a real archive through the lifecycle ===="
+	echo "==== lifecycle 1d skipped: set SMOKE_ARCHIVE=<archive> to run a real archive through the lifecycle ===="
 fi
 
 echo "==== lifecycle 2: image pulled from a loopback HTTP registry ===="
@@ -663,4 +665,4 @@ else
 	echo "== skipped: the delta fixtures are linux/amd64 images =="
 fi
 
-echo "SMOKE OK: purpose-built image sealed, cross-checked four ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir, from a tar of the layout and from a tar of a single-platform layout by the name they carry via --from-tar (and from a real docker save archive when SMOKE_ARCHIVE is set), and from a registry, digest-pinned and by tag, and from an ocicfs copy archive of that tag unpinned and pinned to the platform manifest, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding, a gc round (unwanted reclaimed, in-use survives until unmount on both mount paths, empty store fully reclaimed down to its shard directories), and a delta round (N+1 pulled by ranges over a held N, identical to a plain pull, N reclaimed once released and removed) (checks passed)"
+echo "SMOKE OK: purpose-built image sealed, cross-checked four ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir, from a tar of the layout and from a tar of a single-platform layout by the name they carry via --from-tar (and from a real docker save or buildx archive when SMOKE_ARCHIVE is set), and from a registry, digest-pinned and by tag, and from an ocicfs copy archive of that tag unpinned and pinned to the platform manifest, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding, a gc round (unwanted reclaimed, in-use survives until unmount on both mount paths, empty store fully reclaimed down to its shard directories), and a delta round (N+1 pulled by ranges over a held N, identical to a plain pull, N reclaimed once released and removed) (checks passed)"
