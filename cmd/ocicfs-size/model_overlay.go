@@ -38,6 +38,7 @@ type Breakdown struct {
 	Inodes       int64       `json:"inodes,omitempty"`  // absent when the model does not count them
 	Files        int64       `json:"files"`             // regular files the store keeps on the host
 	Unused       UnusedStats `json:"unused"`
+	Reuse        *Reuse      `json:"reuse,omitempty"`
 }
 
 // UnusedStats counts stored file versions no retained root shows.
@@ -133,6 +134,7 @@ func overlaySize(roots []*root, p Profile) (*Breakdown, string) {
 	b.Host += int64(len(xattrBlocks))*p.HostBlock + snapshotsDirBlocks(len(snaps), p)
 	b.Units = len(snaps)
 	b.Unused = unusedFiles(roots, payloadKey, func(size int64) int64 { return alloc(size, p.HostBlock) })
+	b.Reuse = snapshotReuse(roots, true)
 	b.total(p)
 	return b, ""
 }

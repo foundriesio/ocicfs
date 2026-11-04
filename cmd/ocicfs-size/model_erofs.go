@@ -50,6 +50,7 @@ func erofsSize(roots []*root, p Profile) (*Breakdown, string) {
 	b.Units = len(snaps)
 	b.Files = int64(len(snaps)) // one layer.erofs per snapshot
 	b.Unused = unusedFiles(roots, payloadKey, func(size int64) int64 { return alloc(size, p.ErofsBlock) })
+	b.Reuse = snapshotReuse(roots, true)
 	b.total(p)
 	return b, ""
 }
@@ -111,6 +112,7 @@ func layerCasSize(roots []*root, p Profile) (*Breakdown, string) {
 		}
 		return e.Digest, e.Size, true
 	}, func(size int64) int64 { return alloc(size, p.HostBlock) })
+	b.Reuse = snapshotReuse(roots, false)
 	b.total(p)
 	return b, ""
 }
