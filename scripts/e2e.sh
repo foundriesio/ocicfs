@@ -3,7 +3,7 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: Apache-2.0
 #
-# ocicfs smoke test: exercise the image lifecycle and sealing against a real
+# ocicfs end-to-end test: exercise the image lifecycle and sealing against a real
 # image and a real registry.
 #
 # Phase 0 builds a purpose-built image offline with umoci -- object, inline,
@@ -33,7 +33,7 @@
 # checked, and the image goes through the lifecycle twice more from it with
 # pull --from-tar, unpinned and pinned to the platform manifest,
 # so the currently implemented functionality can be checked by hand in one
-# command. With SMOKE_ARCHIVE set, a real archive (docker save, or
+# command. With E2E_ARCHIVE set, a real archive (docker save, or
 # docker buildx -o type=oci) goes through the same lifecycle too. A final
 # differential leg diffs the mounted rootfs against the same image flattened
 # by crane export, so the layer merge is checked against an independent
@@ -48,29 +48,29 @@
 # container. Either open the dev container and run the target
 # inside it:
 #
-#   ./devshell.sh                # opens a shell in the dev container; then: make smoke
+#   ./devshell.sh                # opens a shell in the dev container; then: make test-e2e
 #
 # or run it one-shot against a container built from the Containerfile:
 #
-#   docker run --rm --privileged -v "$PWD":/work ocicfs-dev make smoke
+#   docker run --rm --privileged -v "$PWD":/work ocicfs-dev make test-e2e
 #
 # Env:
-#   SMOKE_IMAGE     registry image to pull (default docker.io/library/busybox:latest)
-#   SMOKE_LAYOUT    OCI layout directory; cached across runs, so a repeat run needs no
-#                   network (pre-populate it to run fully offline; the registry leg is
-#                   loopback-local and needs no network either)
-#   SMOKE_REG_PORT  loopback port for the smoke run's own zot instance
-#                   (default 5001; the dev container's persistent registry
-#                   owns 5000)
-#   SMOKE_ARCHIVE   a docker save or docker buildx -o type=oci archive
-#                   (uncompressed tar, one image saved by name) to run
-#                   through the lifecycle with pull --from-tar and no
-#                   reference; skipped when unset
+#   E2E_IMAGE     registry image to pull (default docker.io/library/busybox:latest)
+#   E2E_LAYOUT    OCI layout directory; cached across runs, so a repeat run needs no
+#                 network (pre-populate it to run fully offline; the registry leg is
+#                 loopback-local and needs no network either)
+#   E2E_REG_PORT  loopback port for the e2e run's own zot instance
+#                 (default 5001; the dev container's persistent registry
+#                 owns 5000)
+#   E2E_ARCHIVE   a docker save or docker buildx -o type=oci archive
+#                 (uncompressed tar, one image saved by name) to run
+#                 through the lifecycle with pull --from-tar and no
+#                 reference; skipped when unset
 set -euo pipefail
 
-IMAGE="${SMOKE_IMAGE:-docker.io/library/busybox:latest}"
-LAYOUT="${SMOKE_LAYOUT:-/tmp/ocicfs-smoke-layout}"
-ARCHIVE="${SMOKE_ARCHIVE:-}"
+IMAGE="${E2E_IMAGE:-docker.io/library/busybox:latest}"
+LAYOUT="${E2E_LAYOUT:-/tmp/ocicfs-e2e-layout}"
+ARCHIVE="${E2E_ARCHIVE:-}"
 STORE=""
 MNT=""
 OVL=""
@@ -109,11 +109,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-STORE="$(mktemp -d /var/lib/ocicfs/smoke-XXXXXX)"
+STORE="$(mktemp -d /var/lib/ocicfs/e2e-XXXXXX)"
 MNT="$(mktemp -d)"
 KN=(bin/ocicfs --root "$STORE")
 
-fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
+fail() { echo "E2E FAIL: $*" >&2; exit 1; }
 
 # host_child prints the digest of the manifest an image index offers for the
 # host platform -- the identity ocicfs keys the image by. $1 is the index JSON.
@@ -175,7 +175,7 @@ run_lifecycle() {
 	echo "== mounted rootfs (expect non-empty, read-only) =="
 	ls -la "$MNT"
 	[ -n "$(ls -A "$MNT")" ] || fail "mounted rootfs is empty"
-	if touch "$MNT/.smoke-rw-probe" 2>/dev/null; then fail "mounted rootfs is writable"; fi
+	if touch "$MNT/.e2e-rw-probe" 2>/dev/null; then fail "mounted rootfs is writable"; fi
 
 	echo "== unmount (expect the mountpoint emptied) =="
 	"${KN[@]}" unmount "$MNT"
@@ -184,7 +184,7 @@ run_lifecycle() {
 	echo "== mount --metadata-only + consumer-assembled overlay =="
 	# The upper and work directories must not live on an overlayfs, so keep the
 	# whole leg beside the store on the verity-capable filesystem.
-	OVL="$(mktemp -d /var/lib/ocicfs/smoke-ovl-XXXXXX)"
+	OVL="$(mktemp -d /var/lib/ocicfs/e2e-ovl-XXXXXX)"
 	mkdir "$OVL/meta" "$OVL/merged" "$OVL/upper" "$OVL/work"
 	"${KN[@]}" mount --metadata-only "$ref" "$OVL/meta"
 	mount -t overlay overlay -o \
@@ -196,7 +196,7 @@ run_lifecycle() {
 	f="$(find "$OVL/merged" -xdev -type f -size +0c -print -quit)"
 	[ -n "$f" ] || fail "merged rootfs has no file content"
 	cat "$f" >/dev/null || fail "reading $f through the verity overlay failed"
-	touch "$OVL/merged/.smoke-rw-probe" || fail "merged overlay is not writable"
+	touch "$OVL/merged/.e2e-rw-probe" || fail "merged overlay is not writable"
 
 	"${KN[@]}" unmount "$OVL/merged"
 	"${KN[@]}" unmount "$OVL/meta"
@@ -230,7 +230,7 @@ run_lifecycle() {
 # container's persistent one on 5000, so every assertion runs against
 # hermetic per-run registry state untouched by manual testing or previous
 # runs.
-port="${SMOKE_REG_PORT:-5001}"
+port="${E2E_REG_PORT:-5001}"
 REGDIR="$(mktemp -d)"
 cat >"$REGDIR/config.json" <<EOF
 {
@@ -256,7 +256,7 @@ echo "==== phase 0: purpose-built image -> seal -> cross-check -> lifecycle ====
 # whiteout and an override. Hardlink-free so the cross-check below must
 # reach the exact four-way digest match, not its fallback.
 echo "== build with umoci and push =="
-IMGDIR="$(mktemp -d /var/lib/ocicfs/smoke-img-XXXXXX)"
+IMGDIR="$(mktemp -d /var/lib/ocicfs/e2e-img-XXXXXX)"
 umoci init --layout "$IMGDIR/layout"
 umoci new --image "$IMGDIR/layout:custom"
 umoci unpack --image "$IMGDIR/layout:custom" "$IMGDIR/b1" >/dev/null 2>&1
@@ -312,10 +312,10 @@ digest="$(jq -r '.manifests[0].digest' "$LAYOUT/index.json")"
 # The layout pins a multi-arch index, so the identity these legs must land on is
 # the child manifest it offers for the host platform.
 identity="$(host_child "$(cat "$LAYOUT/blobs/sha256/${digest#sha256:}")")"
-[[ "$identity" == sha256:* ]] || fail "smoke layout index lists no linux/$(go env GOARCH) manifest"
+[[ "$identity" == sha256:* ]] || fail "e2e layout index lists no linux/$(go env GOARCH) manifest"
 
 echo "==== lifecycle 1: image sideloaded from a local directory ===="
-run_lifecycle "smoke@$digest" "$identity" "$digest" pull --from-dir "$LAYOUT" "smoke@$digest"
+run_lifecycle "e2e@$digest" "$identity" "$digest" pull --from-dir "$LAYOUT" "e2e@$digest"
 
 echo "==== lifecycle 1b: image sideloaded from a tar of the layout (--from-tar) ===="
 # The archive is laid out as docker save writes one: blobs before index.json,
@@ -325,10 +325,10 @@ echo "==== lifecycle 1b: image sideloaded from a tar of the layout (--from-tar) 
 # as every reference is.
 TARBALL="$(mktemp --suffix=.tar)"
 TARINDEX="$(mktemp -d)"
-jq '.manifests[0].annotations["io.containerd.image.name"] = "smoke:latest"' "$LAYOUT/index.json" >"$TARINDEX/index.json"
+jq '.manifests[0].annotations["io.containerd.image.name"] = "e2e:latest"' "$LAYOUT/index.json" >"$TARINDEX/index.json"
 tar -C "$LAYOUT" -cf "$TARBALL" oci-layout blobs
 tar -C "$TARINDEX" -rf "$TARBALL" index.json
-run_lifecycle "index.docker.io/library/smoke@$digest" "$identity" "$digest" pull --from-tar "$TARBALL"
+run_lifecycle "index.docker.io/library/e2e@$digest" "$identity" "$digest" pull --from-tar "$TARBALL"
 
 echo "==== lifecycle 1c: host-platform image sideloaded from a tar of a single-platform layout (--from-tar) ===="
 # The shape docker save --platform writes: index.json points straight at the
@@ -341,13 +341,13 @@ fi
 sdigest="$(jq -r '.manifests[0].digest' "$LAYOUT-single/index.json")"
 [ "$(jq -r '.manifests[0].mediaType' "$LAYOUT-single/index.json")" = "application/vnd.oci.image.manifest.v1+json" ] \
 	|| fail "single-platform layout's index.json does not point at a manifest"
-jq '.manifests[0].annotations["io.containerd.image.name"] = "smoke:latest"' "$LAYOUT-single/index.json" >"$TARINDEX/index.json"
+jq '.manifests[0].annotations["io.containerd.image.name"] = "e2e:latest"' "$LAYOUT-single/index.json" >"$TARINDEX/index.json"
 tar -C "$LAYOUT-single" -cf "$TARBALL" oci-layout blobs
 tar -C "$TARINDEX" -rf "$TARBALL" index.json
-run_lifecycle "index.docker.io/library/smoke@$sdigest" "$sdigest" "$sdigest" pull --from-tar "$TARBALL"
+run_lifecycle "index.docker.io/library/e2e@$sdigest" "$sdigest" "$sdigest" pull --from-tar "$TARBALL"
 
 if [ -n "$ARCHIVE" ]; then
-	echo "==== lifecycle 1d: real archive $ARCHIVE (--from-tar, SMOKE_ARCHIVE) ===="
+	echo "==== lifecycle 1d: real archive $ARCHIVE (--from-tar, E2E_ARCHIVE) ===="
 	tar -tf "$ARCHIVE" 2>/dev/null | grep -qx 'index.json' \
 		|| fail "$ARCHIVE is not an uncompressed OCI layout tar (no index.json listed; docker save and buildx write one, and ocicfs does not read a compressed archive)"
 	aindex="$(tar -xOf "$ARCHIVE" index.json)"
@@ -372,15 +372,15 @@ if [ -n "$ARCHIVE" ]; then
 	[[ "$aref" == *"@$adigest" ]] || fail "recorded reference $aref does not pin the archive's entry $adigest"
 	run_lifecycle "$aref" "$aidentity" "$adigest" pull --from-tar "$ARCHIVE"
 else
-	echo "==== lifecycle 1d skipped: set SMOKE_ARCHIVE=<archive> to run a real archive through the lifecycle ===="
+	echo "==== lifecycle 1d skipped: set E2E_ARCHIVE=<archive> to run a real archive through the lifecycle ===="
 fi
 
 echo "==== lifecycle 2: image pulled from a loopback HTTP registry ===="
-crane push "$LAYOUT" "127.0.0.1:$port/smoke"
-run_lifecycle "127.0.0.1:$port/smoke@$digest" "$identity" "$digest" pull "127.0.0.1:$port/smoke@$digest"
+crane push "$LAYOUT" "127.0.0.1:$port/e2e"
+run_lifecycle "127.0.0.1:$port/e2e@$digest" "$identity" "$digest" pull "127.0.0.1:$port/e2e@$digest"
 
 echo "==== lifecycle 3: image pulled and addressed by tag ===="
-run_lifecycle "127.0.0.1:$port/smoke:latest" "$identity" "$digest" pull "127.0.0.1:$port/smoke:latest"
+run_lifecycle "127.0.0.1:$port/e2e:latest" "$identity" "$digest" pull "127.0.0.1:$port/e2e:latest"
 
 echo "==== lifecycle 3b: image written to an archive by ocicfs copy (--from-tar by either digest) ===="
 # copy keeps the blobs of the host platform only and lists the image twice in
@@ -388,16 +388,16 @@ echo "==== lifecycle 3b: image written to an archive by ocicfs copy (--from-tar 
 # name in both annotations. Pulled with no reference, the archive is the one
 # image the index names; pinned to the platform manifest, it is that.
 COPYTAR="$(mktemp --suffix=.tar)"
-"${KN[@]}" copy -o "$COPYTAR" "127.0.0.1:$port/smoke:latest"
+"${KN[@]}" copy -o "$COPYTAR" "127.0.0.1:$port/e2e:latest"
 centries="$(tar -xOf "$COPYTAR" index.json | jq -c '[.manifests[] | [.digest, .annotations["io.containerd.image.name"], .annotations["org.opencontainers.image.ref.name"]]]')"
-cwant="$(jq -nc --arg d "$digest" --arg i "$identity" --arg r "127.0.0.1:$port/smoke" \
+cwant="$(jq -nc --arg d "$digest" --arg i "$identity" --arg r "127.0.0.1:$port/e2e" \
 	'[[$d, ($r + ":latest"), ($r + ":latest")], [$i, ($r + "@" + $i), ($r + "@" + $i)]]')"
 [ "$centries" = "$cwant" ] || fail "ocicfs copy wrote the index.json entries $centries, want $cwant"
 for child in $(jq -r --arg i "$identity" '.manifests[] | select(.digest != $i) | .digest' "$LAYOUT/blobs/sha256/${digest#sha256:}"); do
 	! tar -tf "$COPYTAR" | grep -qx "blobs/sha256/${child#sha256:}" || fail "ocicfs copy wrote $child, the manifest of another platform"
 done
-run_lifecycle "127.0.0.1:$port/smoke@$digest" "$identity" "$digest" pull --from-tar "$COPYTAR"
-run_lifecycle "127.0.0.1:$port/smoke@$identity" "$identity" "$identity" pull --from-tar "$COPYTAR" "127.0.0.1:$port/smoke@$identity"
+run_lifecycle "127.0.0.1:$port/e2e@$digest" "$identity" "$digest" pull --from-tar "$COPYTAR"
+run_lifecycle "127.0.0.1:$port/e2e@$identity" "$identity" "$identity" pull --from-tar "$COPYTAR" "127.0.0.1:$port/e2e@$identity"
 
 echo "==== differential: mounted rootfs vs crane's image-level flatten ===="
 # crane export flattens the image the same way ocicfs's merge must (docker
@@ -410,7 +410,7 @@ echo "==== differential: mounted rootfs vs crane's image-level flatten ===="
 # dereferencing would produce false errors. diff checks names, content, and
 # link targets; owners, modes, xattrs, and hardlink identity are covered by
 # the Go e2e tests.
-ref="127.0.0.1:$port/smoke@$digest"
+ref="127.0.0.1:$port/e2e@$digest"
 "${KN[@]}" pull "$ref"
 "${KN[@]}" mount "$ref" "$MNT"
 EXPORTDIR="$(mktemp -d)"
@@ -420,7 +420,7 @@ diff -r -q --no-dereference "$EXPORTDIR" "$MNT" || fail "mounted rootfs differs 
 "${KN[@]}" remove "$ref"
 
 echo "==== seal: publisher-side sealing, then the sealed image's lifecycle ===="
-# Seal handles one platform per call; the smoke image is a multi-arch index,
+# Seal handles one platform per call; the e2e image is a multi-arch index,
 # so select the host platform. --platform matches the index descriptors
 # exactly, including the variant (busybox lists arm64 only as linux/arm64/v8),
 # so read the full platform string from the index rather than assuming a bare
@@ -428,12 +428,12 @@ echo "==== seal: publisher-side sealing, then the sealed image's lifecycle ===="
 platform="$(crane manifest "$ref" | jq -r --arg arch "$(go env GOARCH)" \
 	'first(.manifests[].platform | select(.os == "linux" and .architecture == $arch))
 		| [.os, .architecture, .variant // empty] | join("/")')"
-[[ "$platform" == linux/* ]] || fail "smoke index lists no linux/$(go env GOARCH) platform"
+[[ "$platform" == linux/* ]] || fail "e2e index lists no linux/$(go env GOARCH) platform"
 echo "== seal --dry-run (expect a sealed digest, nothing pushed) =="
 dryrun="$("${KN[@]}" seal --dry-run --platform "$platform" --format json "$ref")"
 sealed_dry="$(jq -r .sealed <<<"$dryrun")"
 [[ "$sealed_dry" == sha256:* ]] || fail "seal --dry-run reported no sealed digest"
-if crane manifest "127.0.0.1:$port/smoke@$sealed_dry" >/dev/null 2>&1; then
+if crane manifest "127.0.0.1:$port/e2e@$sealed_dry" >/dev/null 2>&1; then
 	fail "seal --dry-run pushed the sealed manifest"
 fi
 
@@ -446,12 +446,12 @@ sealed="$(jq -r .sealed <<<"$sealout")"
 echo "== raw sealed manifest (expect both fsverity annotations, bare hex) =="
 # The annotations live on each platform image manifest. A multi-arch image
 # seals as an index, so descend to the host platform's child first.
-manifest="$(crane manifest "127.0.0.1:$port/smoke@$sealed")"
+manifest="$(crane manifest "127.0.0.1:$port/e2e@$sealed")"
 child="$sealed"
 if jq -e '.manifests' <<<"$manifest" >/dev/null; then
 	child="$(host_child "$manifest")"
 	[[ "$child" == sha256:* ]] || fail "sealed index has no host-platform manifest"
-	manifest="$(crane manifest "127.0.0.1:$port/smoke@$child")"
+	manifest="$(crane manifest "127.0.0.1:$port/e2e@$child")"
 fi
 jq -e '.annotations["composefs.merged.erofs.v1.fsverity-sha256-12"] | test("^[0-9a-f]{64}$")' \
 	<<<"$manifest" >/dev/null || fail "sealed manifest lacks a well-formed merged fsverity annotation"
@@ -461,15 +461,15 @@ jq -e '.config.annotations["composefs.config.fsverity-sha256-12"] | test("^[0-9a
 echo "==== lifecycle 4: the sealed image (pull re-verifies the seal) ===="
 # $child is the sealed image's identity: the host platform's manifest when the
 # seal produced an index, and the sealed manifest itself otherwise.
-run_lifecycle "127.0.0.1:$port/smoke@$sealed" "$child" "$sealed" pull "127.0.0.1:$port/smoke@$sealed"
+run_lifecycle "127.0.0.1:$port/e2e@$sealed" "$child" "$sealed" pull "127.0.0.1:$port/e2e@$sealed"
 
 echo "==== seal enforcement: mount trusts the annotation over the binding ===="
 # The lifecycle legs removed their images, so re-pull the two sealed ones:
-# the multi-arch smoke image is the mount under test, and the purpose-built
+# the multi-arch e2e image is the mount under test, and the purpose-built
 # image supplies a different, internally consistent object for the
 # repointing check. Last leg by design -- it leaves knowingly wrong bindings
 # behind between assertions.
-sref="127.0.0.1:$port/smoke@$sealed"
+sref="127.0.0.1:$port/e2e@$sealed"
 "${KN[@]}" pull "$sref"
 "${KN[@]}" pull "127.0.0.1:$port/custom@$csealed"
 # Each identity was pulled for exactly one platform, so its binding is the
@@ -549,7 +549,7 @@ printf '%s\n' "$out"
 [ -n "$(ls -A "$MNT")" ] || fail "metadata mount broke during gc"
 # Data objects open lazily: prove a by-digest file still opens through the
 # live data plane after the collection, not merely that files remain on disk.
-GCOVL="$(mktemp -d /var/lib/ocicfs/smoke-gc-ovl-XXXXXX)"
+GCOVL="$(mktemp -d /var/lib/ocicfs/e2e-gc-ovl-XXXXXX)"
 mkdir "$GCOVL/merged" "$GCOVL/upper" "$GCOVL/work"
 mount -t overlay overlay -o \
 	"lowerdir=$MNT::$STORE/objects/fsverity-sha256-12,upperdir=$GCOVL/upper,workdir=$GCOVL/work,redirect_dir=on,metacopy=on,verity=require" \
@@ -637,7 +637,7 @@ if [ "$(go env GOARCH)" = amd64 ]; then
 	rm -f "$dlog"
 
 	echo "== plain pull of N+1 into a second store (expect the same composefs image) =="
-	DSTORE="$(mktemp -d /var/lib/ocicfs/smoke-delta-XXXXXX)"
+	DSTORE="$(mktemp -d /var/lib/ocicfs/e2e-delta-XXXXXX)"
 	bin/ocicfs --root "$DSTORE" pull "$n1ref"
 	dinspect="$("${KN[@]}" inspect --format json "$n1ref")"
 	pinspect="$(bin/ocicfs --root "$DSTORE" inspect --format json "$n1ref")"
@@ -665,4 +665,4 @@ else
 	echo "== skipped: the delta fixtures are linux/amd64 images =="
 fi
 
-echo "SMOKE OK: purpose-built image sealed, cross-checked four ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir, from a tar of the layout and from a tar of a single-platform layout by the name they carry via --from-tar (and from a real docker save or buildx archive when SMOKE_ARCHIVE is set), and from a registry, digest-pinned and by tag, and from an ocicfs copy archive of that tag unpinned and pinned to the platform manifest, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding, a gc round (unwanted reclaimed, in-use survives until unmount on both mount paths, empty store fully reclaimed down to its shard directories), and a delta round (N+1 pulled by ranges over a held N, identical to a plain pull, N reclaimed once released and removed) (checks passed)"
+echo "E2E OK: purpose-built image sealed, cross-checked four ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir, from a tar of the layout and from a tar of a single-platform layout by the name they carry via --from-tar (and from a real docker save or buildx archive when E2E_ARCHIVE is set), and from a registry, digest-pinned and by tag, and from an ocicfs copy archive of that tag unpinned and pinned to the platform manifest, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding, a gc round (unwanted reclaimed, in-use survives until unmount on both mount paths, empty store fully reclaimed down to its shard directories), and a delta round (N+1 pulled by ranges over a held N, identical to a plain pull, N reclaimed once released and removed) (checks passed)"

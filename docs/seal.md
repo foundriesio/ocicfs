@@ -194,10 +194,10 @@ ocicfs pull "127.0.0.1:5000/app@<sealed digest>"
 ```
 
 The registry persists for the container's lifetime (storage under
-`/var/lib/zot`, log at `/var/tmp/zot.log`). `make smoke` runs the same round
+`/var/lib/zot`, log at `/var/tmp/zot.log`). `make test-e2e` runs the same round
 automatically — dry-run parity, the annotation check on the raw pushed
 manifest, then a device-side pull of the sealed image — against its own
-ephemeral zot instance, so smoke runs never see manual state.
+ephemeral zot instance, so end-to-end runs never see manual state.
 
 The failure path is worth exercising by hand too: a sealed manifest whose
 annotation disagrees with its content must not pull. Overwrite the recorded

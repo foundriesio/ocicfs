@@ -90,16 +90,16 @@ for more.
   make build
   ```
 - Changes that touch ocicfs's privileged paths (mount, fs-verity, CAS build)
-  must also pass the smoke test, which needs the privileged dev container:
+  must also pass the end-to-end test, which needs the privileged dev container:
   ```bash
-  ./devshell.sh make smoke
+  ./devshell.sh make test-e2e
   ```
 - Every Go source file carries the Apache-2.0 SPDX header
   (`// SPDX-License-Identifier: Apache-2.0`).
 
 ## Continuous integration
 
-CI runs `make lint` and `make build test smoke` in the dev container. A pull
+CI runs `make lint` and `make build test test-e2e` in the dev container. A pull
 request is expected to be green before review.
 
 ## Reporting security issues

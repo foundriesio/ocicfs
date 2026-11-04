@@ -27,16 +27,16 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
-      # Cache the smoke test's OCI layout so a docker.io outage or anonymous
+      # Cache the end-to-end test's OCI layout so a docker.io outage or anonymous
       # rate limit cannot fail the job: the image is pinned by index digest, so
       # the cache never goes stale and the registry is contacted at most once
       # per arch.
       - uses: actions/cache@v6
         with:
-          path: .smoke-layout
-          key: smoke-layout-${{ matrix.arch }}-fd8d9aa63ba2
+          path: .e2e-layout
+          key: e2e-layout-${{ matrix.arch }}-fd8d9aa63ba2
       # Build a tiny image for the runner's platform with its docker buildx
-      # into an OCI archive, so the smoke test pulls a real buildx archive
+      # into an OCI archive, so the end-to-end test pulls a real buildx archive
       # with --from-tar. The default docker driver cannot export OCI, hence
       # the docker-container builder. The image needs no base, so no
       # registry is contacted.
@@ -44,7 +44,7 @@ jobs:
           mkdir -p .buildx
           docker buildx create --name oci-export --driver docker-container
           docker buildx build --builder oci-export --platform linux/${{ matrix.arch }} \
-            -o type=oci,dest=.buildx/oci.tar,name=example.com/buildx-smoke:1 - <<'EOF'
+            -o type=oci,dest=.buildx/oci.tar,name=example.com/buildx-e2e:1 - <<'EOF'
           FROM scratch
           COPY <<HELLO /hello
           built by docker buildx
@@ -57,10 +57,10 @@ jobs:
       - uses: devcontainers/ci@v0.3
         with:
           runCmd: >-
-            SMOKE_IMAGE=docker.io/library/busybox@sha256:fd8d9aa63ba2f0982b5304e1ee8d3b90a210bc1ffb5314d980eb6962f1a9715d
-            SMOKE_LAYOUT="$PWD/.smoke-layout"
-            SMOKE_ARCHIVE="$PWD/.buildx/oci.tar"
-            make build test smoke install DESTDIR=/tmp/install-check
+            E2E_IMAGE=docker.io/library/busybox@sha256:fd8d9aa63ba2f0982b5304e1ee8d3b90a210bc1ffb5314d980eb6962f1a9715d
+            E2E_LAYOUT="$PWD/.e2e-layout"
+            E2E_ARCHIVE="$PWD/.buildx/oci.tar"
+            make build test test-e2e install DESTDIR=/tmp/install-check
             && test -x /tmp/install-check/usr/local/bin/ocicfs
           push: never
 

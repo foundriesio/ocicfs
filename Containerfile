@@ -130,7 +130,7 @@ RUN curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/ins
 
 # Pull mkcomposefs + mount.composefs + composefs-info + libcomposefs.so from the builder stage.
 # ldconfig rebuilds the linker cache so the shared library is discoverable; the
-# smoke tests confirm the binaries are on PATH and link against it. composefs-info
+# end-to-end test confirms the binaries are on PATH and link against it. composefs-info
 # inspects and measures a built image; the EROFS round-trip test uses its dump and
 # measure-file modes to assert WriteImage reproduces the upstream tool's output.
 # mount.composefs ships with the tools but is no longer used: ocicfs assembles
@@ -158,12 +158,12 @@ RUN command -v crane >/dev/null
 COPY --from=cfsctl-builder /usr/bin/cfsctl /usr/bin/cfsctl
 RUN command -v cfsctl >/dev/null
 
-# zot: a real OCI registry, statically linked, for the smoke test's registry
+# zot: a real OCI registry, statically linked, for the end-to-end test's registry
 # legs and for manual push/seal/pull testing. Unlike an in-process test
 # registry it enforces the distribution spec on manifest PUTs (Content-Type
 # handling, referenced-blob existence), so the `ocicfs seal` push path is
 # exercised against real registry behavior. The entrypoint serves a persistent
-# instance at 127.0.0.1:5000 from the baked config; the smoke test runs its
+# instance at 127.0.0.1:5000 from the baked config; the end-to-end test runs its
 # own ephemeral instance on another port.
 ARG ZOT_VERSION=2.1.17
 RUN arch="$(dpkg --print-architecture)" \
