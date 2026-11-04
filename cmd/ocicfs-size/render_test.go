@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 var update = flag.Bool("update", false, "rewrite the golden files under testdata/golden")
@@ -49,6 +50,7 @@ func TestTextGolden(t *testing.T) {
 				if code := run(context.Background(), argv, nil, &out, &errOut, newSpyOpener().open); code != 0 {
 					t.Fatalf("exit %d: %s", code, errOut.String())
 				}
+				checkWidths(t, out.String())
 				golden(t, filepath.Join(goldenDir, mode+"-"+name+".txt"), out.String())
 			})
 		}
@@ -78,6 +80,23 @@ func TestNumberFormats(t *testing.T) {
 	} {
 		if c.got != c.want {
 			t.Errorf("got %q, want %q", c.got, c.want)
+		}
+	}
+}
+
+// checkWidths checks the storage projection: every box line is boxWidth
+// runes wide and no other line exceeds 80 runes.
+func checkWidths(t *testing.T, out string) {
+	t.Helper()
+	_, proj, _ := strings.Cut(out, "\nSTORAGE PROJECTION")
+	proj, _, _ = strings.Cut(proj, "\nNotes:")
+	for _, l := range strings.Split(proj, "\n") {
+		n := utf8.RuneCountInString(l)
+		if strings.ContainsAny(l[:min(len(l), 3)], "┌│└") && n != boxWidth {
+			t.Errorf("box line of %d runes: %q", n, l)
+		}
+		if n > 80 {
+			t.Errorf("line of %d runes: %q", n, l)
 		}
 	}
 }

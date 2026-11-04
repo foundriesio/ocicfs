@@ -14,6 +14,64 @@ EROFS/layer                 4  -2 (-33.3%)      3.1 MiB   -4.0 KiB (-0.1%)      
 File CAS/image             10  +4 (+66.7%)      3.2 MiB  +48.0 KiB (+1.5%)       3.2 MiB (+2.3%)  +124.0 KiB (+3.9%)
 File CAS/layer             14  +8 (+133.3%)     3.2 MiB  +40.0 KiB (+1.3%)       3.2 MiB (+2.5%)  +120.0 KiB (+3.8%)
 
+STORAGE PROJECTION · modelled allocation per store, not paths
+█ allocation without fs-verity · ▒ fs-verity increment
+1 cell ≈ 0.1 MiB (40 cells = largest total)
+
+┌─ Overlay · 3.1 MiB ──────────────────────────────────────────────────┐
+│ 4 upper directories, one per snapshot                                │
+│ ███████████████████████████████████████                      3.1 MiB │
+│ file payload 3.0 MiB (of which padding 0.0 MiB)                      │
+│ host 0.1 MiB · 13 inodes                                             │
+│ unused versions 1 (0.0 MiB allocated, kept)                          │
+│ reuse: snapshots shared between images 0 of 4 (0.0 MiB)              │
+│   hardlinked contents 0 (0.0 MiB named more than once)               │
+│   duplicated contents: none                                          │
+│ → overlayfs mount over the snapshot chain; no stored rootfs copy     │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ EROFS/layer · 3.2 MiB with fs-verity ───────────────────────────────┐
+│ 4 layer.erofs images, one per snapshot                               │
+│ ██████████████████████████████████████▒                      3.2 MiB │
+│ without fs-verity 3.1 MiB · fs-verity +0.1 MiB                       │
+│ file payload 3.0 MiB · image layout 0.0 MiB · host 0.1 MiB           │
+│ unused versions 1 (0.0 MiB allocated, kept)                          │
+│ reuse: snapshots shared between images 0 of 4 (0.0 MiB)              │
+│   hardlinked contents 0 (0.0 MiB named more than once)               │
+│   duplicated contents: none                                          │
+│ → overlayfs over per-layer EROFS mounts; no stored rootfs copy       │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ File CAS/image · 3.2 MiB with fs-verity ────────────────────────────┐
+│ 1 composefs image (0.0 MiB) · 5 shared objects (3.0 MiB)             │
+│ ███████████████████████████████████████▒                     3.2 MiB │
+│ without fs-verity 3.2 MiB                                            │
+│ fs-verity +0.1 MiB · OCI metadata 0.0 MiB · host 0.1 MiB             │
+│ inline content 0.0 MiB, inside the composefs images                  │
+│ reuse: rootfs images shared between images 0 of 1 (0.0 MiB)          │
+│   contents used more than once 0 (0.0 MiB of extra uses)             │
+│   duplicated inline contents: none                                   │
+│ → composefs mount: metadata image + objects; no stored rootfs copy   │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ File CAS/layer · 3.2 MiB with fs-verity ────────────────────────────┐
+│ 4 layer metadata images (0.0 MiB) · 6 objects (3.0 MiB)              │
+│ ███████████████████████████████████████▒                     3.2 MiB │
+│ without fs-verity 3.2 MiB (not a valid configuration)                │
+│ fs-verity +0.1 MiB · host 0.1 MiB · unused versions 1 (0.0 MiB       │
+│   allocated, kept)                                                   │
+│ reuse: snapshots shared between images 0 of 4 (0.0 MiB)              │
+│   objects used more than once 0 (0.0 MiB of extra uses)              │
+│   duplicated contents: none                                          │
+│ → one flat overlay: layer metadata + objects as data-only lower      │
+└──────────────────────────────────────────────────────────────────────┘
+
+Reuse is logical bytes, before block rounding and fs-verity. Every name of a
+content is a use; hardlinked names share one stored copy. Snapshot and
+file-level reuse overlap and are never added.
+Unused = invisible in every retained final rootfs; counted in disk usage,
+not necessarily reclaimable.
+
 Notes:
   - 4 layers · 4 snapshots
   - EROFS 4 KiB blocks
