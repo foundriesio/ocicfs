@@ -36,10 +36,3 @@ We follow a Coordinated Vulnerability Disclosure (CVD) process:
 - **Resolution**: we work with you to develop and validate a fix.
 - **Disclosure**: once a fix is ready, we disclose the issue and credit the
   reporter (unless anonymity is requested).
-
-## On Homing under composefs
-
-ocicfs is developed with the goal of homing under the
-[composefs](https://github.com/composefs) organization. Upon acceptance, security
-handling will follow that community's process, and this document will be updated
-at that time.

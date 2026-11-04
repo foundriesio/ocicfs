@@ -1,8 +1,8 @@
 # Contributing to ocicfs
 
-Thanks for your interest in contributing! ocicfs is developed in the open with the
-goal of homing under the [composefs](https://github.com/composefs) organization,
-and aims to follow that community's conventions. Please also read the
+Thanks for your interest in contributing! ocicfs is developed in the open and
+follows the conventions of the composefs and containerd communities. Please also
+read the
 [composefs contribution guide](https://github.com/composefs/composefs/blob/main/CONTRIBUTING.md),
 which this guide builds on.
 

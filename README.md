@@ -11,7 +11,9 @@ ocicfs provides **primitives, not lifecycle policy**: `pull`, `verify`, `mount`,
 `unmount`, `hold`, `release`, and `gc` on the device, plus the publisher-side
 `publish` and `copy`. It does not execute containers and owns no version-management,
 activation, rollback, or update-orchestration logic — those belong to the
-upper-layer agent that drives ocicfs.
+upper-layer agent that drives ocicfs. Containers run under containerd or Docker
+through [cfs-snapshotter](https://github.com/foundriesio/cfs-snapshotter), which
+serves images from an ocicfs store.
 
 > **Status: early development.** The device-side verbs are wired end to
 > end: `pull` from an OCI registry (digest-pinned or tagged) or a local OCI
@@ -23,21 +25,32 @@ upper-layer agent that drives ocicfs.
 > registry images to an archive for offline delivery. The publisher-side
 > `publish` is still to come.
 
+## Install
+
+[INSTALL.md](INSTALL.md) covers the Debian package, the release archives, and
+building from source.
+
 ## Project docs
 
 - [Why ocicfs exists](docs/why.md): problem statement, requirements,
   constraints, and non-goals.
 - [ADR 0001: High-level architecture](docs/adr/0001-high-level-architecture.md):
   the accepted architecture boundary and load-bearing technical decisions.
+- [ADR 0002: Image identity](docs/adr/0002-image-identity.md): the platform
+  manifest digest as the one key for a stored image.
 - [Pulling images](docs/pull.md): registry pull and the local sideload from an
   OCI layout directory (`--from-dir`) or an archive (`--from-tar`) written by
   `ocicfs copy`, `docker save` or skopeo.
+- [Sealing an image](docs/seal.md): the publisher-side `ocicfs seal`, which
+  records the composefs integrity digests a pull verifies.
 - [Mounting a pulled image](docs/mount.md): read-only composefs mounts and
   metadata-only mounts for overlay consumers.
 - [Inspecting a local image](docs/inspect.md): image identity, the composefs
   binding, and the per-layer view.
 - [Listing and forgetting local images](docs/ls-remove.md): `ocicfs ls` and
   `ocicfs remove`.
+- [Reclaiming store space](docs/gc.md): `ocicfs gc` and the wanted/in-use
+  model that decides what it keeps.
 - [On-disk store layout](docs/on-disk-layout.md): what a pull writes under the
   data root.
 - [Hands-on storage walkthrough](docs/storage-walkthrough.md): build and verify
@@ -65,10 +78,10 @@ make build   # stripped binary into bin/
 
 ## Contributing
 
-Contributions are welcome. ocicfs is developed in the open with the goal of
-homing under the [composefs](https://github.com/composefs) organization, and
-follows that community's conventions. Please read [CONTRIBUTING.md](CONTRIBUTING.md)
-and the [Code of Conduct](CODE-OF-CONDUCT.md) first. All commits must be signed
+Contributions are welcome. ocicfs is developed in the open and follows the
+conventions of the composefs and containerd communities. Please read
+[CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE-OF-CONDUCT.md)
+first. All commits must be signed
 off under the [Developer Certificate of Origin](https://developercertificate.org/)
 (`git commit -s`), and pull requests must be opened and reviewed by a human.
 Automated coding agents must additionally follow [AGENTS.md](AGENTS.md).
