@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -288,5 +289,38 @@ func results(rep *Report) map[string]*ModelResult {
 		"erofs/off": ms.EROFS.Off, "erofs/on": ms.EROFS.On,
 		"cas/off": ms.CAS.Off, "cas/on": ms.CAS.On,
 		"layercas/off": ms.LayerCAS.Off, "layercas/on": ms.LayerCAS.On,
+	}
+}
+
+func TestInlineMaxFlag(t *testing.T) {
+	layer := tarOf(t, dir("./"), dir("usr/"), file("usr/a", strings.Repeat("a", 64)), file("usr/b", strings.Repeat("b", 65)), file("usr/c", strings.Repeat("c", 5000)))
+	refs := writeLayout(t, t.TempDir(), testImage{layers: [][]byte{layer}})
+	for _, c := range []struct {
+		arg     string
+		objects int
+	}{{"64", 2}, {"65", 1}, {"5000", 0}, {"5001", 0}, {"1048576", 0}} {
+		rep := sizeImages(t, newSpyOpener().open, "--no-cache", "--inline-max", c.arg, refs[0])
+		if got := rep.Models.CAS.Off.Objects; got != c.objects || rep.Models.CAS.On.Objects != c.objects {
+			t.Errorf("--inline-max %s: %d/%d objects, want %d", c.arg, got, rep.Models.CAS.On.Objects, c.objects)
+		}
+		if fmt.Sprint(rep.Settings.Profile.InlineMax) != c.arg || rep.Settings.Profile.InlineMaxLayer != 0 {
+			t.Errorf("--inline-max %s: settings %+v", c.arg, rep.Settings.Profile)
+		}
+		beyond := c.arg == "5001" || c.arg == "1048576"
+		if (rep.Settings.InlineMaxNote == inlineBeyondCap) != beyond || slices.Contains(rep.Assumptions, "File CAS/image: "+inlineBeyondCap) != beyond {
+			t.Errorf("--inline-max %s: note %q", c.arg, rep.Settings.InlineMaxNote)
+		}
+		if rep.Models.LayerCAS.On.Objects != 3 {
+			t.Errorf("--inline-max %s: layer CAS has %d objects", c.arg, rep.Models.LayerCAS.On.Objects)
+		}
+	}
+	if rep := sizeImages(t, newSpyOpener().open, "--no-cache", refs[0]); rep.Settings.Profile.InlineMax != 64 {
+		t.Errorf("default inline max %d", rep.Settings.Profile.InlineMax)
+	}
+	for _, arg := range []string{"63", "1048577"} {
+		var out, errOut bytes.Buffer
+		if code := run(context.Background(), []string{"images", "--no-cache", "--inline-max", arg, refs[0]}, nil, &out, &errOut, newSpyOpener().open); code != 2 || !strings.Contains(errOut.String(), "--inline-max") {
+			t.Errorf("--inline-max %s: exit %d: %s", arg, code, errOut.String())
+		}
 	}
 }
