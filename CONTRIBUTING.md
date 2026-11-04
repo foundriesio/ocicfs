@@ -83,27 +83,24 @@ for more.
 
 ## Code style and checks
 
-- Go code uses standard formatting. Run `gofmt` (CI rejects unformatted code) and
-  `go vet ./...`.
+- Go code uses standard formatting.
 - Run the relevant tests before submitting:
   ```bash
-  make vet
-  make test       # unit tests
+  make check      # formatting, lint, vet, unit tests
   make build
   ```
 - Changes that touch ocicfs's privileged paths (mount, fs-verity, CAS build)
-  must pass the privileged test target, which requires root or a full-mapping
-  user namespace:
+  must also pass the smoke test, which needs the privileged dev container:
   ```bash
-  sudo -E PATH=$PATH make root-test   # or: podman unshare make root-test
+  ./devshell.sh make smoke
   ```
 - Every Go source file carries the Apache-2.0 SPDX header
   (`// SPDX-License-Identifier: Apache-2.0`).
 
 ## Continuous integration
 
-CI runs `gofmt`, `go vet`, `make build`, and the unit tests. A pull request is
-expected to be green before review.
+CI runs `make lint` and `make build test smoke` in the dev container. A pull
+request is expected to be green before review.
 
 ## Reporting security issues
 

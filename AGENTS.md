@@ -175,10 +175,9 @@ Conventional Commits.
 
 A change is complete only when, at minimum:
 
-- `gofmt` reports no diffs, and `make vet`, `make test`, and `make build` pass
-  cleanly.
+- `make check` and `make build` pass cleanly.
 - Changes touching ocicfs's privileged paths (mount, fs-verity, CAS build)
-  additionally pass the privileged test target.
+  additionally pass `make smoke` in the dev container.
 - Concurrency-sensitive changes pass the race detector
   (`go test -race ./...`).
 - Every new/changed Go file carries the Apache-2.0 SPDX header, and any new
