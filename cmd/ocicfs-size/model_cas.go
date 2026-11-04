@@ -126,6 +126,7 @@ func casSize(roots []*casRoot, p Profile) *Breakdown {
 	b.Files = int64(len(names)) + files
 	b.Units = len(images)
 	b.Objects = len(payloads)
+	b.Reuse = casReuse(roots, p.InlineMax)
 	b.total(p)
 	return b
 }

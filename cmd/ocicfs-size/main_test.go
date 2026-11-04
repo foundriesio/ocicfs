@@ -75,9 +75,15 @@ func TestImagesReport(t *testing.T) {
 		if off, on := res[k+"/off"], res[k+"/on"]; off.Verity != 0 || on.Verity <= 0 || on.Total-off.Total != on.Verity {
 			t.Errorf("%s: verity off %d/%d, on %d/%d", k, off.Verity, off.Total, on.Verity, on.Total)
 		}
+		if off, on := res[k+"/off"].Reuse, res[k+"/on"].Reuse; off == nil || on == nil || *off != *on {
+			t.Errorf("%s: reuse off %v, on %v", k, off, on)
+		}
 	}
 	if lc := rep.Models.LayerCAS; !lc.Provisional || lc.Basis != layerCASBasis || !slices.ContainsFunc(rep.Pins, func(p string) bool { return strings.Contains(p, "ce384325d") }) {
 		t.Errorf("layercas %+v", lc)
+	}
+	if r := res["overlay"].Reuse; r == nil || r.UnitsReferenced != 6 || r.UnitsReused != 2 {
+		t.Errorf("overlay reuse %v", r)
 	}
 	if res["overlay"].Units != 4 || res["cas/on"].Units != 2 {
 		t.Errorf("snapshots %d, images %d", res["overlay"].Units, res["cas/on"].Units)
