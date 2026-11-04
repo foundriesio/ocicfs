@@ -36,11 +36,20 @@ func main() {
 	os.Exit(run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr, ociremote.Open))
 }
 
+// The --inline-max range, and the note for a threshold above what
+// mkcomposefs accepts.
+const (
+	minInlineMax    = composefs.InlineContentMax
+	maxInlineMax    = 1 << 20
+	inlineBeyondCap = "inline above 5000 B assumes a writer beyond composefs-c 1.0.8's limit; sized with EROFS flat-inline layout"
+)
+
 // options are the images command's flags.
 type options struct {
 	platform     string
 	fs           string
 	hostMetadata string
+	inlineMax    int64
 	cacheDir     string
 	noCache      bool
 	details      bool
@@ -85,6 +94,7 @@ func run(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.
 	f.StringVar(&o.platform, "platform", "", "platform to size, os/arch[/variant] (default linux/"+runtime.GOARCH+")")
 	f.StringVar(&o.fs, "fs", "ext4", "host filesystem profile (only ext4)")
 	f.StringVar(&o.hostMetadata, "host-metadata", "include", "count host directories and small files: include or exclude")
+	f.Int64Var(&o.inlineMax, "inline-max", composefs.InlineContentMax, fmt.Sprintf("largest regular file, in bytes, File CAS/image stores inline instead of as an object (%d-%d)", minInlineMax, maxInlineMax))
 	f.StringVar(&o.cacheDir, "cache-dir", "", "layer inventory cache (default $XDG_CACHE_HOME/ocicfs-size)")
 	f.BoolVar(&o.noCache, "no-cache", false, "neither read nor write the cache")
 	f.BoolVar(&o.details, "details", false, "add the assumptions, pins and analyzer diagnostics")
@@ -184,12 +194,18 @@ func settings(o options) (Settings, error) {
 			HostBlock:      4096,
 			ErofsBlock:     erofsBlock,
 			VerityBlock:    4096,
-			InlineMax:      composefs.InlineContentMax,
+			InlineMax:      o.inlineMax,
 			InlineMaxLayer: 0,
 		},
 	}
 	if s.Platform == "" {
 		s.Platform = "linux/" + runtime.GOARCH
+	}
+	if o.inlineMax < minInlineMax || o.inlineMax > maxInlineMax {
+		return s, &cli.UsageError{Err: fmt.Errorf("--inline-max must be between %d and %d bytes, not %d", minInlineMax, maxInlineMax, o.inlineMax)}
+	}
+	if o.inlineMax > composefsInlineCap {
+		s.InlineMaxNote = inlineBeyondCap
 	}
 	if o.fs != "ext4" {
 		return s, &cli.UsageError{Err: fmt.Errorf("--fs supports only ext4, not %q", o.fs)}

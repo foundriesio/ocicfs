@@ -33,6 +33,9 @@ type Settings struct {
 	Profile  Profile `json:"profile"` // fs-verity is set per column, not here
 	Platform string  `json:"platform"`
 	FS       string  `json:"fs"`
+	// InlineMaxNote qualifies a File CAS/image inline threshold no
+	// released writer reaches.
+	InlineMaxNote string `json:"inlineMaxNote,omitempty"`
 }
 
 // ImageReport is one retained image and the composefs image ocicfs would
@@ -117,7 +120,7 @@ func buildReport(ctx context.Context, imgs []*Image, ls *layerSet, s Settings) *
 			"ocicfs " + version.String(),
 		},
 		Settings:    s,
-		Assumptions: assumptions(),
+		Assumptions: assumptions(s),
 		Exclusions:  exclusions(),
 	}
 
@@ -188,8 +191,8 @@ func buildReport(ctx context.Context, imgs []*Image, ls *layerSet, s Settings) *
 	return rep
 }
 
-func assumptions() []string {
-	return []string{
+func assumptions(s Settings) []string {
+	out := []string{
 		"estimates after cleanup: every retained snapshot, object and image is kept and nothing else",
 		"metadata sizes are modelled from the writers' layout rules, not measured",
 		"ext4: 4 KiB blocks, 256-byte inodes, metadata_csum, no inline_data or ea_inode; contiguous allocation",
@@ -199,6 +202,10 @@ func assumptions() []string {
 		"File CAS/image: fs-verity view names are spread over shards like content digests",
 		"File CAS/layer: inline threshold 0 (layer metadata cannot inline file data) and sealed objects, as the prototype does; it mounts with verity=require, so fs-verity off is not a configuration it runs",
 	}
+	if s.InlineMaxNote != "" {
+		out = append(out, "File CAS/image: "+s.InlineMaxNote)
+	}
+	return out
 }
 
 func exclusions() []string {
