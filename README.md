@@ -70,10 +70,10 @@ the [`devcontainer` CLI](https://github.com/devcontainers/cli):
 Inside the shell, the make targets behave exactly as they do in CI:
 
 ```sh
-make         # lint, vet, test, build (the default)
+make         # stripped binary into bin/ (the default)
+make check   # lint, vet, unit tests
 make test    # unit tests
 make lint    # gofumpt + golangci-lint
-make build   # stripped binary into bin/
 ```
 
 ## Contributing
