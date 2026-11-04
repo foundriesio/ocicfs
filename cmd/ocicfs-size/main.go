@@ -97,7 +97,7 @@ func run(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.
 	f.Int64Var(&o.inlineMax, "inline-max", composefs.InlineContentMax, fmt.Sprintf("largest regular file, in bytes, File CAS/image stores inline instead of as an object (%d-%d)", minInlineMax, maxInlineMax))
 	f.StringVar(&o.cacheDir, "cache-dir", "", "layer inventory cache (default $XDG_CACHE_HOME/ocicfs-size)")
 	f.BoolVar(&o.noCache, "no-cache", false, "neither read nor write the cache")
-	f.BoolVar(&o.details, "details", false, "add the assumptions, pins and analyzer diagnostics")
+	f.BoolVar(&o.details, "details", false, "add the storage projection, assumptions and analyzer diagnostics")
 	f.BoolVar(&o.json, "json", false, "write the full report as JSON")
 	f.BoolVarP(&o.verbose, "verbose", "v", false, "enable debug logging on stderr")
 	root.AddCommand(images)

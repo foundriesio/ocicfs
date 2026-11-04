@@ -12,12 +12,13 @@ import (
 )
 
 // writeText writes the report for a reader: what each model takes with
-// fs-verity off and on, and with details everything the run assumed and
-// read.
+// fs-verity off and on, and with details what each model's store keeps and
+// everything the run assumed and read.
 func writeText(w io.Writer, rep *Report, details bool) error {
 	var b strings.Builder
 	writeCompact(&b, rep)
 	if details {
+		writeProjection(&b, rep)
 		writeDetails(&b, rep)
 	}
 	_, err := io.WriteString(w, b.String())
@@ -178,6 +179,126 @@ func writeModelTable(b *strings.Builder, heading string, rows [][]string) {
 	}
 }
 
+// The storage projection's geometry: every box is boxWidth runes wide, and
+// the largest total fills barCells bar cells.
+const (
+	boxWidth = 72
+	barCells = 40
+)
+
+// writeProjection draws one box per model: the allocation its store keeps
+// as a bar on a scale all boxes share, the components of that allocation,
+// its reuse and how the store is mounted.
+func writeProjection(b *strings.Builder, rep *Report) {
+	ms := rep.Models
+	var largest int64
+	for _, m := range []*ModelResult{ms.Overlay, ms.EROFS.On, ms.CAS.On, ms.LayerCAS.On} {
+		if m.Available {
+			largest = max(largest, m.Total)
+		}
+	}
+	cells := func(n int64) int {
+		if largest == 0 {
+			return 0
+		}
+		return int((2*barCells*n + largest) / (2 * largest))
+	}
+	bar := func(off, on *ModelResult) string {
+		return barLine(cells(off.Total), cells(on.Total)-cells(off.Total), on.Total)
+	}
+	host := func(br *Breakdown) string {
+		if !rep.Settings.Profile.HostMetadata {
+			return "host metadata excluded"
+		}
+		return "host " + fmtMiB(br.Host) + " MiB"
+	}
+	unused := func(br *Breakdown) string {
+		return fmt.Sprintf("unused versions %s (%s MiB allocated, kept)", fmtInt(int64(br.Unused.Versions)), fmtMiB(br.Unused.Alloc))
+	}
+	// reuseLines are a box's reuse lines, one metric each: the stored units
+	// shared between images, the contents used more than once, as named,
+	// and the contents kept in several copies, as named.
+	reuseLines := func(r *Reuse, units, used, usedBytes, duplicated string) []string {
+		if r == nil {
+			return nil
+		}
+		dup := "  duplicated " + duplicated + ": none"
+		if r.Duplicated > 0 {
+			dup = fmt.Sprintf("  duplicated %s %s (%s extra copies, %s MiB)",
+				duplicated, fmtInt(int64(r.Duplicated)), fmtInt(int64(r.ExtraCopies)), fmtMiB(r.ExtraBytes))
+		}
+		return []string{
+			fmt.Sprintf("reuse: %s shared between images %s of %s (%s MiB)",
+				units, fmtInt(int64(r.UnitsReused)), fmtInt(int64(r.UnitsReferenced)), fmtMiB(r.UnitBytes)),
+			fmt.Sprintf("  %s %s (%s MiB %s)", used, fmtInt(int64(r.Contents)), fmtMiB(r.ContentBytes), usedBytes),
+			dup,
+		}
+	}
+	box := func(title string, lines, reuse []string, mount string) {
+		writeBox(b, title, append(append(lines, reuse...), mount))
+	}
+
+	b.WriteString("\nSTORAGE PROJECTION · modelled allocation per store, not paths\n")
+	fmt.Fprintf(b, "█ allocation without fs-verity · ▒ fs-verity increment\n1 cell ≈ %s MiB (%d cells = largest total)\n", fmtMiB(largest/barCells), barCells)
+
+	if o := ms.Overlay; !o.Available {
+		writeUnavailableBox(b, "Overlay")
+	} else {
+		box("Overlay · "+fmtMiB(o.Total)+" MiB", []string{
+			nouns(o.Units, "upper directory", "upper directories") + ", one per snapshot",
+			bar(o, o),
+			fmt.Sprintf("file payload %s MiB (of which padding %s MiB)", fmtMiB(o.PayloadAlloc), fmtMiB(o.Padding)),
+			host(o.Breakdown) + " · " + plural(int(o.Inodes), "inode"),
+			unused(o.Breakdown),
+		}, reuseLines(o.Reuse, "snapshots", "hardlinked contents", "named more than once", "contents"),
+			"→ overlayfs mount over the snapshot chain; no stored rootfs copy")
+	}
+
+	if off, on := ms.EROFS.Off, ms.EROFS.On; !on.Available {
+		writeUnavailableBox(b, "EROFS/layer")
+	} else {
+		box("EROFS/layer · "+fmtMiB(on.Total)+" MiB with fs-verity", []string{
+			plural(on.Units, "layer.erofs image") + ", one per snapshot",
+			bar(off, on),
+			fmt.Sprintf("without fs-verity %s MiB · fs-verity +%s MiB", fmtMiB(off.Total), fmtMiB(on.Verity)),
+			fmt.Sprintf("file payload %s MiB · image layout %s MiB · %s", fmtMiB(on.PayloadAlloc), fmtMiB(on.Layout), host(on.Breakdown)),
+			unused(on.Breakdown),
+		}, reuseLines(on.Reuse, "snapshots", "hardlinked contents", "named more than once", "contents"),
+			"→ overlayfs over per-layer EROFS mounts; no stored rootfs copy")
+	}
+
+	if off, on := ms.CAS.Off, ms.CAS.On; !on.Available {
+		writeUnavailableBox(b, "File CAS/image")
+	} else {
+		box("File CAS/image · "+fmtMiB(on.Total)+" MiB with fs-verity", []string{
+			fmt.Sprintf("%s (%s MiB) · %s (%s MiB)", plural(on.Units, "composefs image"), fmtMiB(on.Layout), plural(on.Objects, "shared object"), fmtMiB(on.PayloadAlloc)),
+			bar(off, on),
+			fmt.Sprintf("without fs-verity %s MiB", fmtMiB(off.Total)),
+			fmt.Sprintf("fs-verity +%s MiB · OCI metadata %s MiB · %s", fmtMiB(on.Verity), fmtMiB(on.OCIMeta), host(on.Breakdown)),
+			fmt.Sprintf("inline content %s MiB, inside the composefs images", fmtMiB(on.Inline)),
+		}, reuseLines(on.Reuse, "rootfs images", "contents used more than once", "of extra uses", "inline contents"),
+			"→ composefs mount: metadata image + objects; no stored rootfs copy")
+	}
+
+	if off, on := ms.LayerCAS.Off, ms.LayerCAS.On; !on.Available {
+		writeUnavailableBox(b, "File CAS/layer")
+	} else {
+		box("File CAS/layer · "+fmtMiB(on.Total)+" MiB with fs-verity", []string{
+			fmt.Sprintf("%s (%s MiB) · %s (%s MiB)", plural(on.Units, "layer metadata image"), fmtMiB(on.Layout), plural(on.Objects, "object"), fmtMiB(on.PayloadAlloc)),
+			bar(off, on),
+			fmt.Sprintf("without fs-verity %s MiB (not a valid configuration)", fmtMiB(off.Total)),
+			fmt.Sprintf("fs-verity +%s MiB · %s · %s", fmtMiB(on.Verity), host(on.Breakdown), unused(on.Breakdown)),
+		}, reuseLines(on.Reuse, "snapshots", "objects used more than once", "of extra uses", "contents"),
+			"→ one flat overlay: layer metadata + objects as data-only lower")
+	}
+
+	b.WriteString("\nReuse is logical bytes, before block rounding and fs-verity. Every name of a\n" +
+		"content is a use; hardlinked names share one stored copy. Snapshot and\n" +
+		"file-level reuse overlap and are never added.\n" +
+		"Unused = invisible in every retained final rootfs; counted in disk usage,\n" +
+		"not necessarily reclaimable.\n")
+}
+
 // writeDetails writes what the run assumed, pinned and read, and every
 // image's resolved identities.
 func writeDetails(b *strings.Builder, rep *Report) {
@@ -224,6 +345,55 @@ func writeDetails(b *strings.Builder, rep *Report) {
 	fmt.Fprintf(b, "\nanalyzer: fetched %s MiB (%s); %s; %s, %s\n",
 		fmtMiB(a.BytesFetched), plural(a.BlobsFetched, "blob"), plural(a.CacheHits, "cache hit"),
 		plural(a.LayerScans, "layer scan"), plural(a.OcicfsScans, "ocicfs scan"))
+}
+
+// writeBox draws a box of boxWidth runes around lines, wrapping at spaces
+// each line too long to fit.
+func writeBox(b *strings.Builder, title string, lines []string) {
+	fmt.Fprintf(b, "\n┌─ %s %s┐\n", title, strings.Repeat("─", max(0, boxWidth-5-utf8.RuneCountInString(title))))
+	for _, l := range lines {
+		ws := []string{l}
+		if utf8.RuneCountInString(l) > boxWidth-4 {
+			ws = wrap(l, boxWidth-4)
+		}
+		for _, w := range ws {
+			fmt.Fprintf(b, "│ %s%s │\n", w, strings.Repeat(" ", max(0, boxWidth-4-utf8.RuneCountInString(w))))
+		}
+	}
+	b.WriteString("└" + strings.Repeat("─", boxWidth-2) + "┘\n")
+}
+
+// writeUnavailableBox draws the box of a model the run could not size.
+func writeUnavailableBox(b *strings.Builder, name string) {
+	writeBox(b, name+" · n/a‡", []string{"unavailable: see ‡ above"})
+}
+
+// barLine is a bar of base solid and verity shaded cells, with total in
+// MiB right-aligned in a box line.
+func barLine(base, verity int, total int64) string {
+	bar := strings.Repeat("█", base) + strings.Repeat("▒", verity)
+	num := fmtMiB(total) + " MiB"
+	return bar + strings.Repeat(" ", max(1, boxWidth-4-utf8.RuneCountInString(bar)-utf8.RuneCountInString(num))) + num
+}
+
+// wrap breaks s at spaces into lines of at most width runes, indenting
+// every line after the first by two spaces. A word longer than width
+// stays whole.
+func wrap(s string, width int) []string {
+	var out []string
+	line := ""
+	for _, word := range strings.Split(s, " ") {
+		switch {
+		case line == "":
+			line = word
+		case utf8.RuneCountInString(line)+1+utf8.RuneCountInString(word) <= width:
+			line += " " + word
+		default:
+			out = append(out, line)
+			line = "  " + word
+		}
+	}
+	return append(out, line)
 }
 
 func writeList(b *strings.Builder, title string, items []string) {
