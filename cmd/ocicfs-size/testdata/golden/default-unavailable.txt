@@ -1,0 +1,16 @@
+STORAGE ESTIMATE · 1 image · linux/amd64
+- LAYOUT@sha256:10b8912859a1915fe84a0c6663836f8271b5ae9764fd475a40caef95af3b62e7
+
+OCI layers:       2 references · 2 unique blobs
+Compressed size:  8.5 KiB total · 8.5 KiB unique
+
+Estimated disk usage (formula-based): ext4 · 4 KiB blocks · no compression · inline max size 64 B (File CAS/image)
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                  fs-verity off                    fs-verity on
+Storage model    Stored files  vs Overlay          Size  vs Overlay      Size (vs own off)  vs Overlay off
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Overlay                  n/a‡           —          n/a‡           —                      —               —
+EROFS/layer              n/a‡           —          n/a‡           —                   n/a‡               —
+File CAS/image              6           —     100.0 KiB           —     124.0 KiB (+24.0%)               —
+File CAS/layer           n/a‡           —          n/a‡           —                   n/a‡               —
+‡ Overlay, EROFS/layer, File CAS/layer unavailable: layer sha256:d20abfa7638124c6b1bc367c7d38db170b6868172544a4f061021acf4c83a097: cross-layer hardlink /b -> /a

@@ -24,6 +24,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/foundriesio/ocicfs/internal/cli"
+	"github.com/foundriesio/ocicfs/internal/composefs"
 	"github.com/foundriesio/ocicfs/internal/ocilayout"
 	"github.com/foundriesio/ocicfs/internal/ociremote"
 	"github.com/foundriesio/ocicfs/pkg/version"
@@ -37,10 +38,14 @@ func main() {
 
 // options are the images command's flags.
 type options struct {
-	platform string
-	cacheDir string
-	noCache  bool
-	verbose  bool
+	platform     string
+	fs           string
+	hostMetadata string
+	cacheDir     string
+	noCache      bool
+	details      bool
+	json         bool
+	verbose      bool
 }
 
 // run is the testable entry point: it runs the command argv names against
@@ -78,8 +83,12 @@ func run(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.
 	}
 	f := images.Flags()
 	f.StringVar(&o.platform, "platform", "", "platform to size, os/arch[/variant] (default linux/"+runtime.GOARCH+")")
+	f.StringVar(&o.fs, "fs", "ext4", "host filesystem profile (only ext4)")
+	f.StringVar(&o.hostMetadata, "host-metadata", "include", "count host directories and small files: include or exclude")
 	f.StringVar(&o.cacheDir, "cache-dir", "", "layer inventory cache (default $XDG_CACHE_HOME/ocicfs-size)")
 	f.BoolVar(&o.noCache, "no-cache", false, "neither read nor write the cache")
+	f.BoolVar(&o.details, "details", false, "add the assumptions, pins and analyzer diagnostics")
+	f.BoolVar(&o.json, "json", false, "write the full report as JSON")
 	f.BoolVarP(&o.verbose, "verbose", "v", false, "enable debug logging on stderr")
 	root.AddCommand(images)
 
@@ -94,12 +103,13 @@ func run(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.
 	return cli.HandleExit(cmd, err, stderr)
 }
 
-// runImages loads the images args name.
+// runImages sizes the images args name.
 func runImages(ctx context.Context, args []string, o options, stdin io.Reader, stdout io.Writer, open opener) error {
-	if o.platform == "" {
-		o.platform = "linux/" + runtime.GOARCH
+	s, err := settings(o)
+	if err != nil {
+		return err
 	}
-	platform, err := ocilayout.ParsePlatform(o.platform)
+	platform, err := ocilayout.ParsePlatform(s.Platform)
 	if err != nil {
 		return &cli.UsageError{Err: err}
 	}
@@ -125,8 +135,19 @@ func runImages(ctx context.Context, args []string, o options, stdin io.Reader, s
 	}
 	defer sp.close()
 
-	_, _, err = loadImages(ctx, open, sp, cacheDir, refs, platform)
-	return err
+	imgs, ls, err := loadImages(ctx, open, sp, cacheDir, refs, platform)
+	if err != nil {
+		return err
+	}
+	rep := buildReport(ctx, imgs, ls, s)
+	for _, n := range sp.fetched {
+		rep.Analyzer.BytesFetched += n
+	}
+	rep.Analyzer.BlobsFetched = len(sp.fetched)
+	if o.json {
+		return writeJSON(stdout, rep)
+	}
+	return writeText(stdout, rep, o.details)
 }
 
 // loadImages resolves every reference and loads each distinct layer once.
@@ -152,4 +173,33 @@ func loadImages(ctx context.Context, open opener, sp *spool, cacheDir string, re
 		imgs = append(imgs, img)
 	}
 	return imgs, ls, nil
+}
+
+// settings turns the flags into the models' profile.
+func settings(o options) (Settings, error) {
+	s := Settings{
+		Platform: o.platform,
+		FS:       o.fs,
+		Profile: Profile{
+			HostBlock:      4096,
+			ErofsBlock:     erofsBlock,
+			VerityBlock:    4096,
+			InlineMax:      composefs.InlineContentMax,
+			InlineMaxLayer: 0,
+		},
+	}
+	if s.Platform == "" {
+		s.Platform = "linux/" + runtime.GOARCH
+	}
+	if o.fs != "ext4" {
+		return s, &cli.UsageError{Err: fmt.Errorf("--fs supports only ext4, not %q", o.fs)}
+	}
+	switch o.hostMetadata {
+	case "include":
+		s.Profile.HostMetadata = true
+	case "exclude":
+	default:
+		return s, &cli.UsageError{Err: fmt.Errorf("--host-metadata must be include or exclude, not %q", o.hostMetadata)}
+	}
+	return s, nil
 }

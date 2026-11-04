@@ -1,0 +1,59 @@
+STORAGE ESTIMATE · 1 image · linux/amd64
+- LAYOUT@sha256:dfc1c6ed9fa7f219b2153076e297824d11abe07573fb7fcf4135d382cfebdfab
+
+OCI layers:       4 references · 4 unique blobs
+Compressed size:  3.0 MiB total · 3.0 MiB unique
+
+Estimated disk usage (formula-based): ext4 · 4 KiB blocks · no compression · inline max size 64 B (File CAS/image)
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                      fs-verity off                        fs-verity on
+Storage model    Stored files    vs Overlay        Size         vs Overlay     Size (vs own off)      vs Overlay off
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Overlay                     6             —     3.1 MiB                  —                     —                   —
+EROFS/layer                 4  -2 (-33.3%)      3.1 MiB   -4.0 KiB (-0.1%)       3.2 MiB (+1.9%)   +56.0 KiB (+1.8%)
+File CAS/image             10  +4 (+66.7%)      3.2 MiB  +48.0 KiB (+1.5%)       3.2 MiB (+2.3%)  +124.0 KiB (+3.9%)
+File CAS/layer             14  +8 (+133.3%)     3.2 MiB  +40.0 KiB (+1.3%)       3.2 MiB (+2.5%)  +120.0 KiB (+3.8%)
+
+Notes:
+  - 4 layers · 4 snapshots
+  - EROFS 4 KiB blocks
+  - File CAS inline: image ≤64 B · layer 0 B (fixed)
+  - File CAS/layer: prototype on containerd v2.4+ (9b17276ec), not a release; 'off' is not a valid configuration of the prototype (requires verity=require)
+  - after cleanup; writable layers and application data excluded
+
+Assumptions:
+  - estimates after cleanup: every retained snapshot, object and image is kept and nothing else
+  - metadata sizes are modelled from the writers' layout rules, not measured
+  - ext4: 4 KiB blocks, 256-byte inodes, metadata_csum, no inline_data or ea_inode; contiguous allocation
+  - ext4: hashed directories assumed 75% full; an inode's xattrs sit all in the inode or all in one shared block
+  - sparse files are counted dense
+  - File CAS/image: composefs images are told apart by their dump, so images that differ only in fields mkcomposefs normalises are counted twice
+  - File CAS/image: fs-verity view names are spread over shards like content digests
+  - File CAS/layer: inline threshold 0 (layer metadata cannot inline file data) and sealed objects, as the prototype does; it mounts with verity=require, so fs-verity off is not a configuration it runs
+
+Exclusions:
+  - OCI content cache (compressed blobs) of containerd
+  - containerd metadata.db
+  - writable container layers and application data
+  - ocicfs saved-layer scan records
+  - extraction workspace and garbage-collection delay
+
+Pins:
+  - containerd v2.4.2, default configuration
+  - erofs-utils v1.9.4 (EROFS/layer: mkfs.erofs --tar=f --aufs -Enoinline_data -b4096)
+  - File CAS/layer prototype ce384325d (mkfs.erofs --tar=headerball --aufs -b4096)
+  - composefs-c 1.0.8 (mkcomposefs --min-version=1 --max-version=1)
+  - ocicfs v1.0.0 (0123abc)
+
+Estimator versions:
+  - cas: 1
+  - erofs: 1
+  - ext4: 1
+  - layercas: 1
+  - overlay: 1
+  - verity: 1
+
+Images:
+  - LAYOUT@sha256:dfc1c6ed9fa7f219b2153076e297824d11abe07573fb7fcf4135d382cfebdfab: manifest sha256:dfc1c6ed9fa7f219b2153076e297824d11abe07573fb7fcf4135d382cfebdfab, composefs image sha256:41448d6205a3db4e657e0ea29c9169c91accad5bd3a2aa34e5807ade2bc75375, canonical true
+
+analyzer: fetched 3.0 MiB (6 blobs); 0 cache hits; 4 layer scans, 4 ocicfs scans
