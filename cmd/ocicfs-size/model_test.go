@@ -150,6 +150,10 @@ func TestSharedPrefixes(t *testing.T) {
 	if o.Units != 4 || l.Units != 4 || l.Objects != 3 {
 		t.Errorf("A,B + X,B: overlay %d snapshots, layer CAS %d snapshots and %d objects", o.Units, l.Units, l.Objects)
 	}
+	e, _ := erofsSize(roots, p)
+	if o.Files != 4 || e.Files != 4 || l.Files != 4+4+3 {
+		t.Errorf("A,B + X,B files: overlay %d, erofs %d, layer CAS %d", o.Files, e.Files, l.Files)
+	}
 }
 
 func TestOversizedXattrsMakeOverlayUnavailable(t *testing.T) {
@@ -272,6 +276,9 @@ func TestCASSize(t *testing.T) {
 	meta := alloc(img.ManifestSize, 4096) + alloc(img.ConfigSize, 4096)
 	if b.Units != 1 || b.Objects != 1 || b.PayloadAlloc != 4096 || b.PayloadBytes != 65 || b.Inline != 64 || b.OCIMeta != meta {
 		t.Errorf("one root: %+v", b)
+	}
+	if b.Files != 1+2+1+1+1 { // object, manifest and config, image, binding, reference
+		t.Errorf("one root: %d files", b.Files)
 	}
 	if want := verityBytes(roots[0].size, 4096, 4096) + 3*4096; b.Verity != want {
 		t.Errorf("verity %d, want %d", b.Verity, want)

@@ -36,6 +36,7 @@ type Breakdown struct {
 	Units        int         `json:"units"`
 	Objects      int         `json:"objects,omitempty"` // absent when the model does not count them
 	Inodes       int64       `json:"inodes,omitempty"`  // absent when the model does not count them
+	Files        int64       `json:"files"`             // regular files the store keeps on the host
 	Unused       UnusedStats `json:"unused"`
 }
 
@@ -126,6 +127,7 @@ func overlaySize(roots []*root, p Profile) (*Breakdown, string) {
 		b.PayloadAlloc += u.payloadAlloc
 		b.PayloadBytes += u.payloadBytes
 		b.Inodes += u.inodes
+		b.Files += u.files
 		b.Host += u.host
 	}
 	b.Host += int64(len(xattrBlocks))*p.HostBlock + snapshotsDirBlocks(len(snaps), p)
@@ -137,7 +139,7 @@ func overlaySize(roots []*root, p Profile) (*Breakdown, string) {
 
 // overlayUnit is what one overlay snapshot takes.
 type overlayUnit struct {
-	payloadAlloc, payloadBytes, host, inodes int64
+	payloadAlloc, payloadBytes, host, inodes, files int64
 }
 
 // overlaySnapshot sizes one upper directory. Xattr sets needing a block are
@@ -174,6 +176,7 @@ func overlaySnapshot(m *matLayer, implicit []implicitDir, p Profile, xattrBlocks
 		xattrs := e.Xattrs
 		switch e.Kind {
 		case KindReg:
+			u.files++
 			u.payloadAlloc += alloc(e.Size, p.HostBlock)
 			u.payloadBytes += e.Size
 		case KindSymlink:
