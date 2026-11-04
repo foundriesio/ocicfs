@@ -53,7 +53,7 @@ setup_verity_mount() {
 # The persistent zot registry: a local OCI registry at 127.0.0.1:5000 for
 # manual push -> seal -> pull testing (`ocicfs seal 127.0.0.1:5000/...`). Its
 # storage lives outside the verity mount, so registry state is independent of
-# it; the smoke test never uses this instance — it runs its own ephemeral one
+# it; the end-to-end test never uses this instance — it runs its own ephemeral one
 # on another port. Idempotent: an instance already answering keeps running.
 start_zot() {
 	command -v zot >/dev/null || return 1

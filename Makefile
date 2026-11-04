@@ -79,15 +79,15 @@ lint:
 fmt:
 	$(GOLANGCI_LINT) fmt
 
-# smoke runs the pull --from-dir -> ls -> inspect -> mount -> unmount -> remove
-# lifecycle against a real image, for a quick check of the implemented
-# functionality. Run it inside the privileged dev container (fs-verity +
-# mkcomposefs), e.g.:
-#   ./devshell.sh                                              # then: make smoke
-#   docker run --rm --privileged -v "$PWD":/work ocicfs-dev make smoke
-.PHONY: smoke
-smoke: build
-	./scripts/smoke.sh
+# test-e2e runs the end-to-end suite: every verb through the image lifecycle
+# from each pull source (local layout, archives, registry), plus sealing, gc
+# and delta pull rounds. Run it inside the privileged dev container
+# (fs-verity + mkcomposefs), e.g.:
+#   ./devshell.sh                                              # then: make test-e2e
+#   docker run --rm --privileged -v "$PWD":/work ocicfs-dev make test-e2e
+.PHONY: test-e2e
+test-e2e: build
+	./scripts/e2e.sh
 
 # --- Debian packaging ---------------------------------------------------
 #

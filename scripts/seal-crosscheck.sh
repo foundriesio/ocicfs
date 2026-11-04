@@ -42,7 +42,7 @@
 # Env:
 #   CROSSCHECK_REGISTRY  loopback registry ocicfs seal reads from (default
 #                        127.0.0.1:5000, the dev container's persistent zot;
-#                        the smoke test points it at its own instance)
+#                        the end-to-end test points it at its own instance)
 set -euo pipefail
 
 [ $# -eq 1 ] || { echo "usage: $0 <image-uri>" >&2; exit 2; }

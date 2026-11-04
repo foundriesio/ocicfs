@@ -9,7 +9,7 @@
 #                             remove the container when that shell exits.
 #   ./devshell.sh <cmd...>    Bring the dev container up, run <cmd...> in it, remove
 #                             the container on exit, and exit with <cmd>'s status
-#                             (e.g. ./devshell.sh make smoke).
+#                             (e.g. ./devshell.sh make test-e2e).
 #   ./devshell.sh exec [cmd]  Run a shell (or [cmd]) in the already-running
 #                             container, leaving it running when done.
 #

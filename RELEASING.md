@@ -22,7 +22,7 @@ maintainer's job is choosing the version, writing the summary, and tagging.
 
 - Tag only commits on `main` whose CI run is green.
 - The release workflow independently rebuilds and gates the tagged revision
-  per architecture: `make build test smoke size`, the release validation
+  per architecture: `make build test test-e2e size`, the release validation
   script (ELF architecture, static linkage, stamped version and revision,
   archive layout), and the deb suite (`deb`, lintian, install/upgrade/
   remove/purge tests). A release is created only from green builds.
