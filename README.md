@@ -74,7 +74,18 @@ make         # stripped binary into bin/ (the default)
 make check   # lint, vet, unit tests
 make test    # unit tests
 make lint    # gofumpt + golangci-lint
+make smoke   # pull --from-dir, mount, unmount, remove
 ```
+
+Where each target runs:
+
+| Target | Dev host | Dev container |
+|---|---|---|
+| `make`, `build`, `size`, `clean` | yes | yes |
+| `install` | yes, as root or with a writable `PREFIX` or `DESTDIR` | yes |
+| `check`, `test`, `vet`, `lint`, `fmt` | yes, with Go and golangci-lint installed; tests that need root, fs-verity or mkcomposefs skip themselves | yes, full coverage as in CI |
+| `smoke` | no: needs a privileged environment with fs-verity and mkcomposefs | yes |
+| `deb`, `deb-lint`, `deb-test` | yes, with Docker: they build in their own container | not needed |
 
 ## Contributing
 
