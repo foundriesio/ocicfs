@@ -27,7 +27,11 @@ REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || echo none)
 LDFLAGS := -s -w -X $(PKG)/pkg/version.Version=$(VERSION) -X $(PKG)/pkg/version.Revision=$(REVISION)
 
 .PHONY: all
-all: lint vet test build
+all: build
+
+# check runs the formatting check, the linters, go vet, and the unit tests.
+.PHONY: check
+check: lint vet test
 
 # build compiles the ocicfs CLI into bin/ as a stripped, trimmed binary. Cgo is
 # disabled so the binary is fully static: nothing in ocicfs needs it, and the
