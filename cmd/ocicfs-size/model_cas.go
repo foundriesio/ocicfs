@@ -121,7 +121,9 @@ func casSize(roots []*casRoot, p Profile) *Breakdown {
 	for id := range images {
 		names = append(names, id)
 	}
-	b.Host = casHostBlocks(roots, names) * p.HostBlock
+	blocks, files := casHostBlocks(roots, names)
+	b.Host = blocks * p.HostBlock
+	b.Files = int64(len(names)) + files
 	b.Units = len(images)
 	b.Objects = len(payloads)
 	b.total(p)
@@ -133,8 +135,9 @@ func casSize(roots []*casRoot, p Profile) *Breakdown {
 // object, and per root a binding file in a directory of its own and a
 // reference file, each in sharded namespaces. The view namespace is keyed
 // by fs-verity digests, which spread over its shards as content digests do.
-func casHostBlocks(roots []*casRoot, objects []string) int64 {
-	blocks := 2 * shardedDirBlocks(objects, 0)
+// files counts the binding and reference files.
+func casHostBlocks(roots []*casRoot, objects []string) (blocks, files int64) {
+	blocks = 2 * shardedDirBlocks(objects, 0)
 	var rootNames, refNames []string
 	bindings := map[string]map[string]bool{}
 	refs := map[string]bool{}
@@ -160,8 +163,10 @@ func casHostBlocks(roots []*casRoot, objects []string) int64 {
 			lens = append(lens, len(f))
 		}
 		blocks += ext4DirBlocks(lens) + int64(len(names))
+		files += int64(len(names))
 	}
-	return blocks + shardedDirBlocks(rootNames, 0) + shardedDirBlocks(refNames, len(".json")) + int64(len(refNames))
+	files += int64(len(refNames))
+	return blocks + shardedDirBlocks(rootNames, 0) + shardedDirBlocks(refNames, len(".json")) + int64(len(refNames)), files
 }
 
 // platformFile names an image binding file after its platform.

@@ -48,6 +48,7 @@ func erofsSize(roots []*root, p Profile) (*Breakdown, string) {
 	}
 	b.Host += snapshotsDirBlocks(len(snaps), p)
 	b.Units = len(snaps)
+	b.Files = int64(len(snaps)) // one layer.erofs per snapshot
 	b.Unused = unusedFiles(roots, payloadKey, func(size int64) int64 { return alloc(size, p.ErofsBlock) })
 	b.total(p)
 	return b, ""
@@ -103,6 +104,7 @@ func layerCasSize(roots []*root, p Profile) (*Breakdown, string) {
 	b.Host += snapshotsDirBlocks(len(snaps), p) + shardedDirBlocks(names, 0)*p.HostBlock
 	b.Units = len(snaps)
 	b.Objects = len(objects)
+	b.Files = int64(2*len(snaps) + len(objects)) // a layer.erofs and a marker per snapshot, and the objects
 	b.Unused = unusedFiles(roots, func(_ string, _ mName, e *Entry) (string, int64, bool) {
 		if e == nil || e.Kind != KindReg || e.Size <= p.InlineMaxLayer {
 			return "", 0, false
