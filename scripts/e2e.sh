@@ -83,8 +83,15 @@ DSTORE=""
 TARBALL=""
 TARINDEX=""
 COPYTAR=""
+SECTION="setup"
+NSECTIONS=0
+NSKIPPED=0
+FAILMSG=""
+TITLES=()
+STATUS=()
 
 cleanup() {
+	local rc=$?
 	set +e
 	if [ -n "$OVL" ]; then
 		bin/ocicfs --root "$STORE" unmount "$OVL/merged" 2>/dev/null
@@ -106,6 +113,21 @@ cleanup() {
 	[ -n "$TARBALL" ] && rm -f "$TARBALL"
 	[ -n "$TARINDEX" ] && rm -rf "$TARINDEX"
 	[ -n "$COPYTAR" ] && rm -f "$COPYTAR"
+	# The summary and verdict are the last lines of the run, after any cleanup
+	# output. Sections after a failure never ran, so they are not listed.
+	if [ "$NSECTIONS" -gt 0 ]; then
+		[ "$rc" -eq 0 ] || STATUS[NSECTIONS - 1]=FAIL
+		printf '\nE2E summary (%ss):\n' "$SECONDS"
+		for i in "${!TITLES[@]}"; do
+			printf '  %-4s %2d. %s\n' "${STATUS[i]}" $((i + 1)) "${TITLES[i]}"
+		done
+	fi
+	if [ "$rc" -eq 0 ]; then
+		echo "E2E OK: $((NSECTIONS - NSKIPPED)) passed, $NSKIPPED skipped"
+	else
+		echo "E2E FAIL in $SECTION: ${FAILMSG:-exit $rc}" >&2
+	fi
+	exit "$rc"
 }
 trap cleanup EXIT
 
@@ -113,7 +135,28 @@ STORE="$(mktemp -d /var/lib/ocicfs/e2e-XXXXXX)"
 MNT="$(mktemp -d)"
 KN=(bin/ocicfs --root "$STORE")
 
-fail() { echo "E2E FAIL: $*" >&2; exit 1; }
+# section starts the next numbered section, step announces a step within it,
+# and skip marks the current section as not run; the exit trap lists them all
+# in its summary. fail records the message the exit trap reports, together with
+# the section it failed in.
+section() {
+	NSECTIONS=$((NSECTIONS + 1))
+	SECTION="$NSECTIONS. $*"
+	TITLES+=("$*")
+	STATUS+=(ok)
+	printf '\n=== %s ===\n' "$SECTION"
+}
+step() { echo "  -- $*"; }
+skip() {
+	NSKIPPED=$((NSKIPPED + 1))
+	STATUS[NSECTIONS - 1]=skip
+	TITLES[NSECTIONS - 1]+=": $*"
+	echo "  -- skipped: $*"
+}
+fail() {
+	FAILMSG="$*"
+	exit 1
+}
 
 # host_child prints the digest of the manifest an image index offers for the
 # host platform -- the identity ocicfs keys the image by. $1 is the index JSON.
@@ -133,22 +176,22 @@ run_lifecycle() {
 	local ref="$1" digest="$2" pulled="$3"
 	shift 3
 
-	echo "== pull ($*) =="
+	step "$*"
 	"${KN[@]}" "$@"
 
-	echo "== ls (expect the pulled image) =="
+	step "ls: expect the pulled image"
 	local listed
 	listed="$("${KN[@]}" ls)"
 	printf '%s\n' "$listed"
 	printf '%s\n' "$listed" | grep -qF "$ref" || fail "ls did not list $ref after pull"
 
-	echo "== inspect (text, then json checked against the pulled digest) =="
+	step "inspect, text and json: expect the pulled digest"
 	"${KN[@]}" inspect "$ref"
 	local inspected
 	inspected="$("${KN[@]}" inspect --format json "$ref")"
 	[ "$(jq -r .root <<<"$inspected")" = "$digest" ] || fail "inspect root is not the image identity"
 
-	echo "== ref record (expect identity keyed, provenance preserved) =="
+	step "check the ref record: expect it keyed by identity, with the source digest kept"
 	# One image is in the store at this point, so the single ref record under
 	# refs/ is this leg's. The on-disk layout is a documented contract.
 	local record
@@ -160,7 +203,7 @@ run_lifecycle() {
 	jq -e '.fsverity != ""' <<<"$inspected" >/dev/null || fail "inspect reports no fsverity digest"
 	jq -e '.rootfs_size > 0' <<<"$inspected" >/dev/null || fail "inspect reports no merged rootfs size"
 
-	echo "== inspect --layers (table, then json layer identity checks) =="
+	step "inspect --layers, table and json: expect the layer identities"
 	"${KN[@]}" inspect --layers "$ref"
 	local layered
 	layered="$("${KN[@]}" inspect --layers --format json "$ref")"
@@ -170,18 +213,18 @@ run_lifecycle() {
 		|| fail "first layer chainID is not the first diff_id"
 	jq -e '[.layers[].size > 0] | all' <<<"$layered" >/dev/null || fail "a layer reports no archive size"
 
-	echo "== mount =="
+	step "mount"
 	"${KN[@]}" mount "$ref" "$MNT"
-	echo "== mounted rootfs (expect non-empty, read-only) =="
+	step "check the mounted rootfs: expect it non-empty and read-only"
 	ls -la "$MNT"
 	[ -n "$(ls -A "$MNT")" ] || fail "mounted rootfs is empty"
 	if touch "$MNT/.e2e-rw-probe" 2>/dev/null; then fail "mounted rootfs is writable"; fi
 
-	echo "== unmount (expect the mountpoint emptied) =="
+	step "unmount: expect the mountpoint emptied"
 	"${KN[@]}" unmount "$MNT"
 	[ -z "$(ls -A "$MNT")" ] || fail "mountpoint not empty after unmount"
 
-	echo "== mount --metadata-only + consumer-assembled overlay =="
+	step "mount --metadata-only and assemble a writable overlay over it"
 	# The upper and work directories must not live on an overlayfs, so keep the
 	# whole leg beside the store on the verity-capable filesystem.
 	OVL="$(mktemp -d /var/lib/ocicfs/e2e-ovl-XXXXXX)"
@@ -191,7 +234,7 @@ run_lifecycle() {
 		"lowerdir=$OVL/meta::$STORE/objects/fsverity-sha256-12,upperdir=$OVL/upper,workdir=$OVL/work,redirect_dir=on,metacopy=on,verity=require" \
 		"$OVL/merged"
 
-	echo "== merged rootfs (expect file data served from the object store) =="
+	step "check the merged rootfs: expect file data served from the object store"
 	local f
 	f="$(find "$OVL/merged" -xdev -type f -size +0c -print -quit)"
 	[ -n "$f" ] || fail "merged rootfs has no file content"
@@ -204,7 +247,7 @@ run_lifecycle() {
 	rm -rf "$OVL"
 	OVL=""
 
-	echo "== hold (expect a plain remove to decline, naming the holder) =="
+	step "hold, then remove: expect the remove declined, naming the holder"
 	"${KN[@]}" hold "$ref"
 	local declined
 	if declined="$("${KN[@]}" remove "$ref" 2>&1)"; then
@@ -215,10 +258,10 @@ run_lifecycle() {
 	listed="$("${KN[@]}" ls)"
 	printf '%s\n' "$listed" | grep -qF "$ref" || fail "ls does not list $ref after the declined remove"
 
-	echo "== release, then remove =="
+	step "release, then remove"
 	"${KN[@]}" release "$ref"
 	"${KN[@]}" remove "$ref"
-	echo "== ls (expect the image gone) =="
+	step "ls: expect the image gone"
 	listed="$("${KN[@]}" ls)"
 	printf '%s\n' "$listed"
 	if printf '%s\n' "$listed" | grep -qF "$ref"; then fail "ls still lists $ref after remove"; fi
@@ -248,14 +291,14 @@ done
 curl -fsS "http://127.0.0.1:$port/v2/" >/dev/null 2>&1 \
 	|| { cat "$REGDIR/zot.log" >&2; fail "zot did not become ready on port $port"; }
 
-echo "==== phase 0: purpose-built image -> seal -> cross-check -> lifecycle ===="
+section "Build and seal a purpose-built image, cross-checked against composefs-rs and mkcomposefs"
 # An offline, hardlink-free image covering the content classes and merge
 # semantics the busybox legs cannot pin down: an object-sized and an
 # inline-sized file, an empty file, a symlink, an empty directory, /run
 # content the canonical transform drops, and a second layer carrying a
 # whiteout and an override. Hardlink-free so the cross-check below must
 # reach the exact four-way digest match, not its fallback.
-echo "== build with umoci and push =="
+step "build with umoci and push to the registry"
 IMGDIR="$(mktemp -d /var/lib/ocicfs/e2e-img-XXXXXX)"
 umoci init --layout "$IMGDIR/layout"
 umoci new --image "$IMGDIR/layout:custom"
@@ -279,7 +322,7 @@ cdigest="$(jq -r '.manifests[0].digest' "$IMGDIR/layout/index.json")"
 crane push "$IMGDIR/layout" "127.0.0.1:$port/custom"
 cref="127.0.0.1:$port/custom@$cdigest"
 
-echo "== seal (plain manifest target: dry-run parity, then --from-dir push) =="
+step "seal: expect one digest from the registry dry-run, the --from-dir dry-run and the --from-dir push"
 cdry="$("${KN[@]}" seal --dry-run --format json "$cref" | jq -r .sealed)"
 [[ "$cdry" == sha256:* ]] || fail "custom seal --dry-run reported no sealed digest"
 cfromdir="$("${KN[@]}" seal --dry-run --from-dir "$IMGDIR/layout" --format json "$cref" | jq -r .sealed)"
@@ -292,20 +335,21 @@ jq -e '.annotations["composefs.merged.erofs.v1.fsverity-sha256-12"] | test("^[0-
 jq -e '.config.annotations["composefs.config.fsverity-sha256-12"] | test("^[0-9a-f]{64}$")' \
 	<<<"$cman" >/dev/null || fail "custom sealed manifest lacks a well-formed config fsverity annotation"
 
-echo "== seal-crosscheck (expect the exact four-way match) =="
+step "seal-crosscheck: expect one merged fs-verity digest from ocicfs seal, composefs-rs (cfsctl oci compute-id), the Rust mkcomposefs (cfsctl mkcomposefs) and the C mkcomposefs over a umoci unpack"
 ccheck="$(CROSSCHECK_REGISTRY="127.0.0.1:$port" scripts/seal-crosscheck.sh "$cref")"
 printf '%s\n' "$ccheck" | grep -E "ocicfs:|cfsctl:|mkcomposefs:|RESULT"
 printf '%s\n' "$ccheck" | grep -qF "RESULT: all four digests MATCH" \
 	|| fail "seal-crosscheck did not reach the exact four-way match"
 
-echo "==== lifecycle 0: the sealed purpose-built image ===="
+section "Lifecycle from registry: the sealed purpose-built image"
 # The purpose-built image is a plain manifest, so it is its own identity.
 run_lifecycle "127.0.0.1:$port/custom@$csealed" "$csealed" "$csealed" pull "127.0.0.1:$port/custom@$csealed"
 rm -rf "$IMGDIR"
 IMGDIR=""
 
+section "Lifecycle from a local OCI directory (--from-dir)"
 if [ ! -f "$LAYOUT/index.json" ]; then
-	echo "== crane pull $IMAGE -> $LAYOUT =="
+	step "crane pull $IMAGE into $LAYOUT"
 	crane pull --format=oci "$IMAGE" "$LAYOUT"
 fi
 digest="$(jq -r '.manifests[0].digest' "$LAYOUT/index.json")"
@@ -314,10 +358,9 @@ digest="$(jq -r '.manifests[0].digest' "$LAYOUT/index.json")"
 identity="$(host_child "$(cat "$LAYOUT/blobs/sha256/${digest#sha256:}")")"
 [[ "$identity" == sha256:* ]] || fail "e2e layout index lists no linux/$(go env GOARCH) manifest"
 
-echo "==== lifecycle 1: image sideloaded from a local directory ===="
 run_lifecycle "e2e@$digest" "$identity" "$digest" pull --from-dir "$LAYOUT" "e2e@$digest"
 
-echo "==== lifecycle 1b: image sideloaded from a tar of the layout (--from-tar) ===="
+section "Lifecycle from a multi-platform OCI tar (--from-tar)"
 # The archive is laid out as docker save writes one: blobs before index.json,
 # and the index entry carrying the reference docker save was given in its
 # name annotation. No reference is passed: the pull takes the name from that
@@ -330,12 +373,12 @@ tar -C "$LAYOUT" -cf "$TARBALL" oci-layout blobs
 tar -C "$TARINDEX" -rf "$TARBALL" index.json
 run_lifecycle "index.docker.io/library/e2e@$digest" "$identity" "$digest" pull --from-tar "$TARBALL"
 
-echo "==== lifecycle 1c: host-platform image sideloaded from a tar of a single-platform layout (--from-tar) ===="
+section "Lifecycle from a single-platform OCI tar (--from-tar)"
 # The shape docker save --platform writes: index.json points straight at the
 # platform manifest, so the recorded reference lands on that manifest and the
 # identity is the manifest itself, with no index to descend.
 if [ ! -f "$LAYOUT-single/index.json" ]; then
-	echo "== crane pull --platform linux/$(go env GOARCH) $IMAGE -> $LAYOUT-single =="
+	step "crane pull --platform linux/$(go env GOARCH) $IMAGE into $LAYOUT-single"
 	crane pull --format=oci --platform "linux/$(go env GOARCH)" "$IMAGE" "$LAYOUT-single"
 fi
 sdigest="$(jq -r '.manifests[0].digest' "$LAYOUT-single/index.json")"
@@ -346,8 +389,9 @@ tar -C "$LAYOUT-single" -cf "$TARBALL" oci-layout blobs
 tar -C "$TARINDEX" -rf "$TARBALL" index.json
 run_lifecycle "index.docker.io/library/e2e@$sdigest" "$sdigest" "$sdigest" pull --from-tar "$TARBALL"
 
+section "Lifecycle from a docker save or buildx archive (--from-tar)"
 if [ -n "$ARCHIVE" ]; then
-	echo "==== lifecycle 1d: real archive $ARCHIVE (--from-tar, E2E_ARCHIVE) ===="
+	step "archive $ARCHIVE"
 	tar -tf "$ARCHIVE" 2>/dev/null | grep -qx 'index.json' \
 		|| fail "$ARCHIVE is not an uncompressed OCI layout tar (no index.json listed; docker save and buildx write one, and ocicfs does not read a compressed archive)"
 	aindex="$(tar -xOf "$ARCHIVE" index.json)"
@@ -372,17 +416,17 @@ if [ -n "$ARCHIVE" ]; then
 	[[ "$aref" == *"@$adigest" ]] || fail "recorded reference $aref does not pin the archive's entry $adigest"
 	run_lifecycle "$aref" "$aidentity" "$adigest" pull --from-tar "$ARCHIVE"
 else
-	echo "==== lifecycle 1d skipped: set E2E_ARCHIVE=<archive> to run a real archive through the lifecycle ===="
+	skip "E2E_ARCHIVE is unset"
 fi
 
-echo "==== lifecycle 2: image pulled from a loopback HTTP registry ===="
+section "Lifecycle from registry by digest"
 crane push "$LAYOUT" "127.0.0.1:$port/e2e"
 run_lifecycle "127.0.0.1:$port/e2e@$digest" "$identity" "$digest" pull "127.0.0.1:$port/e2e@$digest"
 
-echo "==== lifecycle 3: image pulled and addressed by tag ===="
+section "Lifecycle from registry by tag"
 run_lifecycle "127.0.0.1:$port/e2e:latest" "$identity" "$digest" pull "127.0.0.1:$port/e2e:latest"
 
-echo "==== lifecycle 3b: image written to an archive by ocicfs copy (--from-tar by either digest) ===="
+section "Lifecycle from an ocicfs copy archive, unpinned and platform-pinned"
 # copy keeps the blobs of the host platform only and lists the image twice in
 # index.json, by the tag it was copied by and by the platform manifest, each
 # name in both annotations. Pulled with no reference, the archive is the one
@@ -399,7 +443,7 @@ done
 run_lifecycle "127.0.0.1:$port/e2e@$digest" "$identity" "$digest" pull --from-tar "$COPYTAR"
 run_lifecycle "127.0.0.1:$port/e2e@$identity" "$identity" "$identity" pull --from-tar "$COPYTAR" "127.0.0.1:$port/e2e@$identity"
 
-echo "==== differential: mounted rootfs vs crane's image-level flatten ===="
+section "Rootfs comparison: ocicfs mount against crane export of the same image"
 # crane export flattens the image the same way ocicfs's merge must (docker
 # export would not do: it dumps a *container*, whose runtime artifacts --
 # .dockerenv, /etc/mtab, /dev stubs -- are not image content). The export is
@@ -419,7 +463,7 @@ diff -r -q --no-dereference "$EXPORTDIR" "$MNT" || fail "mounted rootfs differs 
 "${KN[@]}" unmount "$MNT"
 "${KN[@]}" remove "$ref"
 
-echo "==== seal: publisher-side sealing, then the sealed image's lifecycle ===="
+section "Seal a registry image"
 # Seal handles one platform per call; the e2e image is a multi-arch index,
 # so select the host platform. --platform matches the index descriptors
 # exactly, including the variant (busybox lists arm64 only as linux/arm64/v8),
@@ -429,7 +473,7 @@ platform="$(crane manifest "$ref" | jq -r --arg arch "$(go env GOARCH)" \
 	'first(.manifests[].platform | select(.os == "linux" and .architecture == $arch))
 		| [.os, .architecture, .variant // empty] | join("/")')"
 [[ "$platform" == linux/* ]] || fail "e2e index lists no linux/$(go env GOARCH) platform"
-echo "== seal --dry-run (expect a sealed digest, nothing pushed) =="
+step "seal --dry-run: expect a sealed digest, nothing pushed"
 dryrun="$("${KN[@]}" seal --dry-run --platform "$platform" --format json "$ref")"
 sealed_dry="$(jq -r .sealed <<<"$dryrun")"
 [[ "$sealed_dry" == sha256:* ]] || fail "seal --dry-run reported no sealed digest"
@@ -437,13 +481,13 @@ if crane manifest "127.0.0.1:$port/e2e@$sealed_dry" >/dev/null 2>&1; then
 	fail "seal --dry-run pushed the sealed manifest"
 fi
 
-echo "== seal (expect the dry-run digest, pushed) =="
+step "seal: expect the dry-run digest, pushed"
 sealout="$("${KN[@]}" seal --platform "$platform" --format json "$ref")"
 sealed="$(jq -r .sealed <<<"$sealout")"
 [ "$sealed" = "$sealed_dry" ] || fail "sealed digest differs between dry-run and push"
 [ "$sealed" != "$digest" ] || fail "sealing left the manifest digest unchanged"
 
-echo "== raw sealed manifest (expect both fsverity annotations, bare hex) =="
+step "check the sealed manifest: expect both fs-verity annotations as bare hex"
 # The annotations live on each platform image manifest. A multi-arch image
 # seals as an index, so descend to the host platform's child first.
 manifest="$(crane manifest "127.0.0.1:$port/e2e@$sealed")"
@@ -458,12 +502,12 @@ jq -e '.annotations["composefs.merged.erofs.v1.fsverity-sha256-12"] | test("^[0-
 jq -e '.config.annotations["composefs.config.fsverity-sha256-12"] | test("^[0-9a-f]{64}$")' \
 	<<<"$manifest" >/dev/null || fail "sealed manifest lacks a well-formed config fsverity annotation"
 
-echo "==== lifecycle 4: the sealed image (pull re-verifies the seal) ===="
+section "Lifecycle from registry: the sealed image, pull re-verifying the seal"
 # $child is the sealed image's identity: the host platform's manifest when the
 # seal produced an index, and the sealed manifest itself otherwise.
 run_lifecycle "127.0.0.1:$port/e2e@$sealed" "$child" "$sealed" pull "127.0.0.1:$port/e2e@$sealed"
 
-echo "==== seal enforcement: mount trusts the annotation over the binding ===="
+section "Seal enforcement: mount trusts the annotation over a tampered binding"
 # The lifecycle legs removed their images, so re-pull the two sealed ones:
 # the multi-arch e2e image is the mount under test, and the purpose-built
 # image supplies a different, internally consistent object for the
@@ -484,18 +528,18 @@ cbind=$(echo "$STORE/images/sha256/${chex:0:2}/${chex:2}/"*.json)
 [ -f "$cbind" ] || fail "no purpose-built binding at $cbind"
 recorded="$(jq -r .rootfs.fsverity.digest "$sbind")"
 
-echo "== tampered binding digest (expect the mount to trust the seal) =="
+step "tamper with the binding digest and mount: expect the mount to trust the seal"
 tmp="$(mktemp)"
 jq '.rootfs.fsverity.digest = "sha256:'"$(printf '0%.0s' {1..64})"'"' "$sbind" >"$tmp" && mv "$tmp" "$sbind"
 "${KN[@]}" mount "$sref" "$MNT" || fail "mount did not trust the sealing annotation over the tampered binding"
 [ -n "$(ls -A "$MNT")" ] || fail "sealed mount is empty"
 "${KN[@]}" unmount "$MNT"
 
-echo "== re-pull (expect the tampered binding healed) =="
+step "pull again: expect the tampered binding healed"
 "${KN[@]}" pull "$sref"
 [ "$(jq -r .rootfs.fsverity.digest "$sbind")" = "$recorded" ] || fail "re-pull did not restore the binding digest"
 
-echo "== repointed binding (expect the mount to fail on the seal) =="
+step "repoint the binding and mount: expect the mount to fail on the seal"
 tmp="$(mktemp)"
 jq --slurpfile o "$cbind" \
 	'.rootfs.descriptor = $o[0].rootfs.descriptor | .rootfs.fsverity.digest = $o[0].rootfs.fsverity.digest' \
@@ -506,7 +550,7 @@ fi
 printf '%s\n' "$out"
 printf '%s\n' "$out" | grep -qF "sealing annotation claims" || fail "repointed-binding mount did not name the sealing annotation"
 
-echo "== plain re-pull (expect it to fail closed on the disagreement) =="
+step "pull again: expect it to fail closed on the disagreement"
 # A repointed binding is an integrity disagreement, not staleness, so a plain
 # re-pull must refuse rather than paper over it; remove-then-pull is the
 # remedy.
@@ -516,7 +560,7 @@ fi
 printf '%s\n' "$out"
 printf '%s\n' "$out" | grep -qF "annotation" || fail "repointed-binding pull did not name the sealing annotation"
 
-echo "== remove, pull (expect a clean mount again) =="
+step "remove, pull and mount: expect a clean mount again"
 "${KN[@]}" remove "$sref"
 "${KN[@]}" pull "$sref"
 "${KN[@]}" mount "$sref" "$MNT"
@@ -525,7 +569,8 @@ echo "== remove, pull (expect a clean mount again) =="
 "${KN[@]}" remove "$sref"
 "${KN[@]}" remove "127.0.0.1:$port/custom@$csealed"
 
-echo "== gc: reclaim the unwanted, keep the survivor =="
+section "Garbage collection: reclamation and mount protection"
+step "gc: expect the unwanted image reclaimed, the survivor kept"
 "${KN[@]}" pull "$sref"
 "${KN[@]}" pull "127.0.0.1:$port/custom@$csealed"
 "${KN[@]}" remove "127.0.0.1:$port/custom@$csealed"
@@ -539,7 +584,7 @@ f="$(find "$MNT" -type f -size +64c -print -quit)"
 cat "$f" >/dev/null || fail "reading survivor content failed after gc"
 "${KN[@]}" unmount "$MNT"
 
-echo "== gc: in-use image survives, falls after unmount =="
+step "gc with a metadata-only mount: expect the image kept until unmount, then reclaimed"
 "${KN[@]}" mount --metadata-only "$sref" "$MNT"
 "${KN[@]}" remove "$sref"
 out="$("${KN[@]}" gc --format json)"
@@ -571,7 +616,7 @@ for tree in "$STORE/objects/sha256" "$STORE/objects/fsverity-sha256-12" \
 	[ -z "$(find "$tree" -mindepth 1 -type d 2>/dev/null)" ] || fail "empty shard directories remain under $tree"
 done
 
-echo "== gc: plain mount marks in use, falls after unmount =="
+step "gc with a plain mount: expect the image kept until unmount, then reclaimed"
 "${KN[@]}" pull "$sref"
 "${KN[@]}" mount "$sref" "$MNT"
 "${KN[@]}" remove "$sref"
@@ -598,7 +643,7 @@ printf '%s\n' "$out"
 [ "$(printf '%s' "$out" | jq -r .objectsRemoved)" -gt 0 ] || fail "gc after plain unmount reclaimed nothing"
 [ -z "$(find "$STORE/objects/sha256" -type f)" ] || fail "objects remain in an empty store"
 
-echo "==== delta: pull N, hold it, pull N+1 by ranges, compare, release, remove, gc ===="
+section "Delta pull from registry: ranges over a held N, same image as a plain pull"
 # Two releases sharing their base layer, published zstd:chunked: N+1 changes
 # one inline file, removes one file and adds one, so its delta is a couple of
 # ranges. The fixtures are linux/amd64 images; a host of another
@@ -615,12 +660,12 @@ if [ "$(go env GOARCH)" = amd64 ]; then
 	oldhex="$(printf 'this file is bigger than sixty-four bytes so it is stored as an object.\nold\n' | sha256sum | cut -d' ' -f1)"
 	oldobj="$STORE/objects/sha256/${oldhex:0:2}/${oldhex:2}"
 
-	echo "== pull --delta N into the empty store, hold it as delta-base =="
+	step "pull --delta N into the empty store and hold it as delta-base"
 	"${KN[@]}" pull --delta "$nref"
 	[ -f "$oldobj" ] || fail "N's app/old object is not in the store after the delta pull"
 	"${KN[@]}" hold --holder delta-base "$nref"
 
-	echo "== pull --delta N+1 (expect every layer by ranges, fewer bytes than the layers) =="
+	step "pull --delta N+1: expect every layer by ranges, fewer bytes than the layers"
 	dlog="$(mktemp)"
 	"${KN[@]}" pull --delta "$n1ref" 2>"$dlog"
 	cat "$dlog"
@@ -636,7 +681,7 @@ if [ "$(go env GOARCH)" = amd64 ]; then
 	[ "$fetched" -gt 0 ] && [ "$fetched" -lt "$size" ] || fail "delta pull fetched $fetched of $size layer bytes"
 	rm -f "$dlog"
 
-	echo "== plain pull of N+1 into a second store (expect the same composefs image) =="
+	step "pull N+1 plainly into a second store: expect the same composefs image"
 	DSTORE="$(mktemp -d /var/lib/ocicfs/e2e-delta-XXXXXX)"
 	bin/ocicfs --root "$DSTORE" pull "$n1ref"
 	dinspect="$("${KN[@]}" inspect --format json "$n1ref")"
@@ -648,7 +693,7 @@ if [ "$(go env GOARCH)" = amd64 ]; then
 	rm -rf "$DSTORE"
 	DSTORE=""
 
-	echo "== release delta-base, remove N, gc (expect N's own object gone, N+1 intact) =="
+	step "release delta-base, remove N, gc: expect N's own object gone, N+1 intact"
 	"${KN[@]}" release --holder delta-base "$nref"
 	"${KN[@]}" remove "$nref"
 	out="$("${KN[@]}" gc --format json)"
@@ -662,7 +707,5 @@ if [ "$(go env GOARCH)" = amd64 ]; then
 	"${KN[@]}" unmount "$MNT"
 	"${KN[@]}" remove "$n1ref"
 else
-	echo "== skipped: the delta fixtures are linux/amd64 images =="
+	skip "the delta fixtures are linux/amd64 images"
 fi
-
-echo "E2E OK: purpose-built image sealed, cross-checked four ways, and run through the lifecycle; pull -> ls -> inspect -> mount -> unmount -> metadata-only overlay -> hold -> declined remove -> release -> remove, from --from-dir, from a tar of the layout and from a tar of a single-platform layout by the name they carry via --from-tar (and from a real docker save or buildx archive when E2E_ARCHIVE is set), and from a registry, digest-pinned and by tag, and from an ocicfs copy archive of that tag unpinned and pinned to the platform manifest, plus rootfs diff against crane export, a seal round against the registry, and a seal-enforcement round proving mount trusts the annotation over the binding, a gc round (unwanted reclaimed, in-use survives until unmount on both mount paths, empty store fully reclaimed down to its shard directories), and a delta round (N+1 pulled by ranges over a held N, identical to a plain pull, N reclaimed once released and removed) (checks passed)"
