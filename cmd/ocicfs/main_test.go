@@ -81,7 +81,7 @@ func TestRunUnknownSubcommand(t *testing.T) {
 
 func TestRunSubcommandNotImplemented(t *testing.T) {
 	var out, errOut bytes.Buffer
-	code := run(context.Background(), []string{"publish", "dir", "example.com/team/app:latest"}, &out, &errOut)
+	code := run(context.Background(), []string{"--root", t.TempDir(), "publish", "dir", "example.com/team/app:latest"}, &out, &errOut)
 	if code != 1 {
 		t.Errorf("exit code = %d, want 1", code)
 	}
@@ -122,7 +122,7 @@ func TestRunUnmountDispatchesToEngine(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var out, errOut bytes.Buffer
-	code := run(ctx, []string{"unmount", "/mnt/ocicfs-test"}, &out, &errOut)
+	code := run(ctx, []string{"--root", t.TempDir(), "unmount", "/mnt/ocicfs-test"}, &out, &errOut)
 	if code != 130 {
 		t.Errorf("exit code = %d, want 130", code)
 	}
