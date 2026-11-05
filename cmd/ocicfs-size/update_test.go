@@ -827,7 +827,7 @@ func buildUpdate(t *testing.T, from, to string) *UpdateReport {
 	}
 	defer sp.close()
 	ls := newLayerSet("")
-	ls.readTOCs = true
+	ls.readTOCs, ls.zsizes = true, true
 	known := map[string]*Image{}
 	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
 	a, err := loadImages(ctx, newSpyOpener().open, sp, ls, []string{from}, platform, rootKey, known)

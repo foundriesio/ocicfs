@@ -43,6 +43,10 @@ type layerSet struct {
 	// contents too, into tocs by tocKey.
 	readTOCs bool
 	tocs     map[string]*LayerTOC
+	// zsizes makes load record each file's compressed size in the
+	// inventory of every layer without a table of contents, treating an
+	// inventory cached without them as a miss.
+	zsizes bool
 
 	invHits, recordHits, scans, ocicfsScans, tocHits, tocParses int
 }
@@ -121,12 +125,13 @@ func (ls *layerSet) load(ctx context.Context, src ocichain.BlobSource, l LayerRe
 		ls.blobs[l.DiffID] = blobRef{src: src, desc: desc}
 	}
 	diffID := digest.Digest(l.DiffID)
-	if _, ok := ls.inv[l.DiffID]; !ok {
-		if inv := ls.readInv(diffID); inv != nil {
+	zsizes := ls.zsizes && l.TOC == "" && l.TOCChecksum == ""
+	if inv, ok := ls.inv[l.DiffID]; !ok || (zsizes && !hasZSizes(inv)) {
+		if inv := ls.readInv(diffID); inv != nil && (!zsizes || hasZSizes(inv)) {
 			ls.inv[l.DiffID] = inv
 			ls.invHits++
 		} else {
-			inv, err := ls.scan(ctx, src, desc, diffID)
+			inv, err := ls.scan(ctx, src, desc, diffID, zsizes)
 			if err != nil {
 				return err
 			}
@@ -246,14 +251,26 @@ func (ls *layerSet) ocicfsLayer(ctx context.Context, diffID string, idx int) (*r
 	return ls.ocicfsScan(ctx, b.src, b.desc, digest.Digest(diffID), idx)
 }
 
-// scan reads a layer blob into an inventory.
-func (ls *layerSet) scan(ctx context.Context, src ocichain.BlobSource, desc ocispec.Descriptor, diffID digest.Digest) (*LayerInv, error) {
+// hasZSizes reports whether inv records the compressed size of every
+// non-empty regular file.
+func hasZSizes(inv *LayerInv) bool {
+	for _, e := range inv.Entries {
+		if e.Kind == KindReg && e.Size > 0 && e.ZSize == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// scan reads a layer blob into an inventory, with each file's compressed
+// size when zsizes is set.
+func (ls *layerSet) scan(ctx context.Context, src ocichain.BlobSource, desc ocispec.Descriptor, diffID digest.Digest, zsizes bool) (*LayerInv, error) {
 	r, err := ocichain.OpenLayer(ctx, src, desc)
 	if err != nil {
 		return nil, fmt.Errorf("open layer %s: %w", desc.Digest, err)
 	}
 	ls.scans++
-	return scanLayer(ctx, r, diffID)
+	return scanLayer(ctx, r, diffID, zsizes)
 }
 
 // ocicfsScan reads a layer blob through the ocicfs scan, hashing stored
