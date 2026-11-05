@@ -6,9 +6,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/foundriesio/ocicfs/internal/cli"
+	"github.com/foundriesio/ocicfs/internal/composefs"
 )
 
 // UpdateReport is an update from the from images to the to images: the
@@ -24,6 +26,26 @@ type UpdateReport struct {
 	After       Models   `json:"after"`       // the to images, and the from images with rollback
 	Additional  Models   `json:"additional"`  // union − before
 	Reclaimable Models   `json:"reclaimable"` // union − after
+	Wire        Wire     `json:"wire"`
+
+	details []string // per-layer download lines, for --details
+}
+
+// Wire is what the update downloads by each transfer path.
+type Wire struct {
+	Containerd WirePath `json:"containerd"`
+	Ocicfs     WirePath `json:"ocicfs"`
+}
+
+// WirePath is what one transfer path fetches: the compressed blobs and the
+// metadata reads, every read counted.
+type WirePath struct {
+	Unavailable string `json:"unavailable,omitempty"` // why the path is not estimated
+	Bytes       int64  `json:"bytes"`                 // metadata included
+	Metadata    int64  `json:"metadata"`              // index, manifest and config bytes
+	Reads       int    `json:"reads"`                 // metadata reads
+	Blobs       int    `json:"blobs"`                 // whole-blob reads
+	Held        int    `json:"held,omitempty"`        // to images the store already holds
 }
 
 // runUpdate sizes the update o names.
@@ -107,8 +129,267 @@ func buildUpdateReport(ctx context.Context, from, to []*Image, rollback bool, ls
 	}
 	up.Additional = subtractModels(up.Union, up.Before)
 	up.Reclaimable = subtractModels(up.Union, up.After)
+
+	up.Wire.Containerd = containerdPull(from, to)
+	why := scanUnsupported(roots)
+	if why == "" {
+		why = casErr
+	}
+	if why != "" {
+		up.Wire.Ocicfs.Unavailable = why
+	} else {
+		rootOf, casOf := map[*Image]*root{}, map[*Image]*casRoot{}
+		for i, img := range union {
+			rootOf[img], casOf[img] = roots[i], cas[i]
+		}
+		up.Wire.Ocicfs, up.details = ocicfsPull(from, to, rootOf, casOf)
+	}
+	rep.Assumptions = append(rep.Assumptions, wireAssumptions...)
 	rep.Models, rep.Update = up.Union, up
 	return rep
+}
+
+// The assumptions the download estimates rest on.
+var wireAssumptions = []string{
+	"containerd: stock unpacker (fetch-all off), content store holds the from images' blobs",
+	"ocicfs rows: the from images were pulled by that row's path and collected (gc); store holds their referenced objects",
+	"ocicfs pull: a layer is saved when read from its tar stream, never when built from its table",
+	"survivors from ocicfs-size's replay, which agrees with ocicfs's merge for the layers it accepts",
+}
+
+// containerdPull is what containerd's unpacker fetches for the to images
+// with the from images' blobs and snapshots in place: each image's blobs
+// from its first layer whose snapshot is absent, minus the blobs the content
+// store holds, and the metadata blobs it lacks.
+func containerdPull(from, to []*Image) WirePath {
+	chains, blobs, meta := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	held := func(img *Image) {
+		for _, l := range img.Layers {
+			chains[l.ChainID], blobs[l.BlobDigest] = true, true
+		}
+		for _, m := range metadataBlobs(img) {
+			meta[m.digest] = true
+		}
+	}
+	for _, img := range from {
+		held(img)
+	}
+	var w WirePath
+	for _, img := range to {
+		first := len(img.Layers)
+		for j, l := range img.Layers {
+			if !chains[l.ChainID] {
+				first = j
+				break
+			}
+		}
+		for _, l := range img.Layers[first:] {
+			if !blobs[l.BlobDigest] {
+				blobs[l.BlobDigest] = true
+				w.Bytes += l.BlobSize
+				w.Blobs++
+			}
+		}
+		for _, m := range metadataBlobs(img) {
+			if !meta[m.digest] {
+				w.Metadata += m.size
+				w.Reads++
+			}
+		}
+		held(img)
+	}
+	w.Bytes += w.Metadata
+	return w
+}
+
+// metadataBlob is an image's index, manifest or config.
+type metadataBlob struct {
+	digest string
+	size   int64
+}
+
+func metadataBlobs(img *Image) []metadataBlob {
+	out := []metadataBlob{{img.ManifestDigest, img.ManifestSize}, {img.ConfigDigest, img.ConfigSize}}
+	if img.IndexDigest != "" {
+		out = append(out, metadataBlob{img.IndexDigest, img.IndexSize})
+	}
+	return out
+}
+
+// ocicfsState is what an ocicfs store holds across the pulls of one update:
+// the images by identity, the metadata blobs by digest, the saved layers by
+// blob, size and diff_id, and the objects by content digest.
+type ocicfsState struct {
+	held, metadata, saved, objects map[string]bool
+}
+
+// newOcicfsState is the store the from images leave once collected: the
+// objects their merged roots reference, and the layers save keeps saved.
+func newOcicfsState(from []*Image, cas map[*Image]*casRoot, save func(*Image, int) bool) *ocicfsState {
+	st := &ocicfsState{held: map[string]bool{}, metadata: map[string]bool{}, saved: map[string]bool{}, objects: map[string]bool{}}
+	for _, img := range from {
+		st.held[identity(img)] = true
+		st.metadata[rootKey(img)], st.metadata[img.ManifestDigest] = true, true
+		for j, l := range img.Layers {
+			if save(img, j) {
+				st.saved[savedKey(l)] = true
+			}
+		}
+		for _, e := range cas[img].entries {
+			if e.Hardlink == "" && e.Mode.IsRegular() && e.Content == nil && e.Size > composefs.InlineContentMax {
+				st.objects[e.Digest.String()] = true
+			}
+		}
+	}
+	return st
+}
+
+// identity is what ocicfs keys an image by: its platform manifest and
+// platform.
+func identity(img *Image) string { return img.ManifestDigest + " " + img.Platform }
+
+// savedKey is what a saved layer is valid for.
+func savedKey(l LayerRef) string { return fmt.Sprintf("%s %d %s", l.BlobDigest, l.BlobSize, l.DiffID) }
+
+// resolve charges w the metadata reads of pulling img and reports whether
+// the store holds the image already. A held image reads at most its root,
+// when the store lacks that blob; any other reads its root twice, then its
+// manifest when the root is an index, and its config.
+func (st *ocicfsState) resolve(w *WirePath, img *Image) (held bool, detail string) {
+	root := rootKey(img)
+	rootSize := img.ManifestSize
+	if img.IndexDigest != "" {
+		rootSize = img.IndexSize
+	}
+	if st.held[identity(img)] {
+		w.Held++
+		if st.metadata[root] {
+			return true, img.Ref + ": held: no source reads"
+		}
+		st.metadata[root] = true
+		w.Metadata += rootSize
+		w.Reads++
+		return true, img.Ref + ": held: new root read"
+	}
+	w.Metadata += 2*rootSize + img.ConfigSize
+	w.Reads += 3
+	if img.IndexDigest != "" {
+		w.Metadata += img.ManifestSize
+		w.Reads++
+	}
+	st.held[identity(img)] = true
+	st.metadata[root], st.metadata[img.ManifestDigest] = true, true
+	return false, ""
+}
+
+// readLayer charges w layer j of img read whole, once per blob of the
+// image, and stores every file the layer carries.
+func (st *ocicfsState) readLayer(w *WirePath, read map[string]bool, r *root, j int) {
+	l := r.img.Layers[j]
+	if !read[l.BlobDigest] {
+		read[l.BlobDigest] = true
+		w.Bytes += l.BlobSize
+		w.Blobs++
+	}
+	for d := range layerObjects(r.mats[j].inv) {
+		st.objects[d] = true
+	}
+}
+
+// layerObjects are the contents of the regular files of a layer ocicfs
+// stores as objects, hidden or not.
+func layerObjects(inv *LayerInv) map[string]bool {
+	out := map[string]bool{}
+	for _, e := range inv.Entries {
+		if e.Kind == KindReg && e.Size > composefs.InlineContentMax {
+			out["sha256:"+e.Digest] = true
+		}
+	}
+	return out
+}
+
+// survivor is a regular file an image shows: its content and the layer
+// that supplies it.
+type survivor struct {
+	digest string
+	size   int64
+	layer  int
+}
+
+// survivors are the non-empty regular files r shows, one per content and
+// supplying layer, before ocicfs's canonical transform.
+func survivors(r *root) []survivor {
+	seen := map[survivor]bool{}
+	var out []survivor
+	for li, m := range r.mats {
+		for i := range m.names {
+			e := m.entry(i)
+			if r.view.fate[li][i] != fateVisible || e == nil || e.Kind != KindReg || e.Size == 0 {
+				continue
+			}
+			s := survivor{digest: "sha256:" + e.Digest, size: e.Size, layer: li}
+			if !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
+
+// ocicfsPull is what plain ocicfs pulls of the to images fetch into a store
+// the from images were pulled into, every layer saved, and collected. Each
+// image reads every layer it has no saved layer for, then each saved layer
+// that is the first to list a stored file the image shows and the store
+// still lacks. It returns the per-layer lines for --details too.
+func ocicfsPull(from, to []*Image, roots map[*Image]*root, cas map[*Image]*casRoot) (WirePath, []string) {
+	st := newOcicfsState(from, cas, func(*Image, int) bool { return true })
+	var w WirePath
+	var details []string
+	for _, img := range to {
+		if held, detail := st.resolve(&w, img); held {
+			details = append(details, "ocicfs pull · "+detail)
+			continue
+		}
+		r := roots[img]
+		read := map[string]bool{}
+		var reused []int
+		for j, l := range img.Layers {
+			if st.saved[savedKey(l)] {
+				reused = append(reused, j)
+				continue
+			}
+			if !read[l.BlobDigest] {
+				details = append(details, "ocicfs pull · "+l.BlobDigest+": read whole · not saved")
+			}
+			st.readLayer(&w, read, r, j)
+			st.saved[savedKey(l)] = true
+		}
+		missing := map[string]bool{}
+		for _, s := range survivors(r) {
+			if s.size > composefs.InlineContentMax && !st.objects[s.digest] {
+				missing[s.digest] = true
+			}
+		}
+		for _, j := range reused {
+			if len(missing) == 0 {
+				break
+			}
+			lists := false
+			for d := range layerObjects(r.mats[j].inv) {
+				if missing[d] {
+					delete(missing, d)
+					lists = true
+				}
+			}
+			if lists && !read[img.Layers[j].BlobDigest] {
+				details = append(details, "ocicfs pull · "+img.Layers[j].BlobDigest+": read whole · recovery: lists a needed file the store lacks")
+				st.readLayer(&w, read, r, j)
+			}
+		}
+	}
+	w.Bytes += w.Metadata
+	return w, details
 }
 
 // subtractModels returns a − b, model by model and fs-verity variant by

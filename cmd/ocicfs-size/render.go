@@ -154,16 +154,22 @@ func writeUnavailable(b *strings.Builder, rows []unavailable) {
 	}
 }
 
-// writeUpdate writes an update's header and each model's disk usage before
-// the update, needed while both sets are held and after cleanup, with
-// fs-verity on and off. A model one of the sets cannot be estimated for is
-// unavailable in every column. With details the sets' OCI layers follow.
+// writeUpdate writes an update's header, what each transfer path
+// downloads, and each model's disk usage before the update, needed while
+// both sets are held and after cleanup, with fs-verity on and off. A model
+// one of the sets cannot be estimated for is unavailable in every column.
+// With details the sets' OCI layers, each path's requests and its per-layer
+// reasons follow.
 func writeUpdate(b *strings.Builder, rep *Report, details bool) {
 	from, to, after := updateSets(rep)
 	writeUpdateHeader(b, rep, from, to)
+	writeDownload(b, rep.Update.Wire, from, to)
 	writeDiskTables(b, rep)
 	if details {
 		writeUpdateLayers(b, rep, from, after)
+		up := rep.Update
+		fmt.Fprintf(b, "containerd pull: %s\nocicfs pull: %s\n", requests(up.Wire.Containerd), requests(up.Wire.Ocicfs))
+		writeList(b, "Download details", up.details)
 	}
 }
 
@@ -238,6 +244,51 @@ func shortDigest(d string) string {
 	return hex[:min(12, len(hex))]
 }
 
+// writeDownload writes one row per transfer path: what it downloads, the
+// layers it fetches of the to images', and the storage models it feeds.
+func writeDownload(b *strings.Builder, wire Wire, from, to []ImageReport) {
+	_, _, blobsFrom := imageBlobs(from)
+	_, _, blobsTo := imageBlobs(to)
+	of := fmt.Sprintf(" of %s", plural(len(blobsTo), "layer"))
+	since := "the from set"
+	if len(from) == 1 {
+		since = imageName(from[0])
+	}
+	shared := "none"
+	if n := sharedBlobs(blobsFrom, blobsTo); n > 0 {
+		shared = fmtInt(int64(n))
+	}
+	rows := [][]string{{"Transfer path", "Download", "What it fetches", "Feeds"}}
+	var gone []unavailable
+	for _, p := range []struct {
+		name, fetches, feeds string
+		w                    WirePath
+	}{
+		{"containerd pull", fmt.Sprintf(" (%s shared with %s)", shared, since), "every storage model", wire.Containerd},
+		{"ocicfs pull", "", "File CAS/image", wire.Ocicfs},
+	} {
+		if p.w.Unavailable != "" {
+			rows = append(rows, []string{p.name, "n/a‡", "-", p.feeds})
+			gone = append(gone, unavailable{p.name, p.w.Unavailable})
+			continue
+		}
+		rows = append(rows, []string{p.name, fmtSize(p.w.Bytes), fmtInt(int64(p.w.Blobs)) + of + p.fetches, p.feeds})
+	}
+	b.WriteString("\n")
+	writeTable(b, "Download (compressed bytes the device fetches):", rows, []int{3, 2, 2}, []bool{false, true, false, false})
+	writeUnavailable(b, gone)
+}
+
+// requests counts the requests a transfer path takes, by kind.
+func requests(w WirePath) string {
+	var parts []string
+	if w.Blobs > 0 {
+		parts = append(parts, plural(w.Blobs, "blob"))
+	}
+	parts = append(parts, fmtInt(int64(w.Reads))+" metadata")
+	return strings.Join(parts, " + ")
+}
+
 // writeDiskTables writes each model's disk usage before, needed during and
 // after the update, with fs-verity on and then off, and what the columns
 // and the figures assume.
@@ -249,7 +300,7 @@ func writeDiskTables(b *strings.Builder, rep *Report) {
 			heading = "Disk usage (fs-verity on; Overlay has none):"
 		}
 		b.WriteString("\n")
-		writeTable(b, heading, diskRows(up.Before, up.Additional, up.After, on), diskTableGaps[:])
+		writeTable(b, heading, diskRows(up.Before, up.Additional, up.After, on), diskTableGaps[:], []bool{false, true, true, true, true, true})
 	}
 	writeUnavailable(b, unavailableModels(up.Union))
 	kept := "after = to images only"
@@ -295,9 +346,10 @@ func diskRows(before, needed, after Models, on bool) [][]string {
 }
 
 // writeTable writes rows under heading, the first row the column titles,
-// with a dashed rule under the heading and under the titles: the first
-// column left-aligned and the others right-aligned, gaps apart.
-func writeTable(b *strings.Builder, heading string, rows [][]string, gaps []int) {
+// with a dashed rule under the heading and under the titles: the columns
+// gaps apart, each right-aligned where right says so and left-aligned
+// otherwise.
+func writeTable(b *strings.Builder, heading string, rows [][]string, gaps []int, right []bool) {
 	width := utf8.RuneCountInString
 	pad := func(n int) string { return strings.Repeat(" ", max(n, 0)) }
 	w := make([]int, len(rows[0]))
@@ -317,7 +369,11 @@ func writeTable(b *strings.Builder, heading string, rows [][]string, gaps []int)
 	for i, r := range rows {
 		l := r[0] + pad(w[0]-width(r[0]))
 		for j := 1; j < len(r); j++ {
-			l += pad(gaps[j-1]) + pad(w[j]-width(r[j])) + r[j]
+			if right[j] {
+				l += pad(gaps[j-1]) + pad(w[j]-width(r[j])) + r[j]
+			} else {
+				l += pad(gaps[j-1]) + r[j] + pad(w[j]-width(r[j]))
+			}
 		}
 		line(l)
 		if i == 0 {

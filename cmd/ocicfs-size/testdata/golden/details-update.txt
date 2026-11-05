@@ -2,6 +2,13 @@ UPDATE ESTIMATE · LAYOUT@c45af63c1708 → LAYOUT@a5ec690885e2 · linux/amd64 ·
 - from: LAYOUT @c45af63c1708
 - to:   LAYOUT @a5ec690885e2
 
+Download (compressed bytes the device fetches):
+──────────────────────────────────────────────────────────────────────────────────────────────────
+Transfer path     Download  What it fetches                                    Feeds
+──────────────────────────────────────────────────────────────────────────────────────────────────
+containerd pull    1.1 KiB  1 of 3 layers (2 shared with LAYOUT@c45af63c1708)  every storage model
+ocicfs pull        1.8 KiB  1 of 3 layers                                      File CAS/image
+
 Disk usage (fs-verity on; Overlay has none):
 ─────────────────────────────────────────────────────────────────────────────────────────────
 Storage model       before       needed           vs Overlay      after            vs Overlay
@@ -25,6 +32,11 @@ ext4 · 4 KiB blocks · no compression · inline max size 64 B (File CAS/image) 
 
 OCI layers:       3 → 3 references · 4 unique blobs · 2 shared
 Compressed size:  546 B → 515 B
+containerd pull: 1 blob + 2 metadata
+ocicfs pull: 1 blob + 3 metadata
+
+Download details:
+  - ocicfs pull · sha256:d935b423a2a382a87f403c7dc39e79a40c4c35894f3ea5872e8ae180eb595180: read whole · not saved
 
 STORAGE PROJECTION · modelled allocation per store, not paths
 █ allocation without fs-verity · ▒ fs-verity increment
@@ -100,6 +112,10 @@ Assumptions:
   - File CAS/image: composefs images are told apart by their dump, so images that differ only in fields mkcomposefs normalises are counted twice
   - File CAS/image: fs-verity view names are spread over shards like content digests
   - File CAS/layer: inline threshold 0 (layer metadata cannot inline file data) and sealed objects, as the prototype does; it mounts with verity=require, so fs-verity off is not a configuration it runs
+  - containerd: stock unpacker (fetch-all off), content store holds the from images' blobs
+  - ocicfs rows: the from images were pulled by that row's path and collected (gc); store holds their referenced objects
+  - ocicfs pull: a layer is saved when read from its tar stream, never when built from its table
+  - survivors from ocicfs-size's replay, which agrees with ocicfs's merge for the layers it accepts
 
 Exclusions:
   - OCI content cache (compressed blobs) of containerd
