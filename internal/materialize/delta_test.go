@@ -972,6 +972,90 @@ func TestCheckSpaceRefusesOversizedPull(t *testing.T) {
 	}
 }
 
+// TestPlanRangesBounds asserts the planner's bounds on hand-built extents:
+// a gap of exactly coalesceGap joins two files into one request and one
+// byte more does not, maxDeltaRequests requests stay ranged and one more
+// falls back, and ranges of exactly maxDeltaFraction of the blob stay ranged
+// and one byte more falls back.
+func TestPlanRangesBounds(t *testing.T) {
+	ext := func(name string, off, end int64) zstdchunked.Entry {
+		return zstdchunked.Entry{Type: zstdchunked.TypeReg, Name: name, Size: 100, Digest: digest.FromString(name), Offset: off, EndOffset: end}
+	}
+	need := func(entries []zstdchunked.Entry) []rootfs.Payload {
+		var out []rootfs.Payload
+		for _, e := range entries {
+			out = append(out, rootfs.Payload{Digest: e.Digest, Size: e.Size})
+		}
+		return out
+	}
+	spread := func(n int) []zstdchunked.Entry {
+		var out []zstdchunked.Entry
+		for i := range n {
+			off := int64(i) * (coalesceGap + 20)
+			out = append(out, ext(fmt.Sprint(i), off, off+10))
+		}
+		return out
+	}
+	for _, c := range []struct {
+		name     string
+		size     int64
+		entries  []zstdchunked.Entry
+		requests int
+		planned  int64
+		fallback string
+	}{
+		{"gap joins", 1 << 30, []zstdchunked.Entry{ext("a", 0, 10), ext("b", 10+coalesceGap, 20+coalesceGap)}, 1, 20 + coalesceGap, ""},
+		{"gap splits", 1 << 30, []zstdchunked.Entry{ext("a", 0, 10), ext("b", 11+coalesceGap, 21+coalesceGap)}, 2, 20, ""},
+		{"requests at the bound", 1 << 40, spread(maxDeltaRequests), maxDeltaRequests, 10 * int64(maxDeltaRequests), ""},
+		{"requests past the bound", 1 << 40, spread(maxDeltaRequests + 1), maxDeltaRequests + 1, 10 * int64(maxDeltaRequests+1), fallbackRequests},
+		{"fraction at the bound", 200, []zstdchunked.Entry{ext("a", 0, 100)}, 1, 100, ""},
+		{"fraction past the bound", 200, []zstdchunked.Entry{ext("a", 0, 101)}, 1, 101, fallbackFraction},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := PlanRanges([]PlanLayer{{Size: c.size, Entries: c.entries}}, need(c.entries))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := LayerPlan{Files: len(c.entries), Requests: c.requests, Planned: c.planned, Fallback: c.fallback}
+			if got[0] != want {
+				t.Errorf("plan %+v, want %+v", got[0], want)
+			}
+		})
+	}
+}
+
+// TestPlanRangesAssignment asserts a payload two tables list is fetched from
+// the lower layer, at its lowest offset there; an empty file is never a
+// source; and a payload no table lists fails the plan.
+func TestPlanRangesAssignment(t *testing.T) {
+	d := digest.FromString("shared")
+	shared := func(off int64) zstdchunked.Entry {
+		return zstdchunked.Entry{Type: zstdchunked.TypeReg, Size: 100, Digest: d, Offset: off, EndOffset: off + 10}
+	}
+	empty := zstdchunked.Entry{Type: zstdchunked.TypeReg, Name: "empty"}
+	layers := []PlanLayer{
+		{Size: 1 << 20, Entries: []zstdchunked.Entry{empty}},
+		{Size: 1 << 20, Entries: []zstdchunked.Entry{shared(5000), shared(1000)}},
+		{Size: 1 << 20, Entries: []zstdchunked.Entry{shared(0)}},
+	}
+	got, err := PlanRanges(layers, []rootfs.Payload{{Digest: d, Size: 100}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []LayerPlan{{}, {Files: 1, Requests: 1, Planned: 10}, {}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("plans %+v, want %+v", got, want)
+	}
+	if _, err := PlanRanges(layers, []rootfs.Payload{{Digest: digest.FromString("other"), Size: 100}}); err == nil {
+		t.Error("planned a payload no table lists")
+	}
+
+	listed, unlisted := SplitUnlisted(layers, []rootfs.Payload{{Digest: d, Size: 100}, {Digest: digest.FromString("small"), Size: composefs.InlineContentMax}, {Digest: digest.FromString("big"), Size: 100}})
+	if len(listed) != 2 || len(unlisted) != 1 || unlisted[0].Digest != digest.FromString("big") {
+		t.Errorf("listed %v, unlisted %v", listed, unlisted)
+	}
+}
+
 // requireTools skips a test that needs mkcomposefs.
 func requireTools(t *testing.T) {
 	t.Helper()
