@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 var update = flag.Bool("update", false, "rewrite the golden files under testdata/golden")
@@ -54,6 +56,36 @@ func TestTextGolden(t *testing.T) {
 				golden(t, filepath.Join(goldenDir, mode+"-"+name+".txt"), out.String())
 			})
 		}
+	}
+}
+
+// TestUpdateGolden checks the update output on a gzip pair that shares its
+// two lower layers.
+func TestUpdateGolden(t *testing.T) {
+	stampVersion(t, "v1.0.0", "0123abc")
+	a, b, c, d := baseLayers(t)
+	gz := ocispec.MediaTypeImageLayerGzip
+	goldenDir, err := filepath.Abs(filepath.Join("testdata", "golden"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"default", "details"} {
+		t.Run(mode, func(t *testing.T) {
+			// A fixed layout path keeps the references, and so how File
+			// CAS/image shards their reference files, the same every run.
+			t.Chdir(t.TempDir())
+			refs := writeLayout(t, "LAYOUT", testImage{layers: [][]byte{a, b, c}, mediaType: gz}, testImage{layers: [][]byte{a, b, d}, mediaType: gz})
+			argv := []string{"update", "--no-cache", "--platform", "linux/amd64", "--from", refs[0], "--to", refs[1]}
+			if mode == "details" {
+				argv = append(argv, "--details")
+			}
+			var out, errOut bytes.Buffer
+			if code := run(context.Background(), argv, nil, &out, &errOut, newSpyOpener().open); code != 0 {
+				t.Fatalf("exit %d: %s", code, errOut.String())
+			}
+			checkWidths(t, out.String())
+			golden(t, filepath.Join(goldenDir, mode+"-update.txt"), out.String())
+		})
 	}
 }
 

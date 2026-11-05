@@ -6,9 +6,13 @@ package main
 import (
 	"fmt"
 	"io"
+	"path"
 	"sort"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/distribution/reference"
+	"github.com/opencontainers/go-digest"
 )
 
 // writeText writes the report for a reader: what each model takes with
@@ -16,7 +20,13 @@ import (
 // everything the run assumed and read.
 func writeText(w io.Writer, rep *Report, details bool) error {
 	var b strings.Builder
-	writeCompact(&b, rep)
+	if rep.Update != nil {
+		writeUpdate(&b, rep, details)
+	} else {
+		writeCompact(&b, rep)
+		writeModelTable(&b, diskHeading("Estimated disk usage", rep.Settings), modelRows(rep.Models))
+		writeUnavailable(&b, unavailableModels(rep.Models))
+	}
 	if details {
 		writeProjection(&b, rep)
 		writeDetails(&b, rep)
@@ -25,21 +35,15 @@ func writeText(w io.Writer, rep *Report, details bool) error {
 	return err
 }
 
-// writeCompact writes the header, the images' OCI layers, each model's
-// disk usage with fs-verity off and on, each against overlay, and the host
-// profile in the heading.
+// writeCompact writes the header and the images' OCI layers.
 func writeCompact(b *strings.Builder, rep *Report) {
-	s, p := rep.Settings, rep.Settings.Profile
+	s := rep.Settings
 	fmt.Fprintf(b, "STORAGE ESTIMATE · %s · %s\n", plural(len(rep.Images), "image"), s.Platform)
 	refs := 0
 	var total, unique int64
 	blobs := map[string]bool{}
 	for _, img := range rep.Images {
-		ref := img.Ref
-		if !strings.Contains(ref, "@") {
-			ref += "@" + img.ManifestDigest
-		}
-		fmt.Fprintf(b, "- %s\n", ref)
+		fmt.Fprintf(b, "- %s\n", pinnedRef(img))
 		for _, l := range img.Layers {
 			refs++
 			total += l.BlobSize
@@ -51,8 +55,11 @@ func writeCompact(b *strings.Builder, rep *Report) {
 	}
 	fmt.Fprintf(b, "\nOCI layers:       %s · %s\n", plural(refs, "reference"), plural(len(blobs), "unique blob"))
 	fmt.Fprintf(b, "Compressed size:  %s total · %s unique\n\n", fmtSize(total), fmtSize(unique))
+}
 
-	ms := rep.Models
+// modelRows are the rows of a model table: each model's stored files and
+// size with fs-verity off and on, each against overlay.
+func modelRows(ms Models) [][]string {
 	overlay := ms.Overlay
 	vs := func(m *ModelResult) string {
 		if !overlay.Available || overlay.Total == 0 {
@@ -79,38 +86,289 @@ func writeCompact(b *strings.Builder, rep *Report) {
 		mp   *ModelPair
 	}{{"EROFS/layer", ms.EROFS}, {"File CAS/image", ms.CAS}, {"File CAS/layer", ms.LayerCAS}} {
 		off, on := r.mp.Off, r.mp.On
-		if !on.Available {
+		if !on.Available || !off.Available {
 			rows = append(rows, []string{r.name, "n/a‡", "—", "n/a‡", "—", "n/a‡", "—"})
 			continue
 		}
 		onCell := fmtSize(on.Total)
-		if off.Total > 0 {
+		if off.Total != 0 {
 			onCell += " (" + signedPercent(on.Total-off.Total, off.Total) + ")"
 		}
 		rows = append(rows, []string{r.name, fmtInt(on.Files), vsFiles(on), fmtSize(off.Total), vs(off), onCell, vs(on)})
 	}
-	heading := fmt.Sprintf("Estimated disk usage (formula-based): %s · %d KiB blocks · no compression · inline max size %s B (File CAS/image)", s.FS, p.HostBlock/1024, fmtInt(p.InlineMax))
-	if !p.HostMetadata {
-		heading += " · host metadata excluded"
-	}
-	writeModelTable(b, heading, rows)
+	return rows
+}
 
-	var reasons []string
-	unavailable := map[string][]string{}
-	for _, m := range []struct {
-		name string
-		r    *ModelResult
-	}{{"Overlay", overlay}, {"EROFS/layer", ms.EROFS.On}, {"File CAS/image", ms.CAS.On}, {"File CAS/layer", ms.LayerCAS.On}} {
-		if !m.r.Available {
-			if unavailable[m.r.Reason] == nil {
-				reasons = append(reasons, m.r.Reason)
-			}
-			unavailable[m.r.Reason] = append(unavailable[m.r.Reason], m.name)
+// diskHeading is a disk table's heading: what it estimates, then the host
+// profile.
+func diskHeading(what string, s Settings) string {
+	return what + " (formula-based): " + hostProfile(s)
+}
+
+// hostProfile names the host filesystem the disk figures are sized for.
+func hostProfile(s Settings) string {
+	p := s.Profile
+	profile := fmt.Sprintf("%s · %d KiB blocks · no compression · inline max size %s B (File CAS/image)", s.FS, p.HostBlock/1024, fmtInt(p.InlineMax))
+	if !p.HostMetadata {
+		profile += " · host metadata excluded"
+	}
+	return profile
+}
+
+// modelNames are the storage models in table order.
+var modelNames = [4]string{"Overlay", "EROFS/layer", "File CAS/image", "File CAS/layer"}
+
+// verityOn is each model's result with fs-verity on, in table order;
+// Overlay has none and gives its only result.
+func verityOn(ms Models) [4]*ModelResult {
+	return [4]*ModelResult{ms.Overlay, ms.EROFS.On, ms.CAS.On, ms.LayerCAS.On}
+}
+
+// unavailable is a row a run could not estimate and why.
+type unavailable struct{ name, reason string }
+
+// unavailableModels lists the models ms has no estimate for.
+func unavailableModels(ms Models) []unavailable {
+	var out []unavailable
+	for i, r := range verityOn(ms) {
+		if !r.Available {
+			out = append(out, unavailable{modelNames[i], r.Reason})
 		}
 	}
-	for _, why := range reasons {
-		fmt.Fprintf(b, "‡ %s unavailable: %s\n", strings.Join(unavailable[why], ", "), why)
+	return out
+}
+
+// writeUnavailable writes one footnote per reason, naming the rows it
+// leaves without an estimate.
+func writeUnavailable(b *strings.Builder, rows []unavailable) {
+	var reasons []string
+	names := map[string][]string{}
+	for _, r := range rows {
+		if names[r.reason] == nil {
+			reasons = append(reasons, r.reason)
+		}
+		names[r.reason] = append(names[r.reason], r.name)
 	}
+	for _, why := range reasons {
+		fmt.Fprintf(b, "‡ %s unavailable: %s\n", strings.Join(names[why], ", "), why)
+	}
+}
+
+// writeUpdate writes an update's header and each model's disk usage before
+// the update, needed while both sets are held and after cleanup, with
+// fs-verity on and off. A model one of the sets cannot be estimated for is
+// unavailable in every column. With details the sets' OCI layers follow.
+func writeUpdate(b *strings.Builder, rep *Report, details bool) {
+	from, to, after := updateSets(rep)
+	writeUpdateHeader(b, rep, from, to)
+	writeDiskTables(b, rep)
+	if details {
+		writeUpdateLayers(b, rep, from, after)
+	}
+}
+
+// updateSets are the images an update names with --from and --to, and the
+// images held after cleanup.
+func updateSets(rep *Report) (from, to, after []ImageReport) {
+	for _, img := range rep.Images {
+		for _, set := range img.Sets {
+			if set == "from" {
+				from = append(from, img)
+			} else {
+				to = append(to, img)
+			}
+		}
+	}
+	if rep.Update.Rollback {
+		return from, to, rep.Images
+	}
+	return from, to, to
+}
+
+// writeUpdateHeader names the update: one image to another by name, or
+// the sizes of the two sets and every image of them.
+func writeUpdateHeader(b *strings.Builder, rep *Report, from, to []ImageReport) {
+	platform := rep.Settings.Platform
+	if len(from) == 1 && len(to) == 1 {
+		f, t := from[0], to[0]
+		after := imageName(t) + " only"
+		if rep.Update.Rollback {
+			after = imageName(t) + " + " + imageName(f) + " kept"
+		}
+		fmt.Fprintf(b, "UPDATE ESTIMATE · %s → %s · %s · after cleanup: %s\n", imageName(f), imageName(t), platform, after)
+		fmt.Fprintf(b, "- from: %s\n- to:   %s\n", shortRef(f), shortRef(t))
+		return
+	}
+	after, nAfter := "to only", len(to)
+	if rep.Update.Rollback {
+		after, nAfter = "to + from kept", len(rep.Images)
+	}
+	fmt.Fprintf(b, "UPDATE ESTIMATE · %d → %s · %s · after cleanup: %s\n", len(from), plural(nAfter, "image"), platform, after)
+	for _, img := range from {
+		fmt.Fprintf(b, "- from: %s\n", pinnedRef(img))
+	}
+	for _, img := range to {
+		fmt.Fprintf(b, "- to:   %s\n", pinnedRef(img))
+	}
+}
+
+// imageName is an image's short name: its familiar name and tag, or the
+// name and short digest of a reference without a tag.
+func imageName(img ImageReport) string {
+	ref, _, _ := strings.Cut(img.Ref, "@")
+	named, err := reference.ParseNormalizedNamed(ref)
+	if err != nil {
+		return path.Base(ref) + "@" + shortDigest(img.ManifestDigest)
+	}
+	if _, ok := named.(reference.Tagged); ok {
+		return reference.FamiliarString(named)
+	}
+	return reference.FamiliarName(named) + "@" + shortDigest(img.ManifestDigest)
+}
+
+// shortRef is an image's reference and the short digest of its manifest.
+func shortRef(img ImageReport) string {
+	ref, _, _ := strings.Cut(img.Ref, "@")
+	return ref + " @" + shortDigest(img.ManifestDigest)
+}
+
+// shortDigest is the first 12 hex digits of a digest.
+func shortDigest(d string) string {
+	hex := digest.Digest(d).Encoded()
+	return hex[:min(12, len(hex))]
+}
+
+// writeDiskTables writes each model's disk usage before, needed during and
+// after the update, with fs-verity on and then off, and what the columns
+// and the figures assume.
+func writeDiskTables(b *strings.Builder, rep *Report) {
+	up := rep.Update
+	for _, on := range []bool{true, false} {
+		heading := "Disk usage (fs-verity off):"
+		if on {
+			heading = "Disk usage (fs-verity on; Overlay has none):"
+		}
+		b.WriteString("\n")
+		writeTable(b, heading, diskRows(up.Before, up.Additional, up.After, on), diskTableGaps[:])
+	}
+	writeUnavailable(b, unavailableModels(up.Union))
+	kept := "after = to images only"
+	if up.Rollback {
+		kept = "after = to images, from images kept"
+	}
+	fmt.Fprintf(b, "\nbefore = from images held · needed = extra space while both are held (rollback window) · %s\n", kept)
+	fmt.Fprintf(b, "%s · writable layers, blob cache and app data excluded\n", hostProfile(rep.Settings))
+}
+
+// The disk table's gaps between its columns.
+var diskTableGaps = [5]int{3, 3, 2, 2, 2}
+
+// diskRows are a disk table's titles and one row per model, with fs-verity
+// on or off: the usage before, the space needed and against Overlay's, and
+// the usage after and against Overlay's.
+func diskRows(before, needed, after Models, on bool) [][]string {
+	pick := func(ms Models) []*ModelResult {
+		if on {
+			return []*ModelResult{ms.Overlay, ms.EROFS.On, ms.CAS.On, ms.LayerCAS.On}
+		}
+		return []*ModelResult{ms.Overlay, ms.EROFS.Off, ms.CAS.Off, ms.LayerCAS.Off}
+	}
+	bs, ns, as := pick(before), pick(needed), pick(after)
+	vs := func(m, overlay *ModelResult) string {
+		if m == overlay || !overlay.Available || overlay.Total == 0 {
+			return "-"
+		}
+		d := m.Total - overlay.Total
+		return fmt.Sprintf("%s (%s)", signed(fmtSize(d)), signedPercent(d, overlay.Total))
+	}
+	rows := [][]string{{"Storage model", "before", "needed", "vs Overlay", "after", "vs Overlay"}}
+	for i, name := range modelNames {
+		bf, nd, af := bs[i], ns[i], as[i]
+		if !bf.Available || !nd.Available || !af.Available {
+			rows = append(rows, []string{name, "n/a‡", "n/a‡", "-", "n/a‡", "-"})
+			continue
+		}
+		rows = append(rows, []string{name, fmtSize(bf.Total), signed(fmtSize(nd.Total)), vs(nd, ns[0]), fmtSize(af.Total), vs(af, as[0])})
+	}
+	alignParens(rows[1:], utf8.RuneCountInString, func(n int) string { return strings.Repeat(" ", max(n, 0)) })
+	return rows
+}
+
+// writeTable writes rows under heading, the first row the column titles,
+// with a dashed rule under the heading and under the titles: the first
+// column left-aligned and the others right-aligned, gaps apart.
+func writeTable(b *strings.Builder, heading string, rows [][]string, gaps []int) {
+	width := utf8.RuneCountInString
+	pad := func(n int) string { return strings.Repeat(" ", max(n, 0)) }
+	w := make([]int, len(rows[0]))
+	for _, r := range rows {
+		for j, c := range r {
+			w[j] = max(w[j], width(c))
+		}
+	}
+	total := w[0]
+	for j := 1; j < len(w); j++ {
+		total += gaps[j-1] + w[j]
+	}
+	rule := strings.Repeat("─", max(total, width(heading)))
+	line := func(s string) { b.WriteString(strings.TrimRight(s, " ") + "\n") }
+	line(heading)
+	line(rule)
+	for i, r := range rows {
+		l := r[0] + pad(w[0]-width(r[0]))
+		for j := 1; j < len(r); j++ {
+			l += pad(gaps[j-1]) + pad(w[j]-width(r[j])) + r[j]
+		}
+		line(l)
+		if i == 0 {
+			line(rule)
+		}
+	}
+}
+
+// writeUpdateLayers writes the OCI layers and the compressed size of the
+// two sets.
+func writeUpdateLayers(b *strings.Builder, rep *Report, from, after []ImageReport) {
+	nA, sizeA, blobsA := imageBlobs(from)
+	nB, sizeB, blobsB := imageBlobs(after)
+	_, _, all := imageBlobs(rep.Images)
+	fmt.Fprintf(b, "\nOCI layers:       %d → %s · %s · %d shared\n", nA, plural(nB, "reference"), plural(len(all), "unique blob"), sharedBlobs(blobsA, blobsB))
+	fmt.Fprintf(b, "Compressed size:  %s → %s\n", fmtSize(sizeA), fmtSize(sizeB))
+}
+
+// imageBlobs counts the layer references of imgs, the size of their
+// distinct blobs, and the blobs.
+func imageBlobs(imgs []ImageReport) (refs int, size int64, blobs map[string]bool) {
+	blobs = map[string]bool{}
+	for _, img := range imgs {
+		for _, l := range img.Layers {
+			refs++
+			if !blobs[l.BlobDigest] {
+				blobs[l.BlobDigest] = true
+				size += l.BlobSize
+			}
+		}
+	}
+	return refs, size, blobs
+}
+
+// sharedBlobs counts the blobs of b that a holds.
+func sharedBlobs(a, b map[string]bool) int {
+	n := 0
+	for d := range b {
+		if a[d] {
+			n++
+		}
+	}
+	return n
+}
+
+// pinnedRef is an image's reference with the digest it resolved to.
+func pinnedRef(img ImageReport) string {
+	if strings.Contains(img.Ref, "@") {
+		return img.Ref
+	}
+	return img.Ref + "@" + img.ManifestDigest
 }
 
 // alignParens lines up, column by column, the cells of rows that read

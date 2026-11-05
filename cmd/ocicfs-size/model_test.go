@@ -249,7 +249,8 @@ func casRootsInline(t *testing.T, inlineMax int64, images ...testImage) []*casRo
 	}
 	defer sp.close()
 	refs := writeLayout(t, t.TempDir(), images...)
-	imgs, ls, err := loadImages(ctx, newSpyOpener().open, sp, "", refs, ocispec.Platform{OS: "linux", Architecture: "amd64"})
+	ls := newLayerSet("")
+	imgs, err := loadImages(ctx, newSpyOpener().open, sp, ls, refs, ocispec.Platform{OS: "linux", Architecture: "amd64"}, manifestKey, map[string]*Image{})
 	if err != nil {
 		t.Fatal(err)
 	}

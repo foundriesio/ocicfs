@@ -158,7 +158,8 @@ func TestUnavailableModels(t *testing.T) {
 	}
 	defer sp.close()
 	ok := writeLayout(t, t.TempDir(), testImage{layers: [][]byte{l1}})
-	imgs, ls, err := loadImages(ctx, newSpyOpener().open, sp, "", ok, ocispec.Platform{OS: "linux", Architecture: "amd64"})
+	ls := newLayerSet("")
+	imgs, err := loadImages(ctx, newSpyOpener().open, sp, ls, ok, ocispec.Platform{OS: "linux", Architecture: "amd64"}, manifestKey, map[string]*Image{})
 	if err != nil {
 		t.Fatal(err)
 	}
