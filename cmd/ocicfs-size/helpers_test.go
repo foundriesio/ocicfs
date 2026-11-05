@@ -181,13 +181,16 @@ func compress(t testing.TB, raw []byte, mt string) []byte {
 }
 
 // spyOpener opens "<dir>@<digest>" references from OCI layouts and counts
-// the blobs read from them.
+// the blobs and the ranges read from them.
 type spyOpener struct {
-	mu    sync.Mutex
-	opens map[digest.Digest]int
+	mu     sync.Mutex
+	opens  map[digest.Digest]int
+	ranges map[digest.Digest]int
 }
 
-func newSpyOpener() *spyOpener { return &spyOpener{opens: map[digest.Digest]int{}} }
+func newSpyOpener() *spyOpener {
+	return &spyOpener{opens: map[digest.Digest]int{}, ranges: map[digest.Digest]int{}}
+}
 
 func (s *spyOpener) open(_ context.Context, ref string) (ocichain.BlobSource, digest.Digest, error) {
 	i := strings.LastIndex(ref, "@")
@@ -208,6 +211,13 @@ func (ss spySource) Open(ctx context.Context, desc ocispec.Descriptor) (io.ReadC
 	ss.s.opens[desc.Digest]++
 	ss.s.mu.Unlock()
 	return ss.src.Open(ctx, desc)
+}
+
+func (ss spySource) OpenRange(ctx context.Context, desc ocispec.Descriptor, off, n int64) (io.ReadCloser, bool, error) {
+	ss.s.mu.Lock()
+	ss.s.ranges[desc.Digest]++
+	ss.s.mu.Unlock()
+	return ss.src.(ocichain.RangeSource).OpenRange(ctx, desc, off, n)
 }
 
 // layerInv scans a raw layer tar.

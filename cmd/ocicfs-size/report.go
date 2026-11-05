@@ -90,6 +90,11 @@ type Analyzer struct {
 	CacheHits    int   `json:"cacheHits"`
 	LayerScans   int   `json:"layerScans"`
 	OcicfsScans  int   `json:"ocicfsScans"`
+	// Tables of contents: parsed from blob bytes, of which read as ranges,
+	// and found in the cache.
+	TOCParses int `json:"tocParses,omitempty"`
+	TOCRanges int `json:"tocRanges,omitempty"`
+	TOCHits   int `json:"tocHits,omitempty"`
 }
 
 const (
@@ -175,7 +180,7 @@ func prepareReport(ctx context.Context, imgs []*Image, ls *layerSet, s Settings)
 	if casErr != "" {
 		rep.Unsupported = append(rep.Unsupported, casErr)
 	}
-	rep.Analyzer = Analyzer{CacheHits: ls.invHits + ls.recordHits, LayerScans: ls.scans, OcicfsScans: ls.ocicfsScans}
+	rep.Analyzer = Analyzer{CacheHits: ls.invHits + ls.recordHits, LayerScans: ls.scans, OcicfsScans: ls.ocicfsScans, TOCParses: ls.tocParses, TOCHits: ls.tocHits}
 	return rep, roots, cas, casErr
 }
 

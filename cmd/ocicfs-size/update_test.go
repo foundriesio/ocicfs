@@ -20,6 +20,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/foundriesio/ocicfs/internal/devtest"
+	"github.com/foundriesio/ocicfs/internal/zstdchunked"
 	"github.com/foundriesio/ocicfs/pkg/ocicfs"
 )
 
@@ -570,4 +571,126 @@ func TestUpdateNewIndex(t *testing.T) {
 	if cas := add["cas/off"]; cas.OCIMeta != 4096 || cas.PayloadAlloc != 0 || cas.Units != 0 {
 		t.Errorf("cas %+v", cas.Breakdown)
 	}
+}
+
+// The zstd:chunked release pair: two layers each, the base layer shared.
+var (
+	releaseN  = filepath.Join("..", "..", "internal", "zstdchunked", "testdata", "release-n") + "@sha256:f73453797a21f103d2a7cbc3e1ff649e6da0cd84d70b388e705c0cd8f45c3418"
+	releaseN1 = filepath.Join("..", "..", "internal", "zstdchunked", "testdata", "release-n1") + "@sha256:ae2b0c5dc46df52b06d4bbf5978b4086ef10da994512ecef2dc7d158d4c1d46d"
+)
+
+// layerOpens counts the whole layer blobs spy read.
+func layerOpens(rep *Report, spy *spyOpener) (opens, ranges int) {
+	seen := map[string]bool{}
+	for _, img := range rep.Images {
+		for _, l := range img.Layers {
+			if !seen[l.BlobDigest] {
+				seen[l.BlobDigest] = true
+				opens += spy.opens[digest.Digest(l.BlobDigest)]
+			}
+		}
+	}
+	for _, n := range spy.ranges {
+		ranges += n
+	}
+	return opens, ranges
+}
+
+func TestTOCCache(t *testing.T) {
+	stampVersion(t, "v1.0.0", "0123abc")
+	cache := t.TempDir()
+	update := func(args ...string) (*Report, int, int) {
+		spy := newSpyOpener()
+		rep := sizeUpdateCached(t, spy.open, append([]string{"--cache-dir", cache}, args...)...)
+		opens, ranges := layerOpens(rep, spy)
+		return rep, opens, ranges
+	}
+	// The first run reads every blob whole for its inventory, so the
+	// tables come out of the spool.
+	rep, opens, ranges := update("--from", releaseN, "--to", releaseN1)
+	if a := rep.Analyzer; opens != 3 || ranges != 0 || a.TOCParses != 3 || a.TOCRanges != 0 || a.TOCHits != 0 {
+		t.Errorf("first run: %d opens, %d ranges, analyzer %+v", opens, ranges, a)
+	}
+	rep, opens, ranges = update("--from", releaseN, "--to", releaseN1)
+	if a := rep.Analyzer; opens != 0 || ranges != 0 || a.TOCHits != 3 || a.TOCParses != 0 || a.BlobsFetched != 0 {
+		t.Errorf("second run: %d opens, %d ranges, analyzer %+v", opens, ranges, a)
+	}
+
+	// A cache without tables reads each one as a range, not its blob.
+	if err := os.RemoveAll(filepath.Join(cache, "tocs")); err != nil {
+		t.Fatal(err)
+	}
+	rep, opens, ranges = update("--from", releaseN, "--to", releaseN1)
+	if a := rep.Analyzer; opens != 0 || ranges != 3 || a.TOCParses != 3 || a.TOCRanges != 3 {
+		t.Errorf("without tables: %d opens, %d ranges, analyzer %+v", opens, ranges, a)
+	}
+
+	// The same blob under other annotations is a miss.
+	other := relocatedTOC(t, releaseN1)
+	rep, opens, ranges = update("--from", releaseN, "--to", other)
+	if a := rep.Analyzer; opens != 0 || ranges != 1 || a.TOCParses != 1 || a.TOCHits != 2 {
+		t.Errorf("other annotations: %d opens, %d ranges, analyzer %+v", opens, ranges, a)
+	}
+}
+
+// TestTOCAfterImages checks an update after images sized both sets reads
+// no blob whole, only the tables.
+func TestTOCAfterImages(t *testing.T) {
+	stampVersion(t, "v1.0.0", "0123abc")
+	cache := t.TempDir()
+	sizeImages(t, newSpyOpener().open, "--cache-dir", cache, releaseN, releaseN1)
+	spy := newSpyOpener()
+	rep := sizeUpdateCached(t, spy.open, "--cache-dir", cache, "--from", releaseN, "--to", releaseN1)
+	if opens, ranges := layerOpens(rep, spy); opens != 0 || ranges != 3 || rep.Analyzer.TOCRanges != 3 {
+		t.Errorf("%d opens, %d ranges, analyzer %+v", opens, ranges, rep.Analyzer)
+	}
+	text := runText(t, "update", "--details", "--cache-dir", cache, "--platform", "linux/amd64", "--from", releaseN, "--to", releaseN1)
+	if !strings.Contains(text, "; 3 tables of contents (0 parsed, 0 ranged, 3 hits)") {
+		t.Errorf("no table counts in the analyzer line:\n%s", text)
+	}
+}
+
+// relocatedTOC copies the layout ref names into a new directory with its
+// last layer's position annotation spelled differently, and returns a
+// reference to the copy's manifest.
+func relocatedTOC(t *testing.T, ref string) string {
+	t.Helper()
+	i := strings.LastIndex(ref, "@")
+	src, dst := ref[:i], t.TempDir()
+	if err := os.CopyFS(dst, os.DirFS(src)); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dst, "blobs", "sha256", digest.Digest(ref[i+1:]).Encoded())) // #nosec G304 -- a test layout
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m ocispec.Manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatal(err)
+	}
+	last := m.Layers[len(m.Layers)-1]
+	last.Annotations[zstdchunked.ManifestPositionKey] = "0" + last.Annotations[zstdchunked.ManifestPositionKey]
+	if data, err = json.Marshal(m); err != nil {
+		t.Fatal(err)
+	}
+	d := digest.FromBytes(data)
+	if err := os.WriteFile(filepath.Join(dst, "blobs", "sha256", d.Encoded()), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dst + "@" + d.String()
+}
+
+// sizeUpdateCached is sizeUpdate with the caller's cache flags.
+func sizeUpdateCached(t testing.TB, open opener, args ...string) *Report {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	argv := append([]string{"update", "--json", "--platform", "linux/amd64"}, args...)
+	if code := run(context.Background(), argv, strings.NewReader(""), &out, &errOut, open); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	var rep Report
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("decode report: %v\n%s", err, out.String())
+	}
+	return &rep
 }
