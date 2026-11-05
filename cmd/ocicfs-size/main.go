@@ -196,7 +196,9 @@ func writeReport(w io.Writer, rep *Report, sp *spool, o options) error {
 	for _, n := range sp.fetched {
 		rep.Analyzer.BytesFetched += n
 	}
+	rep.Analyzer.BytesFetched += sp.rangedBytes
 	rep.Analyzer.BlobsFetched = len(sp.fetched)
+	rep.Analyzer.TOCRanges = sp.ranges
 	if o.json {
 		return writeJSON(w, rep)
 	}

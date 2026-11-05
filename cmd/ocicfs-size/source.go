@@ -24,6 +24,7 @@ import (
 	"github.com/foundriesio/ocicfs/internal/cli"
 	"github.com/foundriesio/ocicfs/internal/ocichain"
 	"github.com/foundriesio/ocicfs/internal/ocilayout"
+	"github.com/foundriesio/ocicfs/internal/zstdchunked"
 )
 
 // Image is one resolved image: the reference it was named by, the platform
@@ -48,6 +49,10 @@ type LayerRef struct {
 	BlobSize   int64  `json:"blobSize"`
 	DiffID     string `json:"diffID"`
 	ChainID    string `json:"chainID"`
+	// TOC and TOCChecksum are the zstd:chunked table of contents position
+	// and checksum annotations, empty for a layer without them.
+	TOC         string `json:"toc,omitempty"`
+	TOCChecksum string `json:"tocChecksum,omitempty"`
 }
 
 // opener opens a registry reference as a blob source and returns its root
@@ -132,11 +137,13 @@ func resolveImage(ctx context.Context, open opener, sp *spool, ref string, platf
 	for i, l := range res.Manifest.Layers {
 		chain = chainID(chain, res.DiffIDs[i])
 		img.Layers = append(img.Layers, LayerRef{
-			BlobDigest: l.Digest.String(),
-			MediaType:  l.MediaType,
-			BlobSize:   l.Size,
-			DiffID:     res.DiffIDs[i].String(),
-			ChainID:    chain.String(),
+			BlobDigest:  l.Digest.String(),
+			MediaType:   l.MediaType,
+			BlobSize:    l.Size,
+			DiffID:      res.DiffIDs[i].String(),
+			ChainID:     chain.String(),
+			TOC:         l.Annotations[zstdchunked.ManifestPositionKey],
+			TOCChecksum: l.Annotations[zstdchunked.ManifestChecksumKey],
 		})
 	}
 	return img, s, nil
@@ -178,13 +185,15 @@ func platformError(ctx context.Context, src ocichain.BlobSource, root digest.Dig
 // spool holds every blob fetched during one run in a temporary directory,
 // so a layer read twice is downloaded once. Manifests, configs and indexes
 // are also kept in the cache directory, by digest, across runs. It counts
-// what it downloads.
+// what it downloads, whole blobs and ranges.
 type spool struct {
-	dir      string
-	metaDir  string // "" when nothing is kept across runs
-	fetched  map[digest.Digest]int64
-	order    []digest.Digest
-	inMemory map[digest.Digest][]byte
+	dir         string
+	metaDir     string // "" when nothing is kept across runs
+	fetched     map[digest.Digest]int64
+	order       []digest.Digest
+	inMemory    map[digest.Digest][]byte
+	ranges      int
+	rangedBytes int64
 }
 
 // newSpool creates the run's spool under a new temporary directory; close
@@ -237,31 +246,73 @@ func (s *spool) open(ctx context.Context, src ocichain.BlobSource, desc ocispec.
 			return f, nil
 		}
 	}
-	p := filepath.Join(s.dir, desc.Digest.Encoded())
 	if _, ok := s.fetched[desc.Digest]; !ok {
-		n, err := fetchTo(ctx, src, desc, p)
+		r, err := src.Open(ctx, desc)
 		if err != nil {
 			return nil, err
 		}
-		s.fetched[desc.Digest] = n
-		s.order = append(s.order, desc.Digest)
+		if err := s.keep(desc, r); err != nil {
+			return nil, err
+		}
 	}
-	f, err := os.Open(p) // #nosec G304 -- spool-owned path named by a validated digest
+	f, err := os.Open(s.path(desc)) // #nosec G304 -- spool-owned path named by a validated digest
 	if err != nil {
 		return nil, fmt.Errorf("spool: %w", err)
 	}
 	return f, nil
 }
 
-// fetchTo copies a blob from src into path and returns its size.
-func fetchTo(ctx context.Context, src ocichain.BlobSource, desc ocispec.Descriptor, p string) (int64, error) {
-	r, err := src.Open(ctx, desc)
-	if err != nil {
-		return 0, err
+// openRange serves n bytes of a layer blob from offset off: out of the spool
+// when the blob is there, as a range of src when src serves ranges, and out
+// of the whole blob, spooled, otherwise or when src answers with the whole
+// blob.
+func (s *spool) openRange(ctx context.Context, src ocichain.BlobSource, desc ocispec.Descriptor, off, n int64) (io.ReadCloser, error) {
+	if err := desc.Digest.Validate(); err != nil {
+		return nil, fmt.Errorf("spool: %w", err)
 	}
+	_, spooled := s.fetched[desc.Digest]
+	if rs, ok := src.(ocichain.RangeSource); ok && !spooled {
+		r, whole, err := rs.OpenRange(ctx, desc, off, n)
+		if err != nil {
+			return nil, err
+		}
+		if !whole {
+			s.ranges++
+			s.rangedBytes += n
+			return r, nil
+		}
+		if err := s.keep(desc, r); err != nil {
+			return nil, err
+		}
+	} else if !spooled {
+		r, err := src.Open(ctx, desc)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.keep(desc, r); err != nil {
+			return nil, err
+		}
+	}
+	f, err := os.Open(s.path(desc)) // #nosec G304 -- spool-owned path named by a validated digest
+	if err != nil {
+		return nil, fmt.Errorf("spool: %w", err)
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{io.NewSectionReader(f, off, n), f}, nil
+}
+
+func (s *spool) path(desc ocispec.Descriptor) string {
+	return filepath.Join(s.dir, desc.Digest.Encoded())
+}
+
+// keep copies the blob r streams into the spool, closing r, and counts it.
+func (s *spool) keep(desc ocispec.Descriptor, r io.ReadCloser) error {
+	p := s.path(desc)
 	f, err := os.Create(p) // #nosec G304 -- spool-owned path named by a validated digest
 	if err != nil {
-		return 0, errors.Join(fmt.Errorf("spool: %w", err), r.Close())
+		return errors.Join(fmt.Errorf("spool: %w", err), r.Close())
 	}
 	n, err := io.Copy(f, r)
 	err = errors.Join(err, r.Close(), f.Close())
@@ -269,9 +320,11 @@ func fetchTo(ctx context.Context, src ocichain.BlobSource, desc ocispec.Descript
 		if rerr := os.Remove(p); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
 			slog.Warn("remove partial spool file", "path", p, "err", rerr)
 		}
-		return 0, fmt.Errorf("spool: fetch %s: %w", desc.Digest, err)
+		return fmt.Errorf("spool: fetch %s: %w", desc.Digest, err)
 	}
-	return n, nil
+	s.fetched[desc.Digest] = n
+	s.order = append(s.order, desc.Digest)
+	return nil
 }
 
 // spoolSource is one registry source seen through the spool.
@@ -282,6 +335,13 @@ type spoolSource struct {
 
 func (ss spoolSource) Open(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
 	return ss.s.open(ctx, ss.src, desc)
+}
+
+// OpenRange serves a range through the spool; it never answers with the
+// whole blob.
+func (ss spoolSource) OpenRange(ctx context.Context, desc ocispec.Descriptor, off, n int64) (io.ReadCloser, bool, error) {
+	r, err := ss.s.openRange(ctx, ss.src, desc, off, n)
+	return r, false, err
 }
 
 // writeFileAtomic writes data to p through a temporary file and a rename,

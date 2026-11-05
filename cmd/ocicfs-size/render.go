@@ -656,9 +656,13 @@ func writeDetails(b *strings.Builder, rep *Report) {
 	}
 	writeList(b, "Images", images)
 	a := rep.Analyzer
-	fmt.Fprintf(b, "\nanalyzer: fetched %s MiB (%s); %s; %s, %s\n",
+	fmt.Fprintf(b, "\nanalyzer: fetched %s MiB (%s); %s; %s, %s",
 		fmtMiB(a.BytesFetched), plural(a.BlobsFetched, "blob"), plural(a.CacheHits, "cache hit"),
 		plural(a.LayerScans, "layer scan"), plural(a.OcicfsScans, "ocicfs scan"))
+	if n := a.TOCParses + a.TOCHits; n > 0 {
+		fmt.Fprintf(b, "; %s (%d parsed, %d ranged, %s)", nouns(n, "table of contents", "tables of contents"), a.TOCParses, a.TOCRanges, plural(a.TOCHits, "hit"))
+	}
+	b.WriteString("\n")
 }
 
 // writeBox draws a box of boxWidth runes around lines, wrapping at spaces
