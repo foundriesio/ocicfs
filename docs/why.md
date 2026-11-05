@@ -29,6 +29,13 @@ bandwidth, storage, and boot time that many products cannot afford.
 | End-to-end integrity | Field devices must detect tampered content at rest and at runtime. |
 | Supply-chain trust | Provenance must work for online and offline delivery. |
 
+These are requirements, not a feature list. Three are met only in part
+today: the storage-fit check runs only on delta pulls (see
+[pull.md](pull.md#storage-and-source-requirements)); an interrupted pull
+does not resume a partial download, though a retry reuses the files
+already stored; and end-to-end integrity on read requires fs-verity (see
+[the fs-verity mode](on-disk-layout.md#the-fs-verity-mode)).
+
 ## Constraints
 
 ocicfs is deliberately constrained so it can fit into existing OSS and device
@@ -43,7 +50,7 @@ ecosystems:
 - Distribution uses ordinary OCI registries or OCI Image Layout for air-gapped
   transport.
 - On-disk runtime state uses a single decompressed content-addressed store,
-  composefs, EROFS, and fs-verity.
+  composefs, EROFS, and optional fs-verity.
 - The v1 generator path uses `mkcomposefs`; future composefs-rs adoption should
   be gated by compatibility and upstream stability.
 - The device runtime path must not require a custom registry, custom signing
