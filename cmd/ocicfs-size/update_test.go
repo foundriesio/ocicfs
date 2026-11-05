@@ -8,9 +8,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -314,7 +316,7 @@ func TestWireRollback(t *testing.T) {
 	refs := writeLayout(t, t.TempDir(), testImage{layers: [][]byte{a, b, c}}, testImage{layers: [][]byte{a, b, d}})
 	plain := sizeUpdate(t, newSpyOpener().open, "--from", refs[0], "--to", refs[1]).Update.Wire
 	kept := sizeUpdate(t, newSpyOpener().open, "--rollback", "--from", refs[0], "--to", refs[1]).Update.Wire
-	if kept.Containerd != plain.Containerd || kept.Ocicfs != plain.Ocicfs || kept.Ocicfs.Held != 0 {
+	if kept != plain || kept.Ocicfs.Held != 0 || kept.OcicfsDelta.Held != 0 {
 		t.Errorf("rollback %+v, without %+v", kept, plain)
 	}
 	if text := runText(t, "update", "--details", "--no-cache", "--rollback", "--from", refs[0], "--to", refs[1]); strings.Contains(text, ": held:") {
@@ -329,8 +331,8 @@ func TestWireUnchanged(t *testing.T) {
 	if w.Containerd != (WirePath{}) {
 		t.Errorf("containerd %+v", w.Containerd)
 	}
-	if w.Ocicfs != (WirePath{Held: 1}) {
-		t.Errorf("ocicfs %+v", w.Ocicfs)
+	if w.Ocicfs != (WirePath{Held: 1}) || w.OcicfsDelta != (WirePath{Held: 1}) {
+		t.Errorf("ocicfs %+v, delta %+v", w.Ocicfs, w.OcicfsDelta)
 	}
 }
 
@@ -435,7 +437,7 @@ func TestWireUnsupportedReplay(t *testing.T) {
 		t.Errorf("cas %+v, overlay %+v", up.Additional.CAS.On, up.Additional.Overlay)
 	}
 	text := runText(t, "update", "--no-cache", "--from", refs[0], "--to", refs[1])
-	if !strings.Contains(text, "‡ ocicfs pull unavailable: ") {
+	if !strings.Contains(text, "‡ ocicfs pull, ocicfs pull --delta unavailable: ") {
 		t.Errorf("no footnote for the ocicfs row:\n%s", text)
 	}
 }
@@ -650,34 +652,66 @@ func TestTOCAfterImages(t *testing.T) {
 	}
 }
 
-// relocatedTOC copies the layout ref names into a new directory with its
-// last layer's position annotation spelled differently, and returns a
-// reference to the copy's manifest.
+// relocatedTOC copies the layout ref names with its last layer's position
+// annotation spelled differently, and returns a reference to the copy.
 func relocatedTOC(t *testing.T, ref string) string {
+	return editedManifest(t, ref, func(_ string, m *ocispec.Manifest) {
+		last := m.Layers[len(m.Layers)-1]
+		last.Annotations[zstdchunked.ManifestPositionKey] = "0" + last.Annotations[zstdchunked.ManifestPositionKey]
+	})
+}
+
+// relabelled copies the layout ref names with a label added to its config,
+// and returns a reference to the copy.
+func relabelled(t *testing.T, ref string) string {
+	return editedManifest(t, ref, func(dir string, m *ocispec.Manifest) {
+		var cfg map[string]any
+		if err := json.Unmarshal(readBlob(t, dir, m.Config.Digest), &cfg); err != nil {
+			t.Fatal(err)
+		}
+		cfg["config"] = map[string]any{"Labels": map[string]string{"l": "relabelled"}}
+		m.Config = writeBlob(t, dir, cfg, m.Config.MediaType)
+	})
+}
+
+// editedManifest copies the layout ref names into a new directory, edits
+// its manifest there, and returns a reference to the edited manifest.
+func editedManifest(t *testing.T, ref string, edit func(dir string, m *ocispec.Manifest)) string {
 	t.Helper()
 	i := strings.LastIndex(ref, "@")
 	src, dst := ref[:i], t.TempDir()
 	if err := os.CopyFS(dst, os.DirFS(src)); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(filepath.Join(dst, "blobs", "sha256", digest.Digest(ref[i+1:]).Encoded())) // #nosec G304 -- a test layout
+	var m ocispec.Manifest
+	if err := json.Unmarshal(readBlob(t, dst, digest.Digest(ref[i+1:])), &m); err != nil {
+		t.Fatal(err)
+	}
+	edit(dst, &m)
+	return dst + "@" + writeBlob(t, dst, m, m.MediaType).Digest.String()
+}
+
+func readBlob(t *testing.T, dir string, d digest.Digest) []byte {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, "blobs", "sha256", d.Encoded())) // #nosec G304 -- a test layout
 	if err != nil {
 		t.Fatal(err)
 	}
-	var m ocispec.Manifest
-	if err := json.Unmarshal(data, &m); err != nil {
-		t.Fatal(err)
-	}
-	last := m.Layers[len(m.Layers)-1]
-	last.Annotations[zstdchunked.ManifestPositionKey] = "0" + last.Annotations[zstdchunked.ManifestPositionKey]
-	if data, err = json.Marshal(m); err != nil {
+	return data
+}
+
+// writeBlob writes v as JSON into the layout at dir.
+func writeBlob(t *testing.T, dir string, v any, mediaType string) ocispec.Descriptor {
+	t.Helper()
+	data, err := json.Marshal(v)
+	if err != nil {
 		t.Fatal(err)
 	}
 	d := digest.FromBytes(data)
-	if err := os.WriteFile(filepath.Join(dst, "blobs", "sha256", d.Encoded()), data, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "blobs", "sha256", d.Encoded()), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return dst + "@" + d.String()
+	return ocispec.Descriptor{MediaType: mediaType, Digest: d, Size: int64(len(data))}
 }
 
 // sizeUpdateCached is sizeUpdate with the caller's cache flags.
@@ -693,4 +727,176 @@ func sizeUpdateCached(t testing.TB, open opener, args ...string) *Report {
 		t.Fatalf("decode report: %v\n%s", err, out.String())
 	}
 	return &rep
+}
+
+// TestDeltaMatchesPull checks the delta row against ocicfs delta-pulling
+// the from image, collecting, and delta-pulling the to image: the figures
+// the pull logs for the image and the way each layer's bytes arrive.
+func TestDeltaMatchesPull(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("the layouts are linux/amd64")
+	}
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+	for _, c := range []struct{ name, from, to string }{
+		{"release pair", releaseN, releaseN1},
+		{"held", releaseN, releaseN},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			root, cleanup, err := devtest.VerityRoot()
+			if err != nil {
+				t.Skip(err)
+			}
+			defer cleanup()
+			spy := newSpyOpener()
+			e, err := ocicfs.New(ocicfs.Config{Root: root, RegistrySource: func(ctx context.Context, ref string) (ocicfs.BlobSource, digest.Digest, error) {
+				for _, layout := range []string{releaseN, releaseN1} {
+					if at := strings.LastIndex(layout, "@"); layout[at:] == ref[strings.LastIndex(ref, "@"):] {
+						return spy.open(ctx, layout)
+					}
+				}
+				return nil, "", fmt.Errorf("no layout for %s", ref)
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pull := func(ref string) {
+				t.Helper()
+				if _, err := e.Pull(context.Background(), "example.test/app"+ref[strings.LastIndex(ref, "@"):], ocicfs.WithDelta()); err != nil {
+					if devtest.IsVerityUnsupported(err) {
+						t.Skip(err)
+					}
+					t.Fatalf("pull %s: %v", ref, err)
+				}
+			}
+			pull(c.from)
+			if _, err := e.GC(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			var logs bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			pull(c.to)
+			slog.SetDefault(prev)
+
+			up := buildUpdate(t, c.from, c.to)
+			w := up.Wire.OcicfsDelta
+			pulled := regexp.MustCompile(`msg="delta: pull" .*toc_bytes=(\d+) missing=\d+ planned=(\d+) requests=(\d+) fetched=(\d+)`).FindStringSubmatch(logs.String())
+			if c.from == c.to {
+				if pulled != nil || w.TOCs != 0 || w.Held != 1 || w.Bytes != 0 {
+					t.Errorf("held image: logged %q, estimated %+v", pulled, w)
+				}
+				return
+			}
+			if pulled == nil {
+				t.Fatalf("no delta: pull line:\n%s", logs.String())
+			}
+			var requests int
+			var fetched int64
+			reasons := map[string]string{}
+			for _, d := range up.deltaLayers {
+				requests += d.requests
+				fetched += d.fetched
+				reasons[d.blob] = d.reason
+			}
+			if got := fmt.Sprint(w.TOCBytes, w.Planned, requests, fetched); got != strings.Join(pulled[1:], " ") {
+				t.Errorf("toc_bytes planned requests fetched: estimated %s, logged %v", got, pulled[1:])
+			}
+			for _, m := range regexp.MustCompile(`msg="delta: layer" layer=(\S+) .*fallback=(\S+)`).FindAllStringSubmatch(logs.String(), -1) {
+				want := m[2]
+				if want == "none" {
+					want = "ranges"
+				}
+				if reasons[m[1]] != want {
+					t.Errorf("layer %s: estimated %q, logged %q", m[1], reasons[m[1]], m[2])
+				}
+			}
+		})
+	}
+}
+
+// buildUpdate sizes the update from one layout reference to another in
+// process, keeping the per-layer figures the JSON report leaves out.
+func buildUpdate(t *testing.T, from, to string) *UpdateReport {
+	t.Helper()
+	ctx := context.Background()
+	sp, err := newSpool("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sp.close()
+	ls := newLayerSet("")
+	ls.readTOCs = true
+	known := map[string]*Image{}
+	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	a, err := loadImages(ctx, newSpyOpener().open, sp, ls, []string{from}, platform, rootKey, known)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := loadImages(ctx, newSpyOpener().open, sp, ls, []string{to}, platform, rootKey, known)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return buildUpdateReport(ctx, a, b, false, ls, Settings{Profile: testProfile()}).Update
+}
+
+// TestDeltaConfigOnly checks a delta pull of an image that differs from the
+// held one in its config alone: a layer read from its tar stream carries
+// its inline files, so the gzip pair reads only the metadata, while a layer
+// built from its table leaves them pending, so the chunked pair reads every
+// table and ranges for its inline files, and no stored file.
+func TestDeltaConfigOnly(t *testing.T) {
+	a, b, _, _ := baseLayers(t)
+	gz := ocispec.MediaTypeImageLayerGzip
+	refs := writeLayout(t, t.TempDir(), testImage{layers: [][]byte{a, b}, label: "1", mediaType: gz}, testImage{layers: [][]byte{a, b}, label: "2", mediaType: gz})
+	for _, c := range []struct {
+		name, from, to string
+		chunked        bool
+	}{
+		{"gzip", refs[0], refs[1], false},
+		{"chunked", releaseN, relabelled(t, releaseN), true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			up := buildUpdate(t, c.from, c.to)
+			w := up.Wire.OcicfsDelta
+			if plain := up.Wire.Ocicfs; plain.Blobs != 0 || w.Metadata != plain.Metadata || w.Reads != 3 || w.Blobs != 0 {
+				t.Errorf("delta %+v, plain %+v", w, plain)
+			}
+			var tocBytes int64
+			var missing, inline int
+			for _, d := range up.deltaLayers {
+				missing, inline = missing+d.missing, inline+d.inline
+			}
+			i := strings.LastIndex(c.to, "@")
+			var m ocispec.Manifest
+			if err := json.Unmarshal(readBlob(t, c.to[:i], digest.Digest(c.to[i+1:])), &m); err != nil {
+				t.Fatal(err)
+			}
+			for _, l := range m.Layers {
+				if pos, ok, _ := zstdchunked.Position(l.Annotations, l.Size); ok {
+					tocBytes += pos.CompressedLen
+				}
+			}
+			switch {
+			case !c.chunked && (w.TOCs != 0 || w.Ranges != 0 || w.Bytes != w.Metadata):
+				t.Errorf("gzip: %+v", w)
+			case c.chunked && (w.TOCs != 2 || w.TOCBytes != tocBytes || w.Ranges == 0 || missing == 0 || inline != missing):
+				t.Errorf("chunked: %+v, %d missing of which %d inline, tables %d bytes", w, missing, inline, tocBytes)
+			}
+		})
+	}
+}
+
+// TestWireRunIsFetched checks a file under /run counts as needed: ocicfs
+// empties /run only once the layers are merged, so the store lacks its
+// content after the from image and a pull reads the saved layer listing it.
+func TestWireRunIsFetched(t *testing.T) {
+	l0 := tarOf(t, dir("./"), dir("run/"), file("run/big", strings.Repeat("r", 5000)))
+	l1 := tarOf(t, file("app", strings.Repeat("a", 3000)))
+	refs := writeLayout(t, t.TempDir(), testImage{layers: [][]byte{l0}}, testImage{layers: [][]byte{l0, l1}})
+	w := buildUpdate(t, refs[0], refs[1]).Wire
+	if w.Ocicfs.Blobs != 2 || w.OcicfsDelta.Blobs != 2 {
+		t.Errorf("ocicfs %d blobs, delta %d, want l1 and l0 again", w.Ocicfs.Blobs, w.OcicfsDelta.Blobs)
+	}
 }

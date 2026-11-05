@@ -168,8 +168,8 @@ func writeUpdate(b *strings.Builder, rep *Report, details bool) {
 	if details {
 		writeUpdateLayers(b, rep, from, after)
 		up := rep.Update
-		fmt.Fprintf(b, "containerd pull: %s\nocicfs pull: %s\n", requests(up.Wire.Containerd), requests(up.Wire.Ocicfs))
-		writeList(b, "Download details", up.details)
+		fmt.Fprintf(b, "containerd pull: %s\nocicfs pull: %s\nocicfs pull --delta: %s\n", requests(up.Wire.Containerd), requests(up.Wire.Ocicfs), requests(up.Wire.OcicfsDelta))
+		writeList(b, "Download details", append(deltaDetails(up.deltaLayers), up.details...))
 	}
 }
 
@@ -258,6 +258,14 @@ func writeDownload(b *strings.Builder, wire Wire, from, to []ImageReport) {
 	if n := sharedBlobs(blobsFrom, blobsTo); n > 0 {
 		shared = fmtInt(int64(n))
 	}
+	chunked := map[string]bool{}
+	for _, img := range to {
+		for _, l := range img.Layers {
+			if l.TOC != "" {
+				chunked[l.BlobDigest] = true
+			}
+		}
+	}
 	rows := [][]string{{"Transfer path", "Download", "What it fetches", "Feeds"}}
 	var gone []unavailable
 	for _, p := range []struct {
@@ -266,22 +274,70 @@ func writeDownload(b *strings.Builder, wire Wire, from, to []ImageReport) {
 	}{
 		{"containerd pull", fmt.Sprintf(" (%s shared with %s)", shared, since), "every storage model", wire.Containerd},
 		{"ocicfs pull", "", "File CAS/image", wire.Ocicfs},
+		{"ocicfs pull --delta", "", "File CAS/image", wire.OcicfsDelta},
 	} {
 		if p.w.Unavailable != "" {
 			rows = append(rows, []string{p.name, "n/a‡", "-", p.feeds})
 			gone = append(gone, unavailable{p.name, p.w.Unavailable})
 			continue
 		}
-		rows = append(rows, []string{p.name, fmtSize(p.w.Bytes), fmtInt(int64(p.w.Blobs)) + of + p.fetches, p.feeds})
+		fetches := fmtInt(int64(p.w.Blobs)) + of + p.fetches
+		if p.name == "ocicfs pull --delta" {
+			fetches = deltaFetches(p.w, wire.Containerd, len(chunked), of)
+		}
+		rows = append(rows, []string{p.name, fmtSize(p.w.Bytes), fetches, p.feeds})
 	}
 	b.WriteString("\n")
 	writeTable(b, "Download (compressed bytes the device fetches):", rows, []int{3, 2, 2}, []bool{false, true, false, false})
 	writeUnavailable(b, gone)
 }
 
+// deltaDetails are a delta pull's per-layer lines, as ocicfs logs them.
+func deltaDetails(layers []deltaLayer) []string {
+	var out []string
+	for _, d := range layers {
+		if d.blob == "" {
+			out = append(out, "ocicfs pull --delta · "+d.reason)
+			continue
+		}
+		l := fmt.Sprintf("ocicfs pull --delta · %s: %s blob", d.blob, fmtSize(d.size))
+		if d.table {
+			l += fmt.Sprintf(" · TOC %s · %s (%d inline) · %s %s", fmtSize(d.tocBytes), nouns(d.missing, "missing file", "missing files"), d.inline, plural(d.requests, "range"), fmtSize(d.planned))
+		} else if d.missing > 0 {
+			l += " · " + nouns(d.missing, "missing file", "missing files")
+		}
+		out = append(out, l+fmt.Sprintf(" · fetched %s · %s", fmtSize(d.fetched), d.reason))
+	}
+	return out
+}
+
+// deltaFetches is what a delta pull fetches: its layers whole, out of the
+// to layers of reads, when none of those is zstd:chunked, or else the
+// tables and ranges of the changed files against what containerd
+// downloads, and the layers it still reads whole.
+func deltaFetches(w, containerd WirePath, chunked int, of string) string {
+	if chunked == 0 {
+		return fmtInt(int64(w.Blobs)) + of + " whole: no zstd:chunked layers"
+	}
+	s := fmt.Sprintf("changed files only: %s + %s", nouns(w.TOCs, "TOC", "TOCs"), plural(w.Ranges, "range"))
+	if containerd.Unavailable == "" && containerd.Bytes > 0 {
+		s += " (" + signedPercent(w.Bytes-containerd.Bytes, containerd.Bytes) + ")"
+	}
+	if w.Blobs > 0 {
+		s += " · " + plural(w.Blobs, "layer") + " whole"
+	}
+	return s
+}
+
 // requests counts the requests a transfer path takes, by kind.
 func requests(w WirePath) string {
 	var parts []string
+	if w.TOCs > 0 {
+		parts = append(parts, nouns(w.TOCs, "TOC", "TOCs"))
+	}
+	if w.Ranges > 0 {
+		parts = append(parts, plural(w.Ranges, "range"))
+	}
 	if w.Blobs > 0 {
 		parts = append(parts, plural(w.Blobs, "blob"))
 	}

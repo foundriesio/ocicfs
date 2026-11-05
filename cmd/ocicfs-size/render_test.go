@@ -89,6 +89,15 @@ func TestUpdateGolden(t *testing.T) {
 	}
 }
 
+// TestUpdateChunkedGolden checks the update output on the zstd:chunked
+// release pair.
+func TestUpdateChunkedGolden(t *testing.T) {
+	stampVersion(t, "v1.0.0", "0123abc")
+	out := runText(t, "update", "--no-cache", "--platform", "linux/amd64", "--from", releaseN, "--to", releaseN1)
+	got := strings.ReplaceAll(out, filepath.Join("..", "..", "internal", "zstdchunked", "testdata"), "TESTDATA")
+	golden(t, filepath.Join("testdata", "golden", "default-update-chunked.txt"), got)
+}
+
 func TestNumberFormats(t *testing.T) {
 	for _, c := range []struct {
 		got, want string
