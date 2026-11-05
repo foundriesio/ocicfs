@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -316,7 +317,7 @@ func TestWireRollback(t *testing.T) {
 	refs := writeLayout(t, t.TempDir(), testImage{layers: [][]byte{a, b, c}}, testImage{layers: [][]byte{a, b, d}})
 	plain := sizeUpdate(t, newSpyOpener().open, "--from", refs[0], "--to", refs[1]).Update.Wire
 	kept := sizeUpdate(t, newSpyOpener().open, "--rollback", "--from", refs[0], "--to", refs[1]).Update.Wire
-	if kept != plain || kept.Ocicfs.Held != 0 || kept.OcicfsDelta.Held != 0 {
+	if kept.Containerd != plain.Containerd || kept.Ocicfs != plain.Ocicfs || kept.OcicfsDelta != plain.OcicfsDelta || *kept.OcicfsDeltaModeled != *plain.OcicfsDeltaModeled || kept.Ocicfs.Held != 0 || kept.OcicfsDelta.Held != 0 {
 		t.Errorf("rollback %+v, without %+v", kept, plain)
 	}
 	if text := runText(t, "update", "--details", "--no-cache", "--rollback", "--from", refs[0], "--to", refs[1]); strings.Contains(text, ": held:") {
@@ -898,5 +899,148 @@ func TestWireRunIsFetched(t *testing.T) {
 	w := buildUpdate(t, refs[0], refs[1]).Wire
 	if w.Ocicfs.Blobs != 2 || w.OcicfsDelta.Blobs != 2 {
 		t.Errorf("ocicfs %d blobs, delta %d, want l1 and l0 again", w.Ocicfs.Blobs, w.OcicfsDelta.Blobs)
+	}
+}
+
+// TestModeledTable checks the modeled table of each skopeo fixture layer
+// against its published one: the same files in the same order, every
+// extent within a few bytes, every offset within the header estimate of
+// each entry of the layer; and that a layer scanned without compressed
+// sizes has no modeled table.
+func TestModeledTable(t *testing.T) {
+	dir := filepath.Join("..", "..", "internal", "zstdchunked", "testdata", "layout")
+	var index ocispec.Index
+	data, err := os.ReadFile(filepath.Join(dir, "index.json")) // #nosec G304 -- a test layout
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &index); err != nil {
+		t.Fatal(err)
+	}
+	checked := 0
+	for _, md := range index.Manifests {
+		var m ocispec.Manifest
+		if err := json.Unmarshal(readBlob(t, dir, md.Digest), &m); err != nil {
+			t.Fatal(err)
+		}
+		for _, desc := range m.Layers {
+			blob := readBlob(t, dir, desc.Digest)
+			pos, ok, err := zstdchunked.Position(desc.Annotations, desc.Size)
+			if err != nil || !ok {
+				continue // a layer published without a table
+			}
+			toc, err := zstdchunked.Parse(blob[pos.Offset:pos.Offset+pos.CompressedLen], pos)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw := zstdDecode(t, blob)
+			inv, err := scanLayer(context.Background(), io.NopCloser(bytes.NewReader(raw)), digest.FromBytes(raw), true)
+			if err != nil {
+				continue // a case the scan rejects
+			}
+			var published []zstdchunked.Entry
+			for _, e := range toc.Entries {
+				if e.Type == zstdchunked.TypeReg && e.Digest != "" {
+					published = append(published, e)
+				}
+			}
+			modeled, _, err := modeledTable(inv, LayerRef{BlobDigest: desc.Digest.String()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(modeled.Files) != len(published) {
+				t.Errorf("%s: %d modeled files, %d published", desc.Digest, len(modeled.Files), len(published))
+				continue
+			}
+			for i, f := range modeled.Files {
+				p := published[i]
+				if f.Digest != p.Digest.String() || abs(f.EndOffset-f.Offset-(p.EndOffset-p.Offset)) > 16 || abs(f.Offset-p.Offset) > int64(len(inv.Entries))*hdrZ {
+					t.Errorf("%s file %d: modeled [%d, %d) %s, published [%d, %d) %s", desc.Digest, i, f.Offset, f.EndOffset, f.Digest, p.Offset, p.EndOffset, p.Digest)
+				}
+			}
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no layer checked")
+	}
+	if _, _, err := modeledTable(layerInv(t, tarOf(t, file("a", "x"))), LayerRef{}); err == nil {
+		t.Error("modeled a layer scanned without compressed sizes")
+	}
+}
+
+// TestModeledRow checks an update to an image without tables gets a
+// modeled delta row, marked in its details and assumptions, and one whose
+// layers all have tables does not.
+func TestModeledRow(t *testing.T) {
+	rep := sizeUpdate(t, newSpyOpener().open, "--from", releaseN, "--to", releaseN1)
+	if rep.Update.Wire.OcicfsDeltaModeled != nil {
+		t.Errorf("modeled row for zstd:chunked images: %+v", rep.Update.Wire.OcicfsDeltaModeled)
+	}
+	a, _, _, _ := baseLayers(t)
+	refs := writeLayout(t, t.TempDir(), testImage{layers: [][]byte{a}}, testImage{layers: [][]byte{a, tarOf(t, file("big", strings.Repeat("x", 100000)))}})
+	rep = sizeUpdate(t, newSpyOpener().open, "--from", refs[0], "--to", refs[1])
+	m := rep.Update.Wire.OcicfsDeltaModeled
+	if m == nil || m.Unavailable != "" || m.TOCs != 2 || m.Ranges != 1 || m.Bytes >= rep.Update.Wire.OcicfsDelta.Bytes {
+		t.Fatalf("modeled %+v, published %+v", m, rep.Update.Wire.OcicfsDelta)
+	}
+	text := runText(t, "update", "--details", "--no-cache", "--from", refs[0], "--to", refs[1])
+	for _, want := range []string{"ocicfs pull --delta, as zstd:chunked  ", "ocicfs pull --delta, modeled · ", "modeled zstd:chunked: "} {
+		if !strings.Contains(text, want) {
+			t.Errorf("no %q in:\n%s", want, text)
+		}
+	}
+}
+
+func abs(n int64) int64 {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+// TestDeltaMixedLayers checks an update to an image with a zstd:chunked
+// layer and a gzip layer without a table: the published row ranges the
+// chunked layer and reads the gzip layer whole, the modeled row ranges both
+// and costs the chunked layer the same, and each row's totals are the sum
+// of its layers and the metadata.
+func TestDeltaMixedLayers(t *testing.T) {
+	// The zstdchunked fixture is the only one with a chunked and a gzip layer in one image.
+	mixed := filepath.Join("..", "..", "internal", "zstdchunked", "testdata", "layout") + "@sha256:2d9d5d89c465535ae85b52a7445986db7d850cd599e59abfb8431776cedce94d"
+	up := buildUpdate(t, releaseN, mixed)
+	check := func(name string, w *WirePath, layers []deltaLayer, reasons ...string) {
+		t.Helper()
+		if w == nil || w.Unavailable != "" || len(layers) != len(reasons) {
+			t.Fatalf("%s: %+v, %d layers", name, w, len(layers))
+		}
+		sum := WirePath{Bytes: w.Metadata, Metadata: w.Metadata, Reads: w.Reads}
+		for i, d := range layers {
+			if d.reason != reasons[i] || d.table != (reasons[i] == "ranges") {
+				t.Errorf("%s layer %d: %+v, want %s", name, i, d, reasons[i])
+			}
+			sum.Bytes += d.fetched
+			sum.TOCBytes += d.tocBytes
+			sum.Planned += d.planned
+			sum.Ranges += d.requests
+			if d.tocBytes > 0 {
+				sum.TOCs++
+			}
+			if !d.table {
+				sum.Blobs++
+			}
+		}
+		if sum != *w {
+			t.Errorf("%s: totals %+v, layers add up to %+v", name, *w, sum)
+		}
+	}
+	check("published", &up.Wire.OcicfsDelta, up.deltaLayers, "ranges", "no-toc")
+	check("modeled", up.Wire.OcicfsDeltaModeled, up.modeledLayers, "ranges", "ranges")
+	if pub, mod := up.deltaLayers, up.modeledLayers; len(pub) == 2 && len(mod) == 2 {
+		if pub[0] != mod[0] {
+			t.Errorf("chunked layer: published %+v, modeled %+v", pub[0], mod[0])
+		}
+		if pub[1].fetched != pub[1].size || mod[1].tocBytes == 0 || mod[1].missing == 0 {
+			t.Errorf("gzip layer: published %+v, modeled %+v", pub[1], mod[1])
+		}
 	}
 }
