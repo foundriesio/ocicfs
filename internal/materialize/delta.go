@@ -196,11 +196,12 @@ func Delta(ctx context.Context, store *objectstore.Store, img *imagestore.Store,
 	if err := checkSpace(store, missing); err != nil {
 		return Built{}, err
 	}
+	pl := planLayers(layers)
 	listed, unlisted := missing, []rootfs.Payload(nil)
 	if len(reused) > 0 {
-		listed, unlisted = splitUnlisted(layers, missing)
+		listed, unlisted = SplitUnlisted(pl, missing)
 	}
-	if err := plan(layers, listed); err != nil {
+	if err := plan(layers, pl, listed); err != nil {
 		return Built{}, err
 	}
 	owned, err := supplySaved(ctx, store, img, src, b, res, reused, unlisted, slots)
@@ -464,16 +465,50 @@ func checkSpace(store *objectstore.Store, missing []rootfs.Payload) error {
 	return nil
 }
 
-// splitUnlisted splits the missing payloads into the ones plan assigns to a
-// table of contents and the ones only a saved layer can list: the stored
-// files no table lists. A payload a table lists stays with plan, a range
-// being cheaper than the whole layer a saved layer costs, and so does every
-// inlined file: a saved layer carries such a file's bytes itself, so a
-// pending one always comes from a table.
-func splitUnlisted(layers []*deltaLayer, missing []rootfs.Payload) (listed, unlisted []rootfs.Payload) {
+// PlanLayer is one layer as the range planner sees it: its blob size and
+// its table of contents entries, none for a layer without a table.
+type PlanLayer struct {
+	Size    int64
+	Entries []zstdchunked.Entry
+}
+
+// LayerPlan is how one layer's missing files are fetched.
+type LayerPlan struct {
+	Files    int    // the missing payloads the layer supplies
+	Requests int    // the range requests they take
+	Planned  int64  // the bytes those requests span, gaps included
+	Fallback string // why the layer is read whole instead, "" when it is not
+}
+
+// rangePlan is one layer's share of a plan: the missing payloads it
+// supplies, in offset order, their range requests, and why the layer is
+// read whole instead, "" when it is not.
+type rangePlan struct {
+	files    []fileFetch
+	requests []byteRange
+	planned  int64
+	fallback string
+}
+
+// planLayers is the planner's view of layers.
+func planLayers(layers []*deltaLayer) []PlanLayer {
+	out := make([]PlanLayer, len(layers))
+	for i, l := range layers {
+		out[i] = PlanLayer{Size: l.desc.Size, Entries: l.entries()}
+	}
+	return out
+}
+
+// SplitUnlisted splits the missing payloads into the ones PlanRanges
+// assigns to a table of contents and the ones only a saved layer can list:
+// the stored files no table lists. A payload a table lists stays with the
+// planner, a range being cheaper than the whole layer a saved layer costs,
+// and so does every inlined file: a saved layer carries such a file's bytes
+// itself, so a pending one always comes from a table.
+func SplitUnlisted(layers []PlanLayer, missing []rootfs.Payload) (listed, unlisted []rootfs.Payload) {
 	inTable := make(map[rootfs.Payload]bool)
 	for _, l := range layers {
-		for _, e := range l.entries() {
+		for _, e := range l.Entries {
 			if e.Digest != "" {
 				inTable[rootfs.Payload{Digest: e.Digest, Size: e.Size}] = true
 			}
@@ -489,61 +524,94 @@ func splitUnlisted(layers []*deltaLayer, missing []rootfs.Payload) (listed, unli
 	return listed, unlisted
 }
 
-// plan assigns every missing payload to the lowest layer whose table lists
-// it, at that layer's lowest-offset occurrence, so a payload is fetched once,
-// and turns each layer's files into range requests: the extents in offset
-// order, coalesced across a gap of at most coalesceGap. A layer that would
-// take more than maxDeltaRequests requests, or whose requests add up to more
-// than maxDeltaFraction of its blob, is read whole instead.
-func plan(layers []*deltaLayer, missing []rootfs.Payload) error {
+// PlanRanges plans the fetch of the missing payloads out of layers, as a
+// delta pull does, and returns each layer's plan.
+func PlanRanges(layers []PlanLayer, missing []rootfs.Payload) ([]LayerPlan, error) {
+	plans, err := planRanges(layers, missing)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]LayerPlan, len(plans))
+	for i, p := range plans {
+		out[i] = LayerPlan{Files: len(p.files), Requests: len(p.requests), Planned: p.planned, Fallback: p.fallback}
+	}
+	return out, nil
+}
+
+// plan plans the fetch of the missing payloads out of layers, whose
+// planner view is pl, and records each layer's share in it. A layer
+// already read whole for another reason keeps that reason; the planner's
+// fallback applies only to layers whose bytes were to arrive by range.
+func plan(layers []*deltaLayer, pl []PlanLayer, missing []rootfs.Payload) error {
+	plans, err := planRanges(pl, missing)
+	if err != nil {
+		return err
+	}
+	for i, l := range layers {
+		p := plans[i]
+		l.files, l.requests, l.planned = p.files, p.requests, p.planned
+		if l.reason == fallbackNone && p.fallback != "" {
+			l.reason = p.fallback
+		}
+	}
+	return nil
+}
+
+// planRanges assigns every missing payload to the lowest layer whose table
+// lists it, at that layer's lowest-offset occurrence, so a payload is
+// fetched once, and turns each layer's files into range requests: the
+// extents in offset order, coalesced across a gap of at most coalesceGap. A
+// layer that would take more than maxDeltaRequests requests, or whose
+// requests add up to more than maxDeltaFraction of its blob, is to be read
+// whole instead.
+func planRanges(layers []PlanLayer, missing []rootfs.Payload) ([]rangePlan, error) {
 	type occurrence struct {
-		layer *deltaLayer
+		layer int
 		entry zstdchunked.Entry
 	}
 	sources := make(map[rootfs.Payload]occurrence)
-	for _, l := range layers {
-		for _, e := range l.entries() {
+	for i, l := range layers {
+		for _, e := range l.Entries {
 			if e.Digest == "" {
 				continue
 			}
 			key := rootfs.Payload{Digest: e.Digest, Size: e.Size}
-			if o, ok := sources[key]; !ok || (o.layer == l && e.Offset < o.entry.Offset) {
-				sources[key] = occurrence{layer: l, entry: e}
+			if o, ok := sources[key]; !ok || (o.layer == i && e.Offset < o.entry.Offset) {
+				sources[key] = occurrence{layer: i, entry: e}
 			}
 		}
 	}
+	plans := make([]rangePlan, len(layers))
 	for _, p := range missing {
 		o, ok := sources[p]
 		if !ok {
-			return fmt.Errorf("materialize: no table of contents lists missing payload %s of %d bytes", p.Digest, p.Size)
+			return nil, fmt.Errorf("materialize: no table of contents lists missing payload %s of %d bytes", p.Digest, p.Size)
 		}
-		o.layer.files = append(o.layer.files, fileFetch{payload: p, entry: o.entry})
+		plans[o.layer].files = append(plans[o.layer].files, fileFetch{payload: p, entry: o.entry})
 	}
 
-	for _, l := range layers {
-		sort.Slice(l.files, func(i, j int) bool { return l.files[i].entry.Offset < l.files[j].entry.Offset })
-		for _, f := range l.files {
-			if n := len(l.requests); n > 0 && f.entry.Offset-l.requests[n-1].end <= coalesceGap {
-				l.requests[n-1].end = f.entry.EndOffset
-				l.requests[n-1].files = append(l.requests[n-1].files, f)
+	for i := range plans {
+		p := &plans[i]
+		sort.Slice(p.files, func(a, b int) bool { return p.files[a].entry.Offset < p.files[b].entry.Offset })
+		for _, f := range p.files {
+			if n := len(p.requests); n > 0 && f.entry.Offset-p.requests[n-1].end <= coalesceGap {
+				p.requests[n-1].end = f.entry.EndOffset
+				p.requests[n-1].files = append(p.requests[n-1].files, f)
 				continue
 			}
-			l.requests = append(l.requests, byteRange{off: f.entry.Offset, end: f.entry.EndOffset, files: []fileFetch{f}})
+			p.requests = append(p.requests, byteRange{off: f.entry.Offset, end: f.entry.EndOffset, files: []fileFetch{f}})
 		}
-		for _, r := range l.requests {
-			l.planned += r.end - r.off
-		}
-		if l.reason != fallbackNone {
-			continue
+		for _, r := range p.requests {
+			p.planned += r.end - r.off
 		}
 		switch {
-		case len(l.requests) > maxDeltaRequests:
-			l.reason = fallbackRequests
-		case float64(l.planned) > maxDeltaFraction*float64(l.desc.Size):
-			l.reason = fallbackFraction
+		case len(p.requests) > maxDeltaRequests:
+			p.fallback = fallbackRequests
+		case float64(p.planned) > maxDeltaFraction*float64(layers[i].Size):
+			p.fallback = fallbackFraction
 		}
 	}
-	return nil
+	return plans, nil
 }
 
 // fetchLayer supplies the builder with l's missing files: out of the spool,
