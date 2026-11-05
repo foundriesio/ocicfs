@@ -85,13 +85,13 @@ func TestScanLayerRejects(t *testing.T) {
 		"xattr-big": tarOf(t, tent{name: "f", xattrs: map[string]string{"user.big": strings.Repeat("v", maxXattrValue+1)}}),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := scanLayer(context.Background(), io.NopCloser(bytes.NewReader(raw)), digest.FromBytes(raw)); err == nil {
+			if _, err := scanLayer(context.Background(), io.NopCloser(bytes.NewReader(raw)), digest.FromBytes(raw), false); err == nil {
 				t.Fatal("accepted")
 			}
 		})
 	}
 	raw := tarOf(t, file("a", "x"))
-	if _, err := scanLayer(context.Background(), io.NopCloser(bytes.NewReader(raw)), digest.FromString("other")); err == nil {
+	if _, err := scanLayer(context.Background(), io.NopCloser(bytes.NewReader(raw)), digest.FromString("other"), false); err == nil {
 		t.Fatal("diff_id mismatch accepted")
 	}
 }
@@ -107,7 +107,7 @@ func TestScanLayerReadsToStreamEnd(t *testing.T) {
 	_, _ = zw.Write(tarOf(t, file("a", strings.Repeat("x", 100000))))
 	_ = zw.Close()
 	cut := gz.Bytes()[:gz.Len()/2]
-	_, err := scanLayer(context.Background(), mustGunzip(t, cut), digest.FromString("unknown"))
+	_, err := scanLayer(context.Background(), mustGunzip(t, cut), digest.FromString("unknown"), false)
 	if err == nil {
 		t.Fatal("truncated stream accepted")
 	}
@@ -245,6 +245,84 @@ func TestInvCacheKeepsBytes(t *testing.T) {
 	ls.writeInv(want)
 	if got := ls.readInv(diffID); !reflect.DeepEqual(got, want) {
 		t.Errorf("cached inventory = %+v, want %+v", got, want)
+	}
+}
+
+func TestScanZSizes(t *testing.T) {
+	raw := tarOf(t, dir("d/"), file("d/a", strings.Repeat("a", 5000)), file("d/empty", ""), hardlink("d/b", "d/a"))
+	scan := func(zsizes bool) *LayerInv {
+		inv, err := scanLayer(context.Background(), io.NopCloser(bytes.NewReader(raw)), digest.FromBytes(raw), zsizes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return inv
+	}
+	for _, e := range scan(true).Entries {
+		if compressed := e.Path == "/d/a"; compressed != (e.ZSize > 0) || e.ZSize >= 5000 {
+			t.Errorf("%s: compressed size %d", e.Path, e.ZSize)
+		}
+	}
+	for _, e := range scan(false).Entries {
+		if e.ZSize != 0 {
+			t.Errorf("%s: compressed size %d unasked", e.Path, e.ZSize)
+		}
+	}
+}
+
+// TestLoadZSizes checks a load that wants compressed sizes rescans a
+// layer whose cached inventory lacks them, and reuses one that has them.
+func TestLoadZSizes(t *testing.T) {
+	stampVersion(t, "v1.0.0", "0123abc")
+	refs := writeLayout(t, t.TempDir(), testImage{layers: [][]byte{tarOf(t, file("a", strings.Repeat("a", 5000)))}})
+	platform := ocispec.Platform{OS: "linux", Architecture: "amd64"}
+	cache := t.TempDir()
+	load := func(zsizes bool) *layerSet {
+		sp, err := newSpool("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sp.close()
+		ls := newLayerSet(cache)
+		ls.zsizes = zsizes
+		if _, err := loadImages(context.Background(), newSpyOpener().open, sp, ls, refs, platform, manifestKey, map[string]*Image{}); err != nil {
+			t.Fatal(err)
+		}
+		return ls
+	}
+	for i, c := range []struct {
+		zsizes      bool
+		scans, hits int
+	}{{false, 1, 0}, {true, 1, 0}, {true, 0, 1}, {false, 0, 1}} {
+		if ls := load(c.zsizes); ls.scans != c.scans || ls.invHits != c.hits {
+			t.Errorf("load %d: %d scans, %d hits", i, ls.scans, ls.invHits)
+		}
+	}
+
+	// A layer published both as zstd:chunked and without a table is
+	// scanned again for its sizes after the chunked image loaded it.
+	sp, err := newSpool("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sp.close()
+	ls := newLayerSet("")
+	ls.zsizes = true
+	chunked, err := loadImages(context.Background(), newSpyOpener().open, sp, ls, []string{releaseN}, platform, manifestKey, map[string]*Image{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := chunked[0].Layers[len(chunked[0].Layers)-1]
+	dir, _, _ := strings.Cut(releaseN, "@")
+	raw := zstdDecode(t, readBlob(t, dir, digest.Digest(last.BlobDigest)))
+	if hasZSizes(ls.inv[last.DiffID]) {
+		t.Fatal("the chunked layer has compressed sizes")
+	}
+	plain := writeLayout(t, t.TempDir(), testImage{layers: [][]byte{raw}})
+	if _, err := loadImages(context.Background(), newSpyOpener().open, sp, ls, plain, platform, manifestKey, map[string]*Image{}); err != nil {
+		t.Fatal(err)
+	}
+	if !hasZSizes(ls.inv[last.DiffID]) {
+		t.Error("the layer without a table has no compressed sizes")
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/opencontainers/go-digest"
 )
 
@@ -49,6 +50,7 @@ type Entry struct {
 	Devminor  int64   `json:"dm,omitempty"`
 	Xattrs    []Xattr `json:"x,omitempty"`
 	Sparse    bool    `json:"sp,omitempty"`
+	ZSize     int64   `json:"z,omitempty"` // a non-empty regular file's content compressed alone at zstd level 10, when the scan records it
 }
 
 // Xattr is one extended attribute of an entry.
@@ -84,9 +86,10 @@ const (
 
 // scanLayer reads a decompressed layer tar from r and returns its inventory,
 // after reading the stream to its end, closing it, and checking it hashes to
-// diffID. A failure at any of those steps returns no inventory.
-func scanLayer(ctx context.Context, r io.ReadCloser, diffID digest.Digest) (*LayerInv, error) {
-	inv, err := scanTar(ctx, r, diffID)
+// diffID. A failure at any of those steps returns no inventory. With
+// zsizes it records every non-empty regular file's compressed size too.
+func scanLayer(ctx context.Context, r io.ReadCloser, diffID digest.Digest, zsizes bool) (*LayerInv, error) {
+	inv, err := scanTar(ctx, r, diffID, zsizes)
 	if cerr := r.Close(); err == nil && cerr != nil {
 		err = fmt.Errorf("scan layer %s: close: %w", diffID, cerr)
 	}
@@ -98,7 +101,16 @@ func scanLayer(ctx context.Context, r io.ReadCloser, diffID digest.Digest) (*Lay
 
 // scanTar walks the tar stream, drains it to the decompressor's end and
 // verifies the diff_id.
-func scanTar(ctx context.Context, r io.Reader, diffID digest.Digest) (*LayerInv, error) {
+func scanTar(ctx context.Context, r io.Reader, diffID digest.Digest, zsizes bool) (*LayerInv, error) {
+	var enc *zstd.Encoder
+	if zsizes {
+		var err error
+		// The level and options containers/storage writes zstd:chunked
+		// payloads with.
+		if enc, err = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(10))); err != nil {
+			return nil, fmt.Errorf("scan layer %s: %w", diffID, err)
+		}
+	}
 	h := sha256.New()
 	counted := &countingReader{r: io.TeeReader(r, h)}
 	tr := tar.NewReader(counted)
@@ -118,7 +130,7 @@ func scanTar(ctx context.Context, r io.Reader, diffID digest.Digest) (*LayerInv,
 		if len(inv.Entries) == maxLayerEntries {
 			return nil, fmt.Errorf("scan layer %s: more than %d entries", diffID, maxLayerEntries)
 		}
-		e, keep, err := entryFromHeader(tr, hdr, inv, byPath)
+		e, keep, err := entryFromHeader(tr, hdr, inv, byPath, enc)
 		if err != nil {
 			return nil, fmt.Errorf("scan layer %s: %w", diffID, err)
 		}
@@ -141,8 +153,9 @@ func scanTar(ctx context.Context, r io.Reader, diffID digest.Digest) (*LayerInv,
 }
 
 // entryFromHeader converts one tar header, reading a regular file's content
-// to hash it. keep is false for an entry the layer does not record.
-func entryFromHeader(tr *tar.Reader, hdr *tar.Header, inv *LayerInv, byPath map[string]int32) (Entry, bool, error) {
+// to hash it, and to compress it alone with enc when enc is not nil. keep
+// is false for an entry the layer does not record.
+func entryFromHeader(tr *tar.Reader, hdr *tar.Header, inv *LayerInv, byPath map[string]int32, enc *zstd.Encoder) (Entry, bool, error) {
 	if hdr.Typeflag == tar.TypeXGlobalHeader {
 		return Entry{}, false, nil
 	}
@@ -174,11 +187,23 @@ func entryFromHeader(tr *tar.Reader, hdr *tar.Header, inv *LayerInv, byPath map[
 			inv.Notes = appendNote(inv.Notes, "sparse files are counted as dense")
 		}
 		h := sha256.New()
-		n, err := io.Copy(h, tr)
+		var w io.Writer = h
+		var z countingWriter
+		if enc != nil {
+			enc.Reset(&z)
+			w = io.MultiWriter(h, enc)
+		}
+		n, err := io.Copy(w, tr)
 		if err != nil {
 			return Entry{}, false, fmt.Errorf("%s: read content: %w", p, err)
 		}
 		e.Size, e.Digest = n, hex.EncodeToString(h.Sum(nil))
+		if enc != nil && n > 0 {
+			if err := enc.Close(); err != nil {
+				return Entry{}, false, fmt.Errorf("%s: compress content: %w", p, err)
+			}
+			e.ZSize = z.n
+		}
 	case tar.TypeDir:
 		e.Kind = KindDir
 	case tar.TypeSymlink:
@@ -304,4 +329,12 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	c.n += int64(n)
 	return n, err
+}
+
+// countingWriter counts the bytes written to it.
+type countingWriter struct{ n int64 }
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	c.n += int64(len(p))
+	return len(p), nil
 }

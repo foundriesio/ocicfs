@@ -84,7 +84,7 @@ func runUpdate(ctx context.Context, o options, stdin io.Reader, stdout io.Writer
 	defer sp.close()
 
 	ls := newLayerSet(cacheDir)
-	ls.readTOCs = true
+	ls.readTOCs, ls.zsizes = true, true
 	known := map[string]*Image{}
 	from, err := loadImages(ctx, open, sp, ls, fromRefs, platform, rootKey, known)
 	if err != nil {

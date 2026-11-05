@@ -223,7 +223,7 @@ func (ss spySource) OpenRange(ctx context.Context, desc ocispec.Descriptor, off,
 // layerInv scans a raw layer tar.
 func layerInv(t testing.TB, raw []byte) *LayerInv {
 	t.Helper()
-	inv, err := scanLayer(context.Background(), io.NopCloser(bytes.NewReader(raw)), digest.FromBytes(raw))
+	inv, err := scanLayer(context.Background(), io.NopCloser(bytes.NewReader(raw)), digest.FromBytes(raw), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,4 +256,19 @@ func stampVersion(t *testing.T, ver, rev string) {
 	oldV, oldR := version.Version, version.Revision
 	version.Version, version.Revision = ver, rev
 	t.Cleanup(func() { version.Version, version.Revision = oldV, oldR })
+}
+
+// zstdDecode decompresses a zstd stream, skipping its skippable frames.
+func zstdDecode(t testing.TB, data []byte) []byte {
+	t.Helper()
+	d, err := zstd.NewReader(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	out, err := d.DecodeAll(data, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
 }
