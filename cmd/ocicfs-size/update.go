@@ -33,8 +33,9 @@ type UpdateReport struct {
 	Reclaimable Models   `json:"reclaimable"` // union − after
 	Wire        Wire     `json:"wire"`
 
-	details     []string     // per-layer download lines of a plain pull, for --details
-	deltaLayers []deltaLayer // what a delta pull fetches of each layer it reads
+	details       []string     // per-layer download lines of a plain pull, for --details
+	deltaLayers   []deltaLayer // what a delta pull fetches of each layer it reads
+	modeledLayers []deltaLayer // the same, with the layers without a table modeled
 }
 
 // Wire is what the update downloads by each transfer path.
@@ -42,6 +43,9 @@ type Wire struct {
 	Containerd  WirePath `json:"containerd"`
 	Ocicfs      WirePath `json:"ocicfs"`
 	OcicfsDelta WirePath `json:"ocicfsDelta"`
+	// OcicfsDeltaModeled is a delta pull with every to layer that has no
+	// table of contents published as zstd:chunked, when one has none.
+	OcicfsDeltaModeled *WirePath `json:"ocicfsDeltaModeled,omitempty"`
 }
 
 // WirePath is what one transfer path fetches: the compressed blobs and the
@@ -157,9 +161,33 @@ func buildUpdateReport(ctx context.Context, from, to []*Image, rollback bool, ls
 			rootOf[img], casOf[img] = roots[i], cas[i]
 		}
 		up.Wire.Ocicfs, up.details = ocicfsPull(from, to, rootOf, casOf)
+		published := func(l LayerRef) (*LayerTOC, int64, string) { return tableOf(ls, l) }
 		var err error
-		if up.Wire.OcicfsDelta, up.deltaLayers, err = deltaPull(from, to, rootOf, casOf, ls); err != nil {
+		if up.Wire.OcicfsDelta, up.deltaLayers, err = deltaPull(from, to, rootOf, casOf, published); err != nil {
 			up.Wire.OcicfsDelta = WirePath{Unavailable: err.Error()}
+		}
+		if lacksTable(ls, to) {
+			var unmodeled error
+			modeled := func(l LayerRef) (*LayerTOC, int64, string) {
+				if t, n, reason := tableOf(ls, l); reason != "no-toc" {
+					return t, n, reason
+				}
+				t, n, err := modeledTable(ls.inv[l.DiffID], l)
+				if err != nil {
+					unmodeled = err
+					return nil, 0, "no-toc"
+				}
+				return t, n, ""
+			}
+			w, layers, err := deltaPull(from, to, rootOf, casOf, modeled)
+			if err == nil {
+				err = unmodeled
+			}
+			if err != nil {
+				w, layers = WirePath{Unavailable: err.Error()}, nil
+			}
+			up.Wire.OcicfsDeltaModeled, up.modeledLayers = &w, layers
+			rep.Assumptions = append(rep.Assumptions, modeledAssumption)
 		}
 	}
 	rep.Assumptions = append(rep.Assumptions, wireAssumptions...)
@@ -473,6 +501,53 @@ type deltaLayer struct {
 	reason           string
 }
 
+// The modeled assumption: how a layer without a table is sized as if
+// published as zstd:chunked.
+const modeledAssumption = "modeled zstd:chunked: content frames at zstd level 10 as containers/storage writes them; " +
+	"headers and table of contents estimated; tar-split not counted; large files are not split at rollsum boundaries, so their ranges are 3–8 % low"
+
+// The estimated zstd:chunked bytes per tar entry of the header frames and
+// of the table of contents.
+const (
+	hdrZ = 90
+	tocZ = 100
+)
+
+// lacksTable reports whether a layer of imgs has no table of contents.
+func lacksTable(ls *layerSet, imgs []*Image) bool {
+	for _, img := range imgs {
+		for _, l := range img.Layers {
+			if _, _, reason := tableOf(ls, l); reason == "no-toc" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// modeledTable is the table of contents layer l would have, with the bytes
+// reading it costs, were it published as zstd:chunked: its entries in tar
+// order, each after an estimated header, every non-empty regular file
+// taking its content's compressed size, and the table after them. A layer
+// scanned without compressed sizes has none.
+func modeledTable(inv *LayerInv, l LayerRef) (*LayerTOC, int64, error) {
+	t := &LayerTOC{Blob: l.BlobDigest}
+	var off int64
+	for _, e := range inv.Entries {
+		off += hdrZ
+		if e.Kind == KindReg && e.Size > 0 {
+			if e.ZSize == 0 {
+				return nil, 0, fmt.Errorf("layer %s was scanned without compressed sizes", l.DiffID)
+			}
+			t.Files = append(t.Files, TOCFile{Digest: "sha256:" + e.Digest, Size: e.Size, Offset: off, EndOffset: off + e.ZSize})
+			off += e.ZSize
+		}
+	}
+	toc := tocZ * int64(len(inv.Entries))
+	t.BlobSize = off + toc
+	return t, toc, nil
+}
+
 // tableOf is the table of contents a delta pull reads for layer l: nil
 // when the layer has none or it is unusable, with the bytes reading it
 // costs and why the layer then goes to its tar stream.
@@ -497,10 +572,12 @@ func tableOf(ls *layerSet, l LayerRef) (*LayerTOC, int64, string) {
 // takes each other layer from its saved layer or reads it whole, and plans
 // the files it shows and the store lacks as ranges, as the pull's own
 // planner does; a stored file no table lists comes from the first saved
-// layer listing it, read whole.
-func deltaPull(from, to []*Image, roots map[*Image]*root, cas map[*Image]*casRoot, ls *layerSet) (WirePath, []deltaLayer, error) {
+// layer listing it, read whole. table gives each layer's table, the bytes
+// reading it costs and why a layer without one goes to its tar stream; a
+// table's blob size stands for the layer's.
+func deltaPull(from, to []*Image, roots map[*Image]*root, cas map[*Image]*casRoot, table func(LayerRef) (*LayerTOC, int64, string)) (WirePath, []deltaLayer, error) {
 	st := newOcicfsState(from, cas, func(img *Image, j int) bool {
-		t, _, _ := tableOf(ls, img.Layers[j])
+		t, _, _ := table(img.Layers[j])
 		return t == nil
 	})
 	var w WirePath
@@ -516,13 +593,17 @@ func deltaPull(from, to []*Image, roots map[*Image]*root, cas map[*Image]*casRoo
 		plan := make([]ocimat.PlanLayer, len(img.Layers))
 		var reused []int
 		for j, l := range img.Layers {
-			t, tocBytes, reason := tableOf(ls, l)
-			d := deltaLayer{blob: l.BlobDigest, size: l.BlobSize, tocBytes: tocBytes, fetched: tocBytes, reason: reason, table: t != nil}
+			t, tocBytes, reason := table(l)
+			size := l.BlobSize
+			if t != nil {
+				size = t.BlobSize
+			}
+			d := deltaLayer{blob: l.BlobDigest, size: size, tocBytes: tocBytes, fetched: tocBytes, reason: reason, table: t != nil}
 			if tocBytes > 0 {
 				w.TOCs++
 				w.TOCBytes += tocBytes
 			}
-			plan[j].Size = l.BlobSize
+			plan[j].Size = size
 			switch {
 			case t != nil:
 				d.reason = "ranges"
