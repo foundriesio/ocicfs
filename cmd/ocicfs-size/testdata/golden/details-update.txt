@@ -3,11 +3,12 @@ UPDATE ESTIMATE · LAYOUT@c45af63c1708 → LAYOUT@a5ec690885e2 · linux/amd64 ·
 - to:   LAYOUT @a5ec690885e2
 
 Download (compressed bytes the device fetches):
-──────────────────────────────────────────────────────────────────────────────────────────────────
-Transfer path     Download  What it fetches                                    Feeds
-──────────────────────────────────────────────────────────────────────────────────────────────────
-containerd pull    1.1 KiB  1 of 3 layers (2 shared with LAYOUT@c45af63c1708)  every storage model
-ocicfs pull        1.8 KiB  1 of 3 layers                                      File CAS/image
+──────────────────────────────────────────────────────────────────────────────────────────────────────
+Transfer path         Download  What it fetches                                    Feeds
+──────────────────────────────────────────────────────────────────────────────────────────────────────
+containerd pull        1.1 KiB  1 of 3 layers (2 shared with LAYOUT@c45af63c1708)  every storage model
+ocicfs pull            1.8 KiB  1 of 3 layers                                      File CAS/image
+ocicfs pull --delta    1.8 KiB  1 of 3 layers whole: no zstd:chunked layers        File CAS/image
 
 Disk usage (fs-verity on; Overlay has none):
 ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -34,8 +35,12 @@ OCI layers:       3 → 3 references · 4 unique blobs · 2 shared
 Compressed size:  546 B → 515 B
 containerd pull: 1 blob + 2 metadata
 ocicfs pull: 1 blob + 3 metadata
+ocicfs pull --delta: 1 blob + 3 metadata
 
 Download details:
+  - ocicfs pull --delta · sha256:c11e998623760b91f0dd2f53bb30f590a5d5cef7e9b750fc6e7f1e2374426de7: 221 B blob · fetched 0 B · saved
+  - ocicfs pull --delta · sha256:99a0bc42f282e83cb1e16935d4949c6a22fd0a4a0ec182d72f9c4ea9735e708d: 177 B blob · fetched 0 B · saved
+  - ocicfs pull --delta · sha256:d935b423a2a382a87f403c7dc39e79a40c4c35894f3ea5872e8ae180eb595180: 117 B blob · fetched 117 B · no-toc
   - ocicfs pull · sha256:d935b423a2a382a87f403c7dc39e79a40c4c35894f3ea5872e8ae180eb595180: read whole · not saved
 
 STORAGE PROJECTION · modelled allocation per store, not paths
@@ -115,6 +120,7 @@ Assumptions:
   - containerd: stock unpacker (fetch-all off), content store holds the from images' blobs
   - ocicfs rows: the from images were pulled by that row's path and collected (gc); store holds their referenced objects
   - ocicfs pull: a layer is saved when read from its tar stream, never when built from its table
+  - delta: TOC extents from the published blob; registry serves ranges; HTTP overhead and redirects not counted (5–13 % measured)
   - survivors from ocicfs-size's replay, which agrees with ocicfs's merge for the layers it accepts
 
 Exclusions:

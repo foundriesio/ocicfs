@@ -3,11 +3,12 @@ UPDATE ESTIMATE · LAYOUT@c45af63c1708 → LAYOUT@a5ec690885e2 · linux/amd64 ·
 - to:   LAYOUT @a5ec690885e2
 
 Download (compressed bytes the device fetches):
-──────────────────────────────────────────────────────────────────────────────────────────────────
-Transfer path     Download  What it fetches                                    Feeds
-──────────────────────────────────────────────────────────────────────────────────────────────────
-containerd pull    1.1 KiB  1 of 3 layers (2 shared with LAYOUT@c45af63c1708)  every storage model
-ocicfs pull        1.8 KiB  1 of 3 layers                                      File CAS/image
+──────────────────────────────────────────────────────────────────────────────────────────────────────
+Transfer path         Download  What it fetches                                    Feeds
+──────────────────────────────────────────────────────────────────────────────────────────────────────
+containerd pull        1.1 KiB  1 of 3 layers (2 shared with LAYOUT@c45af63c1708)  every storage model
+ocicfs pull            1.8 KiB  1 of 3 layers                                      File CAS/image
+ocicfs pull --delta    1.8 KiB  1 of 3 layers whole: no zstd:chunked layers        File CAS/image
 
 Disk usage (fs-verity on; Overlay has none):
 ─────────────────────────────────────────────────────────────────────────────────────────────

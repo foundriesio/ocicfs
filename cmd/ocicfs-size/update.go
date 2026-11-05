@@ -9,8 +9,13 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/opencontainers/go-digest"
+
 	"github.com/foundriesio/ocicfs/internal/cli"
 	"github.com/foundriesio/ocicfs/internal/composefs"
+	ocimat "github.com/foundriesio/ocicfs/internal/materialize"
+	"github.com/foundriesio/ocicfs/internal/rootfs"
+	"github.com/foundriesio/ocicfs/internal/zstdchunked"
 )
 
 // UpdateReport is an update from the from images to the to images: the
@@ -28,13 +33,15 @@ type UpdateReport struct {
 	Reclaimable Models   `json:"reclaimable"` // union − after
 	Wire        Wire     `json:"wire"`
 
-	details []string // per-layer download lines, for --details
+	details     []string     // per-layer download lines of a plain pull, for --details
+	deltaLayers []deltaLayer // what a delta pull fetches of each layer it reads
 }
 
 // Wire is what the update downloads by each transfer path.
 type Wire struct {
-	Containerd WirePath `json:"containerd"`
-	Ocicfs     WirePath `json:"ocicfs"`
+	Containerd  WirePath `json:"containerd"`
+	Ocicfs      WirePath `json:"ocicfs"`
+	OcicfsDelta WirePath `json:"ocicfsDelta"`
 }
 
 // WirePath is what one transfer path fetches: the compressed blobs and the
@@ -46,6 +53,11 @@ type WirePath struct {
 	Reads       int    `json:"reads"`                 // metadata reads
 	Blobs       int    `json:"blobs"`                 // whole-blob reads
 	Held        int    `json:"held,omitempty"`        // to images the store already holds
+	TOCs        int    `json:"tocs,omitempty"`        // delta: table of contents reads
+	TOCBytes    int64  `json:"tocBytes,omitempty"`    // delta: their bytes, unusable tables included
+	Ranges      int    `json:"ranges,omitempty"`      // delta: range requests issued
+	Planned     int64  `json:"planned,omitempty"`     // delta: bytes the planned ranges span, gaps included
+	Fallbacks   int    `json:"fallbacks,omitempty"`   // delta: layers read whole for too many or too large ranges
 }
 
 // runUpdate sizes the update o names.
@@ -138,12 +150,17 @@ func buildUpdateReport(ctx context.Context, from, to []*Image, rollback bool, ls
 	}
 	if why != "" {
 		up.Wire.Ocicfs.Unavailable = why
+		up.Wire.OcicfsDelta.Unavailable = why
 	} else {
 		rootOf, casOf := map[*Image]*root{}, map[*Image]*casRoot{}
 		for i, img := range union {
 			rootOf[img], casOf[img] = roots[i], cas[i]
 		}
 		up.Wire.Ocicfs, up.details = ocicfsPull(from, to, rootOf, casOf)
+		var err error
+		if up.Wire.OcicfsDelta, up.deltaLayers, err = deltaPull(from, to, rootOf, casOf, ls); err != nil {
+			up.Wire.OcicfsDelta = WirePath{Unavailable: err.Error()}
+		}
 	}
 	rep.Assumptions = append(rep.Assumptions, wireAssumptions...)
 	rep.Models, rep.Update = up.Union, up
@@ -155,6 +172,7 @@ var wireAssumptions = []string{
 	"containerd: stock unpacker (fetch-all off), content store holds the from images' blobs",
 	"ocicfs rows: the from images were pulled by that row's path and collected (gc); store holds their referenced objects",
 	"ocicfs pull: a layer is saved when read from its tar stream, never when built from its table",
+	"delta: TOC extents from the published blob; registry serves ranges; HTTP overhead and redirects not counted (5–13 % measured)",
 	"survivors from ocicfs-size's replay, which agrees with ocicfs's merge for the layers it accepts",
 }
 
@@ -283,18 +301,18 @@ func (st *ocicfsState) resolve(w *WirePath, img *Image) (held bool, detail strin
 	return false, ""
 }
 
-// readLayer charges w layer j of img read whole, once per blob of the
-// image, and stores every file the layer carries.
-func (st *ocicfsState) readLayer(w *WirePath, read map[string]bool, r *root, j int) {
-	l := r.img.Layers[j]
-	if !read[l.BlobDigest] {
-		read[l.BlobDigest] = true
-		w.Bytes += l.BlobSize
-		w.Blobs++
-	}
+// readLayer stores every file layer j of r carries, read whole, and
+// reports whether that read its blob: an image reads each blob once.
+func (st *ocicfsState) readLayer(read map[string]bool, r *root, j int) bool {
 	for d := range layerObjects(r.mats[j].inv) {
 		st.objects[d] = true
 	}
+	blob := r.img.Layers[j].BlobDigest
+	if read[blob] {
+		return false
+	}
+	read[blob] = true
+	return true
 }
 
 // layerObjects are the contents of the regular files of a layer ocicfs
@@ -360,10 +378,11 @@ func ocicfsPull(from, to []*Image, roots map[*Image]*root, cas map[*Image]*casRo
 				reused = append(reused, j)
 				continue
 			}
-			if !read[l.BlobDigest] {
+			if st.readLayer(read, r, j) {
 				details = append(details, "ocicfs pull · "+l.BlobDigest+": read whole · not saved")
+				w.Bytes += l.BlobSize
+				w.Blobs++
 			}
-			st.readLayer(&w, read, r, j)
 			st.saved[savedKey(l)] = true
 		}
 		missing := map[string]bool{}
@@ -383,9 +402,10 @@ func ocicfsPull(from, to []*Image, roots map[*Image]*root, cas map[*Image]*casRo
 					lists = true
 				}
 			}
-			if lists && !read[img.Layers[j].BlobDigest] {
+			if lists && st.readLayer(read, r, j) {
 				details = append(details, "ocicfs pull · "+img.Layers[j].BlobDigest+": read whole · recovery: lists a needed file the store lacks")
-				st.readLayer(&w, read, r, j)
+				w.Bytes += img.Layers[j].BlobSize
+				w.Blobs++
 			}
 		}
 	}
@@ -438,4 +458,163 @@ func subtractBreakdown(a, b *Breakdown) *Breakdown {
 		Inodes:       a.Inodes - b.Inodes,
 		Files:        a.Files - b.Files,
 	}
+}
+
+// deltaLayer is what a delta pull fetches of one layer: its table of
+// contents, the missing files it supplies, the ranges they take, and how
+// the layer's bytes arrive.
+type deltaLayer struct {
+	blob             string
+	size, tocBytes   int64
+	table            bool
+	missing, inline  int
+	requests         int
+	planned, fetched int64
+	reason           string
+}
+
+// tableOf is the table of contents a delta pull reads for layer l: nil
+// when the layer has none or it is unusable, with the bytes reading it
+// costs and why the layer then goes to its tar stream.
+func tableOf(ls *layerSet, l LayerRef) (*LayerTOC, int64, string) {
+	pos, ok, err := zstdchunked.Position(layerDesc(l).Annotations, l.BlobSize)
+	switch {
+	case err != nil:
+		return nil, 0, "toc-error"
+	case !ok:
+		return nil, 0, "no-toc"
+	}
+	t := ls.tocs[tocKey(l)]
+	if t == nil || t.Error != "" {
+		return nil, pos.CompressedLen, "toc-error"
+	}
+	return t, pos.CompressedLen, ""
+}
+
+// deltaPull is what delta pulls of the to images fetch into a store the
+// from images were delta-pulled into and collected, so that only their
+// layers without a usable table are saved. Each image reads every table,
+// takes each other layer from its saved layer or reads it whole, and plans
+// the files it shows and the store lacks as ranges, as the pull's own
+// planner does; a stored file no table lists comes from the first saved
+// layer listing it, read whole.
+func deltaPull(from, to []*Image, roots map[*Image]*root, cas map[*Image]*casRoot, ls *layerSet) (WirePath, []deltaLayer, error) {
+	st := newOcicfsState(from, cas, func(img *Image, j int) bool {
+		t, _, _ := tableOf(ls, img.Layers[j])
+		return t == nil
+	})
+	var w WirePath
+	var out []deltaLayer
+	for _, img := range to {
+		if held, detail := st.resolve(&w, img); held {
+			out = append(out, deltaLayer{reason: detail})
+			continue
+		}
+		r := roots[img]
+		read := map[string]bool{}
+		layers := make([]deltaLayer, len(img.Layers))
+		plan := make([]ocimat.PlanLayer, len(img.Layers))
+		var reused []int
+		for j, l := range img.Layers {
+			t, tocBytes, reason := tableOf(ls, l)
+			d := deltaLayer{blob: l.BlobDigest, size: l.BlobSize, tocBytes: tocBytes, fetched: tocBytes, reason: reason, table: t != nil}
+			if tocBytes > 0 {
+				w.TOCs++
+				w.TOCBytes += tocBytes
+			}
+			plan[j].Size = l.BlobSize
+			switch {
+			case t != nil:
+				d.reason = "ranges"
+				for _, f := range t.Files {
+					plan[j].Entries = append(plan[j].Entries, zstdchunked.Entry{Digest: digest.Digest(f.Digest), Size: f.Size, Offset: f.Offset, EndOffset: f.EndOffset})
+				}
+			case st.saved[savedKey(l)]:
+				d.reason = "saved"
+				reused = append(reused, j)
+			default:
+				st.readLayer(read, r, j)
+				d.fetched += l.BlobSize
+				w.Blobs++
+				st.saved[savedKey(l)] = true
+			}
+			layers[j] = d
+		}
+
+		var missing []rootfs.Payload
+		seen := map[string]bool{}
+		for _, s := range survivors(r) {
+			inline := s.size <= composefs.InlineContentMax
+			if seen[s.digest] || (inline && !layers[s.layer].table) || (!inline && st.objects[s.digest]) {
+				continue
+			}
+			seen[s.digest] = true
+			missing = append(missing, rootfs.Payload{Digest: digest.Digest(s.digest), Size: s.size})
+		}
+		listed, unlisted := missing, []rootfs.Payload(nil)
+		if len(reused) > 0 {
+			listed, unlisted = ocimat.SplitUnlisted(plan, missing)
+		}
+		plans, err := ocimat.PlanRanges(plan, listed)
+		if err != nil {
+			return WirePath{}, nil, fmt.Errorf("%s: %w", img.Ref, err)
+		}
+		for _, p := range missing {
+			st.objects[p.Digest.String()] = true
+		}
+		// An inline file comes from the lowest layer whose table lists it.
+		for _, p := range listed {
+			if p.Size > composefs.InlineContentMax {
+				continue
+			}
+		lowest:
+			for j := range plan {
+				for _, e := range plan[j].Entries {
+					if e.Digest == p.Digest && e.Size == p.Size {
+						layers[j].inline++
+						break lowest
+					}
+				}
+			}
+		}
+		for _, p := range unlisted {
+			for _, j := range reused {
+				if layerObjects(r.mats[j].inv)[p.Digest.String()] {
+					if layers[j].reason == "saved" {
+						layers[j].reason = "saved, read whole"
+						layers[j].fetched += img.Layers[j].BlobSize
+						w.Blobs++
+						st.readLayer(read, r, j)
+					}
+					layers[j].missing++
+					break
+				}
+			}
+		}
+		for j, p := range plans {
+			d := &layers[j]
+			d.missing += p.Files
+			d.requests = p.Requests
+			d.planned = p.Planned
+			w.Planned += p.Planned
+			if p.Files == 0 {
+				continue
+			}
+			if p.Fallback != "" {
+				d.reason = p.Fallback
+				d.fetched += d.size
+				w.Blobs++
+				w.Fallbacks++
+				continue
+			}
+			d.fetched += p.Planned
+			w.Ranges += p.Requests
+		}
+		for _, d := range layers {
+			w.Bytes += d.fetched
+		}
+		out = append(out, layers...)
+	}
+	w.Bytes += w.Metadata
+	return w, out, nil
 }

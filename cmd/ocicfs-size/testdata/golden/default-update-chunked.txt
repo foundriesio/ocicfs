@@ -1,0 +1,32 @@
+UPDATE ESTIMATE · release-n@f73453797a21 → release-n1@ae2b0c5dc46d · linux/amd64 · after cleanup: release-n1@ae2b0c5dc46d only
+- from: TESTDATA/release-n @f73453797a21
+- to:   TESTDATA/release-n1 @ae2b0c5dc46d
+
+Download (compressed bytes the device fetches):
+─────────────────────────────────────────────────────────────────────────────────────────────────────────
+Transfer path         Download  What it fetches                                       Feeds
+─────────────────────────────────────────────────────────────────────────────────────────────────────────
+containerd pull        2.8 KiB  1 of 2 layers (1 shared with release-n@f73453797a21)  every storage model
+ocicfs pull            3.9 KiB  1 of 2 layers                                         File CAS/image
+ocicfs pull --delta    5.6 KiB  changed files only: 2 TOCs + 2 ranges (+101.6%)       File CAS/image
+
+Disk usage (fs-verity on; Overlay has none):
+─────────────────────────────────────────────────────────────────────────────────────────────
+Storage model       before       needed           vs Overlay      after            vs Overlay
+─────────────────────────────────────────────────────────────────────────────────────────────
+Overlay          124.0 KiB    +28.0 KiB                    -  124.0 KiB                     -
+EROFS/layer      116.0 KiB    +36.0 KiB   +8.0 KiB (+28.6%)   116.0 KiB    -8.0 KiB (-6.5%)
+File CAS/image   288.0 KiB   +120.0 KiB  +92.0 KiB (+328.6%)  288.0 KiB  +164.0 KiB (+132.3%)
+File CAS/layer   240.0 KiB    +48.0 KiB  +20.0 KiB (+71.4%)   240.0 KiB  +116.0 KiB (+93.5%)
+
+Disk usage (fs-verity off):
+────────────────────────────────────────────────────────────────────────────────────────────
+Storage model       before       needed           vs Overlay      after           vs Overlay
+────────────────────────────────────────────────────────────────────────────────────────────
+Overlay          124.0 KiB    +28.0 KiB                    -  124.0 KiB                    -
+EROFS/layer      100.0 KiB    +28.0 KiB       +0 B (+0.0%)    100.0 KiB   -24.0 KiB (-19.4%)
+File CAS/image   232.0 KiB   +100.0 KiB  +72.0 KiB (+257.1%)  232.0 KiB  +108.0 KiB (+87.1%)
+File CAS/layer   168.0 KiB    +36.0 KiB   +8.0 KiB (+28.6%)   168.0 KiB   +44.0 KiB (+35.5%)
+
+before = from images held · needed = extra space while both are held (rollback window) · after = to images only
+ext4 · 4 KiB blocks · no compression · inline max size 64 B (File CAS/image) · writable layers, blob cache and app data excluded
