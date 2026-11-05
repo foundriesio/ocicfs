@@ -1,15 +1,16 @@
 # ocicfs
 
 An OCI-native content delivery and mount engine for IoT/Edge devices. ocicfs
-pulls standard OCI v1.1 images — fetching only the content a device does not
-already have, from **zstd:chunked** layers — and serves them from a single
-content-addressed store using **composefs + EROFS + fs-verity**, mounting a
-filesystem tree with one `mount` syscall instead of unpacking and stacking
-layers.
+pulls standard OCI v1.1 images — with `--delta`, range-fetching from
+**zstd:chunked** layers only the files a device lacks, where that pays — and
+serves them from a single content-addressed store using **composefs + EROFS + fs-verity**. A
+mount serves the image's EROFS metadata through one read-only overlay with the
+store as a data-only lower layer, instead of unpacking and stacking layers.
 
-ocicfs provides **primitives, not lifecycle policy**: `pull`, `verify`, `mount`,
+ocicfs provides **primitives, not lifecycle policy**: `pull`, `mount`,
 `unmount`, `hold`, `release`, and `gc` on the device, plus the publisher-side
-`publish` and `copy`. It does not execute containers and owns no version-management,
+`seal` and `copy`. Verification runs inside `pull` and `mount`; there is no
+standalone `verify`. It does not execute containers and owns no version-management,
 activation, rollback, or update-orchestration logic — those belong to the
 upper-layer agent that drives ocicfs. Containers run under containerd or Docker
 through [cfs-snapshotter](https://github.com/foundriesio/cfs-snapshotter), which
@@ -18,12 +19,14 @@ serves images from an ocicfs store.
 > **Status: early development.** The device-side verbs are wired end to
 > end: `pull` from an OCI registry (digest-pinned or tagged) or a local OCI
 > layout, with fail-closed verification of sealed images and, with
-> `--delta`, per-file fetch from the zstd:chunked TOC (see
-> [docs/pull.md](docs/pull.md)); read-only, writable (`--rw`), and
-> metadata-only `mount`; `unmount`, `ls`, `inspect`, `hold`/`release`,
-> `remove`, and `gc`; plus the publisher-side `seal` and `copy`, which writes
-> registry images to an archive for offline delivery. The publisher-side
-> `publish` is still to come.
+> `--delta`, per-file range fetch from the zstd:chunked TOC, falling back to
+> whole-layer reads where ranges do not pay or no TOC exists (see
+> [docs/pull.md](docs/pull.md)); read-only and metadata-only `mount` (`--rw`
+> is rejected: writable mounts are not supported); `unmount`,
+> `ls`, `inspect`, `hold`/`release`, `remove`, and `gc`; plus the
+> publisher-side `seal` and `copy`, which writes registry images to an
+> archive for offline delivery. The `publish` command is registered but
+> returns "not implemented".
 
 ## Install
 

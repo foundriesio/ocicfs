@@ -35,10 +35,11 @@ ocicfs is deliberately constrained so it can fit into existing OSS and device
 ecosystems:
 
 - Wire format is standard OCI v1.1, no new media types.
-- zstd:chunked is the wire format for the optimized network pull: its per-file
-  TOC is what makes delta-only fetch and storage-fit preflight possible. A network
-  pull relies on it; the local-directory sideload can also read plain `tar+gzip`
-  layers, forgoing those optimizations.
+- zstd:chunked is the wire format for the optimized delta pull: its per-file
+  TOC is what makes delta-only fetch and storage-fit preflight possible. A plain
+  pull, from a registry or a sideload, also reads standard gzip, zstd, and
+  uncompressed layers whole, forgoing those optimizations, and a delta pull
+  falls back to whole-layer reads where ranges do not pay.
 - Distribution uses ordinary OCI registries or OCI Image Layout for air-gapped
   transport.
 - On-disk runtime state uses a single decompressed content-addressed store,

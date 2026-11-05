@@ -145,8 +145,12 @@ stacking depth. The upper and work directories must not live on an overlayfs.
   annotation of the digest-verified identity manifest for a sealed image, the
   binding's locally recorded digest otherwise — is enforced by measuring the
   image on the very descriptor the loop device attaches, on both mount paths;
-  fs-verity is required on every backing object either way, so tampered or
-  unsealed content cannot be served. The binding itself is an untrusted,
-  regenerable index: it selects which local image object is mounted for the
-  requested identity digest, and for a sealed image it contributes nothing to
-  the trust decision.
+  fs-verity is required on every backing object either way, so a backing
+  object without fs-verity, or whose content differs from the digest the
+  image metadata records, cannot be served. The binding itself is an
+  untrusted, regenerable index: it selects which local image object is mounted
+  for the requested identity digest, and for a sealed image it contributes
+  nothing to the trust decision. For an unsealed image the enforced digest is
+  the binding's own local record, not a publisher-provided value, so a
+  coherent rewrite of binding and image object goes undetected; sealing closes
+  that gap.

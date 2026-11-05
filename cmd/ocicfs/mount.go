@@ -17,8 +17,8 @@ func newMountCommand(g *globalOptions) *cobra.Command {
 	var metadataOnly bool
 
 	cmd := &cobra.Command{
-		Use:   "mount [--rw|--metadata-only] <ref> <path>",
-		Short: "mount an image at a target path",
+		Use:   "mount [--metadata-only] <ref> <path>",
+		Short: "mount an image read-only at a target path",
 		Args:  cli.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if rw && metadataOnly {
@@ -39,7 +39,7 @@ func newMountCommand(g *globalOptions) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().BoolVar(&rw, "rw", false, "mount a writable overlay over the read-only composefs base, with the upperdir and workdir allocated under the overlay root")
+	cmd.Flags().BoolVar(&rw, "rw", false, "unsupported; use --metadata-only to build a writable overlay")
 	cmd.Flags().BoolVar(&metadataOnly, "metadata-only", false, "mount only the image's verified EROFS metadata, without file data; the caller assembles its own overlay with the store's objects/fsverity-sha256-12 view as a data-only lowerdir and verity=require")
 	return cmd
 }

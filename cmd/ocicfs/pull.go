@@ -91,7 +91,7 @@ func newPullCommand(g *globalOptions) *cobra.Command {
 
 	cmd.Flags().StringVar(&fromDir, "from-dir", "", "sideload from an OCI image layout directory instead of a registry")
 	cmd.Flags().StringVar(&fromTar, "from-tar", "", "sideload from an uncompressed OCI archive (docker save, skopeo oci-archive) instead of a registry; without <ref>, the name the archive carries is recorded")
-	cmd.Flags().BoolVar(&delta, "delta", false, "fetch only the files the store lacks from zstd:chunked layers; hold the previous release first (see docs/pull.md)")
+	cmd.Flags().BoolVar(&delta, "delta", false, "range-fetch the files the store lacks from zstd:chunked layers where that pays, otherwise read layers whole; hold the previous release first (see docs/pull.md)")
 	cmd.Flags().IntVar(&ingestWorkers, "ingest-workers", ocicfs.DefaultIngestWorkers, "layers scanned (and, from a registry, downloaded) concurrently; more than the default helps only on fast storage")
 	cli.AddFormatFlag(cmd, &format)
 	return cmd
