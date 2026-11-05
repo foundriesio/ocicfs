@@ -99,8 +99,9 @@ func tarOf(t testing.TB, entries ...tent) []byte {
 // compress them.
 type testImage struct {
 	layers    [][]byte
-	mediaType string // default plain tar
-	label     string // a config label, to vary the config alone
+	mediaType string   // default plain tar
+	layerType []string // per layer, overriding mediaType where set
+	label     string   // a config label, to vary the config alone
 }
 
 // writeLayout writes images into an OCI layout under dir and returns a
@@ -133,7 +134,11 @@ func writeLayout(t testing.TB, dir string, images ...testImage) []string {
 		}
 		var descs []ocispec.Descriptor
 		var diffIDs []digest.Digest
-		for _, raw := range img.layers {
+		for i, raw := range img.layers {
+			mt := mt
+			if i < len(img.layerType) && img.layerType[i] != "" {
+				mt = img.layerType[i]
+			}
 			descs = append(descs, put(compress(t, raw, mt), mt))
 			diffIDs = append(diffIDs, digest.FromBytes(raw))
 		}

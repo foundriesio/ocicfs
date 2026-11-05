@@ -8,8 +8,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/opencontainers/go-digest"
+	specs "github.com/opencontainers/image-spec/specs-go"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/foundriesio/ocicfs/internal/devtest"
+	"github.com/foundriesio/ocicfs/pkg/ocicfs"
 )
 
 func TestSubtractModels(t *testing.T) {
@@ -282,5 +293,281 @@ func TestUpdateUsage(t *testing.T) {
 		if code := run(context.Background(), argv, nil, &out, &errOut, newSpyOpener().open); code != 2 {
 			t.Errorf("%v: exit %d, want 2: %s", argv, code, errOut.String())
 		}
+	}
+}
+
+// blobSize is the size of a blob of the layout at dir.
+func blobSize(t *testing.T, dir, d string) int64 {
+	t.Helper()
+	fi, err := os.Stat(filepath.Join(dir, "blobs", "sha256", digest.Digest(d).Encoded()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi.Size()
+}
+
+// TestWireRollback checks the from images --rollback keeps are not
+// pulled again.
+func TestWireRollback(t *testing.T) {
+	a, b, c, d := baseLayers(t)
+	refs := writeLayout(t, t.TempDir(), testImage{layers: [][]byte{a, b, c}}, testImage{layers: [][]byte{a, b, d}})
+	plain := sizeUpdate(t, newSpyOpener().open, "--from", refs[0], "--to", refs[1]).Update.Wire
+	kept := sizeUpdate(t, newSpyOpener().open, "--rollback", "--from", refs[0], "--to", refs[1]).Update.Wire
+	if kept.Containerd != plain.Containerd || kept.Ocicfs != plain.Ocicfs || kept.Ocicfs.Held != 0 {
+		t.Errorf("rollback %+v, without %+v", kept, plain)
+	}
+	if text := runText(t, "update", "--details", "--no-cache", "--rollback", "--from", refs[0], "--to", refs[1]); strings.Contains(text, ": held:") {
+		t.Errorf("rollback pulls a kept image:\n%s", text)
+	}
+}
+
+func TestWireUnchanged(t *testing.T) {
+	a, b, c, _ := baseLayers(t)
+	refs := writeLayout(t, t.TempDir(), testImage{layers: [][]byte{a, b, c}})
+	w := sizeUpdate(t, newSpyOpener().open, "--from", refs[0], "--to", refs[0]).Update.Wire
+	if w.Containerd != (WirePath{}) {
+		t.Errorf("containerd %+v", w.Containerd)
+	}
+	if w.Ocicfs != (WirePath{Held: 1}) {
+		t.Errorf("ocicfs %+v", w.Ocicfs)
+	}
+}
+
+func TestWireConfigOnly(t *testing.T) {
+	a, b, _, _ := baseLayers(t)
+	dir := t.TempDir()
+	refs := writeLayout(t, dir, testImage{layers: [][]byte{a, b}, label: "1"}, testImage{layers: [][]byte{a, b}, label: "2"})
+	rep := sizeUpdate(t, newSpyOpener().open, "--from", refs[0], "--to", refs[1])
+	to := rep.Images[1]
+	manifest, config := blobSize(t, dir, to.ManifestDigest), blobSize(t, dir, to.ConfigDigest)
+	w := rep.Update.Wire
+	if want := (WirePath{Bytes: manifest + config, Metadata: manifest + config, Reads: 2}); w.Containerd != want {
+		t.Errorf("containerd %+v, want %+v", w.Containerd, want)
+	}
+	// Every layer is saved, so only the metadata is read: the root twice.
+	meta := 2*manifest + config
+	if want := (WirePath{Bytes: meta, Metadata: meta, Reads: 3}); w.Ocicfs != want {
+		t.Errorf("ocicfs %+v, want %+v", w.Ocicfs, want)
+	}
+}
+
+func TestWireContainerdPin(t *testing.T) {
+	a, b, _, d := baseLayers(t)
+	x := tarOf(t, file("x", strings.Repeat("x", 3000)))
+	gz := ocispec.MediaTypeImageLayerGzip
+	from := testImage{layers: [][]byte{a, b}}
+	for _, c := range []struct {
+		name  string
+		to    testImage
+		blobs int
+	}{
+		// a recompressed below the first new snapshot: the snapshot is there.
+		{"recompressed below", testImage{layers: [][]byte{a, b, d}, layerType: []string{gz}}, 1},
+		// b recompressed above it: extracted again, so its new blob is fetched.
+		{"recompressed above", testImage{layers: [][]byte{a, x, b}, layerType: []string{"", "", gz}}, 2},
+		// b unchanged above it: its blob is in the content store.
+		{"shared above", testImage{layers: [][]byte{a, x, b}}, 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			refs := writeLayout(t, t.TempDir(), from, c.to)
+			if w := sizeUpdate(t, newSpyOpener().open, "--from", refs[0], "--to", refs[1]).Update.Wire.Containerd; w.Blobs != c.blobs {
+				t.Errorf("%d blobs, want %d", w.Blobs, c.blobs)
+			}
+		})
+	}
+}
+
+func TestWireSavedLayers(t *testing.T) {
+	big := strings.Repeat("X", 5000)
+	l0 := tarOf(t, dir("./"), file("x", big))
+	l1 := tarOf(t, file("w", big))
+	gone := tarOf(t, whiteout("x"), whiteout("w"))
+	carry := tarOf(t, file("y", big))
+	gz := ocispec.MediaTypeImageLayerGzip
+	for _, c := range []struct {
+		name   string
+		from   testImage
+		to     testImage
+		blobs  []int // the to layers read whole
+		detail string
+	}{
+		// The store lost x's content with the from image, and a layer the
+		// to image reads anyway carries it again.
+		{"carried by an unsaved layer", testImage{layers: [][]byte{l0, gone}}, testImage{layers: [][]byte{l0, carry}}, []int{1}, "not saved"},
+		// No unsaved layer carries it: the first saved layer listing it is
+		// read whole, once.
+		{"recovered", testImage{layers: [][]byte{l0, l1, gone}}, testImage{layers: [][]byte{l0, l1}}, []int{0}, "recovery"},
+		// A recompressed layer has no saved layer.
+		{"recompressed", testImage{layers: [][]byte{l0}}, testImage{layers: [][]byte{l0}, layerType: []string{gz}}, []int{0}, "not saved"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			refs := writeLayout(t, dir, c.from, c.to)
+			rep := sizeUpdate(t, newSpyOpener().open, "--from", refs[0], "--to", refs[1])
+			to := rep.Images[len(rep.Images)-1]
+			var want int64
+			for _, j := range c.blobs {
+				want += blobSize(t, dir, to.Layers[j].BlobDigest)
+			}
+			w := rep.Update.Wire.Ocicfs
+			if w.Blobs != len(c.blobs) || w.Bytes-w.Metadata != want {
+				t.Errorf("%d blobs of %d bytes, want %d of %d", w.Blobs, w.Bytes-w.Metadata, len(c.blobs), want)
+			}
+			text := runText(t, "update", "--no-cache", "--details", "--from", refs[0], "--to", refs[1])
+			if !strings.Contains(text, to.Layers[c.blobs[0]].BlobDigest+": read whole · "+c.detail) {
+				t.Errorf("no %q detail line:\n%s", c.detail, text)
+			}
+		})
+	}
+}
+
+func TestWireUnsupportedReplay(t *testing.T) {
+	a, _, _, _ := baseLayers(t)
+	l1 := tarOf(t, dir("./"), file("a", strings.Repeat("a", 5000)))
+	l2 := tarOf(t, hardlink("b", "a"))
+	refs := writeLayout(t, t.TempDir(), testImage{layers: [][]byte{a}}, testImage{layers: [][]byte{l1, l2}})
+	up := sizeUpdate(t, newSpyOpener().open, "--from", refs[0], "--to", refs[1]).Update
+	if w := up.Wire; w.Containerd.Unavailable != "" || w.Containerd.Blobs != 2 || w.Ocicfs.Unavailable == "" {
+		t.Errorf("wire %+v", w)
+	}
+	if !up.Additional.CAS.On.Available || up.Additional.Overlay.Available {
+		t.Errorf("cas %+v, overlay %+v", up.Additional.CAS.On, up.Additional.Overlay)
+	}
+	text := runText(t, "update", "--no-cache", "--from", refs[0], "--to", refs[1])
+	if !strings.Contains(text, "‡ ocicfs pull unavailable: ") {
+		t.Errorf("no footnote for the ocicfs row:\n%s", text)
+	}
+}
+
+// runText runs a command and returns its text output.
+func runText(t *testing.T, argv ...string) string {
+	t.Helper()
+	argv = append([]string{argv[0], "--platform", "linux/amd64"}, argv[1:]...)
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), argv, nil, &out, &errOut, newSpyOpener().open); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	return out.String()
+}
+
+// writeIndex writes an image index of the manifests refs name into the
+// layout at dir, the first for linux/amd64 and the rest for linux/arm64,
+// and returns a reference to it.
+func writeIndex(t *testing.T, dir string, refs ...string) string {
+	t.Helper()
+	idx := ocispec.Index{Versioned: specs.Versioned{SchemaVersion: 2}, MediaType: ocispec.MediaTypeImageIndex}
+	for i, ref := range refs {
+		d := ref[strings.LastIndex(ref, "@")+1:]
+		p := &ocispec.Platform{OS: "linux", Architecture: "amd64"}
+		if i > 0 {
+			p = &ocispec.Platform{OS: "linux", Architecture: "arm64"}
+		}
+		idx.Manifests = append(idx.Manifests, ocispec.Descriptor{MediaType: ocispec.MediaTypeImageManifest, Digest: digest.Digest(d), Size: blobSize(t, dir, d), Platform: p})
+	}
+	data, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := digest.FromBytes(data)
+	if err := os.WriteFile(filepath.Join(dir, "blobs", "sha256", d.Encoded()), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir + "@" + d.String()
+}
+
+// TestWireMetadataReads checks the ocicfs row's reads against ocicfs
+// pulling the from image, collecting, and pulling the to image.
+func TestWireMetadataReads(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("the layouts are linux/amd64")
+	}
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+	a, b, c, d := baseLayers(t)
+	dir := t.TempDir()
+	m := writeLayout(t, dir, testImage{layers: [][]byte{a, b, c}}, testImage{layers: [][]byte{a, d}}, testImage{layers: [][]byte{b, d}})
+	i1 := writeIndex(t, dir, m[0], m[1])
+	i2 := writeIndex(t, dir, m[0], m[2]) // the same amd64 image under a new index
+	for _, c := range []struct {
+		name, from, to string
+		reads          int
+	}{
+		{"held pinned image", m[0], m[0], 0},
+		{"held manifest under a new index", i1, i2, 1},
+		{"index to its selected manifest", i1, m[0], 0},
+		{"unheld index", m[1], i1, 4},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			root, cleanup, err := devtest.VerityRoot()
+			if err != nil {
+				t.Skip(err)
+			}
+			defer cleanup()
+			spy := newSpyOpener()
+			e, err := ocicfs.New(ocicfs.Config{Root: root, RegistrySource: func(ctx context.Context, ref string) (ocicfs.BlobSource, digest.Digest, error) {
+				return spy.open(ctx, dir+ref[strings.LastIndex(ref, "@"):])
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pull := func(ref string) {
+				t.Helper()
+				if _, err := e.Pull(context.Background(), "example.test/app"+ref[strings.LastIndex(ref, "@"):]); err != nil {
+					if devtest.IsVerityUnsupported(err) {
+						t.Skip(err)
+					}
+					t.Fatalf("pull %s: %v", ref, err)
+				}
+			}
+			pull(c.from)
+			if _, err := e.GC(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			spy.opens = map[digest.Digest]int{}
+			pull(c.to)
+
+			rep := sizeUpdate(t, newSpyOpener().open, "--from", c.from, "--to", c.to)
+			layers := map[digest.Digest]bool{}
+			for _, img := range rep.Images {
+				for _, l := range img.Layers {
+					layers[digest.Digest(l.BlobDigest)] = true
+				}
+			}
+			var reads, blobs int
+			var bytes int64
+			for d, n := range spy.opens {
+				if layers[d] {
+					blobs += n
+				} else {
+					reads += n
+					bytes += int64(n) * blobSize(t, dir, d.String())
+				}
+			}
+			w := rep.Update.Wire.Ocicfs
+			if reads != c.reads || w.Reads != reads || w.Metadata != bytes || w.Blobs != blobs {
+				t.Errorf("ocicfs read %d metadata blobs, %d bytes, %d layers; estimated %d, %d, %d; want %d reads", reads, bytes, blobs, w.Reads, w.Metadata, w.Blobs, c.reads)
+			}
+		})
+	}
+}
+
+func TestUpdateNewIndex(t *testing.T) {
+	a, b, c, d := baseLayers(t)
+	dir := t.TempDir()
+	m := writeLayout(t, dir, testImage{layers: [][]byte{a, b, c}}, testImage{layers: [][]byte{a, d}}, testImage{layers: [][]byte{b, d}})
+	rep := sizeUpdate(t, newSpyOpener().open, "--from", writeIndex(t, dir, m[0], m[1]), "--to", writeIndex(t, dir, m[0], m[2]))
+	if len(rep.Images) != 2 || fmt.Sprint(rep.Images[0].Sets, rep.Images[1].Sets) != "[from] [to]" {
+		t.Fatalf("images %+v", rep.Images)
+	}
+	add := modelResults(rep.Update.Additional)
+	for k, m := range add {
+		if !strings.HasPrefix(k, "cas/") && (m.Total != 0 || m.Files != 0) {
+			t.Errorf("%s: +%d bytes, +%d files", k, m.Total, m.Files)
+		}
+	}
+	// One index object, and the binding the estimator keys by root.
+	if cas := add["cas/off"]; cas.OCIMeta != 4096 || cas.PayloadAlloc != 0 || cas.Units != 0 {
+		t.Errorf("cas %+v", cas.Breakdown)
 	}
 }
