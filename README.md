@@ -1,63 +1,187 @@
 # ocicfs
 
-An OCI-native content delivery and mount engine for IoT/Edge devices. ocicfs
-pulls standard OCI v1.1 images — with `--delta`, range-fetching from
-**zstd:chunked** layers only the files a device lacks, where that pays — and
-serves them from a single content-addressed store using **composefs + EROFS + fs-verity**. A
-mount serves the image's EROFS metadata through one read-only overlay with the
-store as a data-only lower layer, instead of unpacking and stacking layers.
+ocicfs pulls OCI container images and mounts them as read-only filesystems
+on any Linux host that runs containers. Each distinct file is stored once
+and shared by every image that contains it. The savings matter most on
+constrained devices with slow links and small flash storage.
 
-ocicfs provides **primitives, not lifecycle policy**: `pull`, `mount`,
-`unmount`, `hold`, `release`, and `gc` on the device, plus the publisher-side
-`seal` and `copy`. Verification runs inside `pull` and `mount`; there is no
-standalone `verify`. It does not execute containers and owns no version-management,
-activation, rollback, or update-orchestration logic — those belong to the
-upper-layer agent that drives ocicfs. Containers run under containerd or Docker
-through [cfs-snapshotter](https://github.com/foundriesio/cfs-snapshotter), which
-serves images from an ocicfs store.
+ocicfs is a CLI and a [Go library](pkg/ocicfs/engine.go) for update agents
+and container runtimes. The
+[cfs-snapshotter](https://github.com/foundriesio/cfs-snapshotter) lets
+Docker and containerd use the same store. Images remain standard OCI images.
 
-> **Status: early development.** The device-side verbs are wired end to
-> end: `pull` from an OCI registry (digest-pinned or tagged) or a local OCI
-> layout, with fail-closed verification of sealed images and, with
-> `--delta`, per-file range fetch from the zstd:chunked TOC, falling back to
-> whole-layer reads where ranges do not pay or no TOC exists (see
-> [docs/pull.md](docs/pull.md)); read-only and metadata-only `mount` (`--rw`
-> is rejected: writable mounts are not supported); `unmount`,
-> `ls`, `inspect`, `hold`/`release`, `remove`, and `gc`; plus the
-> publisher-side `seal` and `copy`, which writes registry images to an
-> archive for offline delivery. The `publish` command is registered but
-> returns "not implemented".
+Publishers can also [seal images](docs/seal.md) with `ocicfs seal`. This
+records the digest of the image's filesystem in the manifest. Pull and
+mount then reject an image whose filesystem does not match it.
 
-## Install
+## Why ocicfs?
 
-[INSTALL.md](INSTALL.md) covers the Debian package, the release archives, and
-building from source.
+A conventional container pull downloads each changed layer whole,
+decompresses it and unpacks it into its own directory. This has costs for
+any host:
 
-## Project docs
+- **Bandwidth.** Rebuilding a layer changes its digest, so an update
+  downloads the whole layer even when only a few files in it changed.
+- **Storage.** Shared layers are stored once, but a file present in two
+  different layers is stored once per layer.
+- **Time.** Every layer is decompressed and unpacked before use.
+- **Integrity.** With overlay2, the layer digests identify the archives,
+  not the unpacked files. Nothing ties the files on disk back to the
+  image, so there is no practical way to check that an image is still
+  complete and unchanged.
 
-- [Why ocicfs exists](docs/why.md): problem statement, requirements,
-  constraints, and non-goals.
-- [ADR 0001: High-level architecture](docs/adr/0001-high-level-architecture.md):
-  the accepted architecture boundary and load-bearing technical decisions.
-- [ADR 0002: Image identity](docs/adr/0002-image-identity.md): the platform
-  manifest digest as the one key for a stored image.
-- [Pulling images](docs/pull.md): registry pull and the local sideload from an
-  OCI layout directory (`--from-dir`) or an archive (`--from-tar`) written by
-  `ocicfs copy`, `docker save` or skopeo.
-- [Sealing an image](docs/seal.md): the publisher-side `ocicfs seal`, which
-  records the composefs integrity digests a pull verifies.
-- [Mounting a pulled image](docs/mount.md): read-only composefs mounts and
-  metadata-only mounts for overlay consumers.
-- [Inspecting a local image](docs/inspect.md): image identity, the composefs
-  binding, and the per-layer view.
-- [Listing and forgetting local images](docs/ls-remove.md): `ocicfs ls` and
-  `ocicfs remove`.
-- [Reclaiming store space](docs/gc.md): `ocicfs gc` and the wanted/in-use
-  model that decides what it keeps.
-- [On-disk store layout](docs/on-disk-layout.md): what a pull writes under the
-  data root.
-- [Hands-on storage walkthrough](docs/storage-walkthrough.md): build and verify
-  a composefs image with the upstream tools, by hand.
+ocicfs shares files across layers, images and releases. A layer read by an
+earlier pull is normally not read again. Optional delta pulls can download
+only missing files. Mounting uses prepared metadata and the shared file
+store, so it needs no layer unpacking.
+
+ocicfs records one digest per image that covers every file name,
+permission and content. Mount checks the stored image metadata and this
+digest before mounting. With fs-verity, the kernel also checks each file
+as it is read, so a missing or altered file cannot be served.
+
+## How it works
+
+ocicfs separates file contents from their names, ownership and permissions.
+It uses [composefs](https://github.com/composefs/composefs) to join them at
+mount time.
+
+```mermaid
+flowchart LR
+    subgraph delivery ["Delivery: ocicfs pull"]
+        source["Registry, OCI layout directory<br/>or uncompressed image archive"]
+        pull["Check digests and read layers"]
+        source --> pull
+    end
+    subgraph store ["Device store"]
+        files["Shared file contents"]
+        metadata["Per-image EROFS metadata"]
+    end
+    subgraph mounting ["Mounting: ocicfs mount"]
+        loop["EROFS metadata on a loop device"]
+        overlay["One read-only overlayfs"]
+        loop --> overlay
+    end
+    pull --> files
+    pull --> metadata
+    metadata --> loop
+    files --> overlay
+    overlay --> reader["Application or container runtime"]
+```
+
+**Pull.** ocicfs checks the manifest, config and layers against their
+digests. Plain pulls read whole layers in gzip, zstd or uncompressed form.
+They need no special layer format.
+
+With `--delta`, ocicfs fetches only missing files, using byte ranges into
+`zstd:chunked` layers (standard zstd layers that carry a per-file table of
+contents). It reads a layer whole if the layer has no table of contents or
+ranges would not save enough data.
+
+File contents are keyed by their SHA-256 digest. Names, ownership,
+permissions and file digests go into a per-image filesystem image in EROFS
+format. Files of 64 bytes or fewer are inlined there. Compressed layers are
+not kept in the store. A delta pull may keep a whole layer in a temporary
+file until the pull ends.
+
+**Mount.** ocicfs attaches the EROFS metadata to a loop device. It creates
+one read-only overlayfs with the shared store as a data-only lower layer.
+File data is read on demand. There is no daemon.
+
+**Integrity and trust.** Stored files and EROFS images can be protected by
+[fs-verity](https://docs.kernel.org/filesystems/fsverity.html). This kernel
+feature checks content against a recorded digest as it is read from disk.
+With it, the overlay is mounted with `verity=require`, so the kernel
+refuses to serve a file whose content does not match the digest in the
+metadata.
+These checks detect corruption and tampering. They do not establish who
+published an image. On a filesystem without fs-verity, the default build
+stores files without it: content is checked when it is written but not
+when it is read. See [the fs-verity mode](docs/on-disk-layout.md#the-fs-verity-mode).
+
+Publisher trust starts with a digest-pinned reference supplied by the
+caller. A publisher can also run `ocicfs seal` to push a manifest annotated
+with the expected EROFS digest. Pull and mount reject a mismatch. For an
+unsealed image, mount checks the EROFS digest recorded locally at pull.
+See [mount notes](docs/mount.md#notes).
+
+## Capabilities
+
+| Capability | Commands |
+|---|---|
+| Pull from an OCI registry by digest or tag | `pull` |
+| Import an OCI layout directory | `pull --from-dir` |
+| Import an uncompressed archive (compressed archives are refused) from `docker save`, skopeo or `ocicfs copy` | `pull --from-tar` |
+| Save registry images to an archive for offline delivery | `copy` |
+| Use file-level delta downloads | `pull --delta` |
+| Mount read-only or expose metadata for your own overlay | `mount`, `mount --metadata-only`, `unmount` |
+| Record the expected EROFS digest in a published manifest | `seal` |
+| List, inspect and remove stored images | `ls`, `inspect`, `remove` |
+| Pin an image against `remove` and `gc`, or release the pin | `hold`, `release` |
+| Reclaim content no image wants and no mount uses | `gc` |
+
+Not available today:
+
+- **Writable mounts.** `mount --rw` is rejected. Use
+  `mount --metadata-only` and add your own writable overlay.
+- **`publish`.** The command is registered but returns "not implemented".
+- **Standalone verification.** There is no `verify` command. Verification
+  runs inside `pull` and `mount`.
+
+## Quick start
+
+You need Linux 6.6 or newer, root, and `mkcomposefs` from the composefs
+tools (`pull` and `seal` only). fs-verity is optional: with it, content is
+checked on every read. To make it mandatory, build with the
+`ocicfs_verity_required` tag. See
+[the fs-verity mode](docs/on-disk-layout.md#the-fs-verity-mode) and
+[runtime requirements](INSTALL.md#runtime-requirements).
+
+To add fs-verity on a host without it, see the
+[loopback ext4 setup](docs/mount.md#optional-add-fs-verity-with-a-loop-device).
+
+```sh
+image=docker.io/library/busybox:latest
+sudo ocicfs pull "$image"
+sudo ocicfs inspect "$image"
+sudo mkdir -p /mnt/busybox
+sudo ocicfs mount "$image" /mnt/busybox
+ls /mnt/busybox
+sudo ocicfs unmount /mnt/busybox
+```
+
+The store defaults to `/var/lib/ocicfs`. Use `--root` to select another
+location. `inspect` and `mount` resolve tags from the local pull record,
+never over the network.
+
+Tags are fine for trying ocicfs. In production, pull digest-pinned
+references (`name@sha256:<digest>`). The digest is the trust anchor.
+
+## Scope and status
+
+ocicfs provides primitives, not lifecycle policy. It does not run
+containers or decide which version is active, when to update or when to
+roll back. Those decisions belong to the update agent or container runtime.
+
+[cfs-snapshotter](https://github.com/foundriesio/cfs-snapshotter) integrates
+ocicfs with containerd and Docker. It uses metadata-only mounts and adds
+the writable overlay containers need.
+
+**Status: early development.** The commands in the
+[capabilities table](#capabilities) are implemented end to end and covered
+by the repository's tests.
+
+## Documentation
+
+- **Use:** [installing](INSTALL.md), [pulling and offline import](docs/pull.md),
+  [mounting](docs/mount.md), [sealing](docs/seal.md).
+- **Manage the store:** [inspect](docs/inspect.md),
+  [list and remove](docs/ls-remove.md), [holds and gc](docs/gc.md).
+- **Understand the design:** [why ocicfs exists](docs/why.md),
+  [ADR 0001: architecture](docs/adr/0001-high-level-architecture.md),
+  [ADR 0002: image identity](docs/adr/0002-image-identity.md),
+  [on-disk store layout](docs/on-disk-layout.md),
+  [hands-on storage walkthrough](docs/storage-walkthrough.md).
 
 ## Development
 
