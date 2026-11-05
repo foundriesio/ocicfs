@@ -61,7 +61,7 @@ func newRootCommand(stdout, stderr io.Writer) (*cobra.Command, *globalOptions) {
 		Use:   "ocicfs",
 		Short: "OCI-native content delivery and mount engine for IoT/edge devices",
 		Long: "ocicfs pulls, verifies, and mounts OCI content as composefs images. It " +
-			"provides primitives — publish, seal, copy, pull, mount, unmount, inspect, ls, hold, release, remove — " +
+			"provides primitives — seal, copy, pull, mount, unmount, inspect, ls, hold, release, remove, gc — " +
 			"and leaves version management and update orchestration to the upper-layer " +
 			"agent that drives it.",
 		Version:       version.String(),
@@ -83,9 +83,9 @@ func newRootCommand(stdout, stderr io.Writer) (*cobra.Command, *globalOptions) {
 
 	pf := root.PersistentFlags()
 	pf.StringVar(&g.root, "root", defaultRoot, "ocicfs data directory")
-	pf.StringVar(&g.overlayRoot, "overlay-root", "", "base for writable-mount upperdir/workdir (default <root>/overlays)")
+	pf.StringVar(&g.overlayRoot, "overlay-root", "", "unused: writable mounts are not supported")
 	pf.BoolVarP(&g.verbose, "verbose", "v", false, "enable debug logging on stderr")
-	pf.BoolVarP(&g.quiet, "quiet", "q", false, "suppress progress and non-error logging")
+	pf.BoolVarP(&g.quiet, "quiet", "q", false, "suppress non-error logging")
 
 	root.AddCommand(
 		newPublishCommand(g),

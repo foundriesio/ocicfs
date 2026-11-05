@@ -25,12 +25,14 @@ composefs project's published guidelines, **composefs wins**. In particular:
 
 - You are an automated software engineer working on **ocicfs**: an OCI-native
   content delivery and mount engine for IoT/Edge devices. It pulls standard OCI
-  v1.1 images — fetching only missing content from `zstd:chunked` layers — and
-  serves them from a single content-addressed store using composefs + EROFS +
-  fs-verity.
+  v1.1 images — with `--delta`, range-fetching only missing files from
+  `zstd:chunked` layers where that pays — and serves them from a single content-addressed store using
+  composefs + EROFS + fs-verity.
 - **Scope discipline (load-bearing):** ocicfs provides **primitives, not lifecycle
-  policy**. The verbs are `pull`, `verify`, `mount`, `unmount`, `hold`, `release`,
-  `gc`, plus the publisher-side `publish` and `copy`. ocicfs **does not execute
+  policy**. The verbs are `pull`, `mount`, `unmount`, `hold`, `release`, `gc`,
+  plus the publisher-side `seal` and `copy`. Verification runs inside `pull` and
+  `mount` (no standalone `verify`); `publish` is registered but returns
+  `ErrNotImplemented`. ocicfs **does not execute
   containers** and owns no version-management, activation, rollback, or
   update-orchestration logic. Do **not** add
   `run`/`deploy`/`update`/`stop`/`logs`-style behavior — it is out of scope by
@@ -67,12 +69,16 @@ Run the project's standard targets; do not invent ad-hoc invocations.
   lives under `cmd/` (main packages, e.g. `cmd/ocicfs`), `internal/` (non-importable
   implementation), and `pkg/` (public API), with `docs/` for documentation.
 - **The format stack is non-negotiable.** On the wire: standard OCI v1.1, no
-  proprietary format — the optimized network pull uses **`zstd:chunked`** layers,
-  whose per-file TOC enables delta-only fetch; the local-directory sideload also
-  accepts plain OCI layers (e.g. `tar+gzip`), forgoing that optimization. On disk:
-  a *single decompressed copy* in a sha256-keyed
-  content-addressed store (CAS); the compressed wire form is never persisted; mount
-  is one `mount -t composefs` syscall. Every EROFS ocicfs builds or verifies is
+  proprietary format — the `--delta` pull uses **`zstd:chunked`** layers, whose
+  per-file TOC enables file-level range fetch; plain pulls (registry or
+  sideload) read standard gzip, zstd, and uncompressed layers whole, and a
+  delta pull falls back to whole-layer reads where ranges do not pay. On disk: a *single decompressed copy* in
+  a sha256-keyed content-addressed store (CAS); the compressed wire form is never
+  persisted (a delta pull may spool a whole blob to a store temp file for the
+  duration of the pull). A mount attaches the image's verified EROFS metadata to
+  a loop device and serves it through one read-only overlay with the store's
+  object directory as a data-only lower and `verity=require` — no per-layer
+  unpack or overlay stack. Every EROFS ocicfs builds or verifies is
   **composefs-c 1.0.8-compatible V1**.
 - **Backend abstraction:** keep storage, pull, and mount behavior behind narrow
   interfaces rather than ad-hoc calls scattered through command handlers.
@@ -86,7 +92,8 @@ Run the project's standard targets; do not invent ad-hoc invocations.
 - **Tests:** prefer table-driven tests. Place `*_test.go` next to the code under
   test.
 - **License header:** every Go source file begins with
-  `// SPDX-License-Identifier: Apache-2.0`.
+  `// Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.`
+  followed by `// SPDX-License-Identifier: Apache-2.0`.
 
 ## 5. Code complexity & size
 

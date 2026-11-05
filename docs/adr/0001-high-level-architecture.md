@@ -38,10 +38,9 @@ ocicfs owns image and filesystem materialization:
 - populate the local CAS;
 - build or verify composefs/EROFS trees;
 - mount and unmount prepared content;
-- protect content through hold/release semantics — both live (mounted or
-  prepared) content and the in-flight/partial content of a pull that has not
-  finished materializing, so an interrupted update survives retries and
-  garbage collection until the upper-layer agent commits or abandons it.
+- protect content through hold/release semantics and mount tracking, and
+  keep garbage collection out while a pull runs; an interrupted pull's objects
+  stay in the store until the next collection, and a retry reuses them.
 
 ocicfs does not own lifecycle policy:
 
@@ -56,11 +55,11 @@ ocicfs does not own lifecycle policy:
 | Decision | Rationale |
 |---|---|
 | Standard OCI wire format, no new media types | Works with existing builders, registries, scanners, and signing; the zstd:chunked layout uses standard media types, not a protocol fork. |
-| zstd:chunked for the optimized network pull | Its per-file TOC is what enables delta-only fetch, resumable transfer, and storage-fit preflight, so a network pull relies on it. Materializing an image does not require it — the local-directory sideload reads standard OCI layers, including plain `tar+gzip`, forgoing those optimizations. |
-| Single decompressed copy in a sha256-keyed CAS | The compressed wire form is never persisted or buffered whole; files decompress straight into the CAS, so flash holds one copy per digest instead of compressed-plus-extracted. |
-| composefs + EROFS + fs-verity on disk | Fast activation (one mount, no extract) and kernel-enforced runtime integrity. |
-| Per-target pull lock over a no-replace CAS | The CAS is concurrency-safe by construction; the lock only blocks duplicate work on the same target, not unrelated pulls. |
-| Progress as absolute store-reconciled bytes | ocicfs reports how much of the target is present (no progress journal); the caller frames the delta against its own baseline. |
+| zstd:chunked for the optimized network pull | Its per-file TOC is what enables delta-only fetch, resumable transfer, and storage-fit preflight, so the delta pull relies on it. Materializing an image does not require it — registry pulls and sideloads read standard OCI layers, including plain `tar+gzip`, whole, forgoing those optimizations. |
+| Single decompressed copy in a sha256-keyed CAS | The compressed wire form is never persisted; files decompress straight into the CAS, so flash holds one copy per digest instead of compressed-plus-extracted. Exception: a delta pull whose source answers the TOC range request with the whole blob spools it to a store temp file until the pull ends. |
+| composefs + EROFS + fs-verity on disk | Fast activation (the image's EROFS metadata served through one read-only overlay with the CAS as a data-only lower; no extract, no per-layer stack) and kernel-enforced runtime integrity. |
+| Shared store lock over a no-replace CAS | The CAS is concurrency-safe by construction, so pulls and mounts share the store lock and only garbage collection takes it exclusively. Concurrent pulls of the same target are safe but duplicate work. |
+| Progress as absolute store-reconciled bytes (not yet implemented) | ocicfs reports how much of the target is present (no progress journal); the caller frames the delta against its own baseline. |
 | `mkcomposefs` for v1 generation | Uses the stable, packaged composefs path (builds composefs-c 1.0.8-compatible V1 EROFS) while keeping composefs-rs adoption open. |
 | Digest-pinned verification before native trust | Keeps early phases small; the upper-layer agent supplies trust roots until native TUF/cosign lands. |
 | Go implementation | Matches the surrounding container tooling and OCI client ecosystem. |
@@ -71,10 +70,9 @@ The wire protocol stays ordinary and device-specific optimization lives in the
 client. The upper-layer agent boundary is explicit: ocicfs serves OTA systems,
 scripts, or containerd, but never decides which version is active.
 
-In return, ocicfs owns careful local state — resumable fetch, storage-fit
-preflight, CAS population, integrity verification, mount tracking, and
-garbage-collection protection (including a durable root that keeps an interrupted
-pull's partial content alive until it is committed or abandoned). These belong in
+In return, ocicfs owns careful local state — reuse of already-stored content
+on retry, storage-fit preflight, CAS population, integrity verification, mount
+tracking, and garbage-collection protection. These belong in
 ocicfs because they are part of materialization, not lifecycle policy.
 
 ## Rejected alternatives

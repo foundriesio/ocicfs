@@ -6,9 +6,10 @@
 // end and to embedders. The engine owns a local content-addressed store; it
 // holds no version-management, activation, or update-orchestration policy.
 //
-// The current surface covers the basic primitives — publish, pull, mount,
-// unmount, inspect, list, hold, release, remove, gc. The remaining primitives
-// (verify, status) are added as they are implemented.
+// The current surface covers the basic primitives — pull, mount, unmount,
+// inspect, list, hold, release, remove, gc. Verification runs inside Pull and
+// Mount. Publish is declared but returns ErrNotImplemented; the remaining
+// primitives (verify, status) are added as they are implemented.
 package ocicfs
 
 import (
@@ -240,18 +241,18 @@ func WithDelta() PullOption {
 
 // MountOptions is the resolved configuration a Mount acts on. Callers do not
 // usually build it directly: they pass the With* options to Mount, which apply
-// to a zero MountOptions. The zero value yields a read-only composefs mount; a
-// writable overlay over that base is requested when any of Writable,
-// OverlayRoot, UpperDir, or WorkDir is set.
+// to a zero MountOptions. The zero value yields a read-only composefs mount.
+// Writable mounts are not supported: Mount rejects any of Writable,
+// OverlayRoot, UpperDir, or WorkDir being set.
 type MountOptions struct {
-	// Writable stacks a writable overlay over the read-only composefs base.
+	// Writable requests a writable overlay over the read-only composefs
+	// base; Mount rejects it.
 	Writable bool
-	// OverlayRoot overrides Config.OverlayRoot for this mount: the per-mount
-	// upperdir and workdir are allocated under it. Empty falls back to the
-	// engine-wide Config.OverlayRoot.
+	// OverlayRoot names a base for a writable mount's upperdir and workdir;
+	// Mount rejects it.
 	OverlayRoot string
-	// UpperDir and WorkDir name the overlay's writable layer explicitly,
-	// bypassing allocation under any overlay root. Both must be set together.
+	// UpperDir and WorkDir name a writable overlay layer explicitly; Mount
+	// rejects them.
 	UpperDir string
 	WorkDir  string
 	// MetadataOnly mounts only the image's EROFS metadata, read-only on a
@@ -263,22 +264,18 @@ type MountOptions struct {
 }
 
 // MountOption opts a Mount into a particular behaviour. The zero set of options
-// yields a read-only composefs mount; the With* options opt into a writable
-// overlay stacked over that read-only composefs base.
+// yields a read-only composefs mount.
 type MountOption func(*MountOptions)
 
-// WithWritable stacks a writable overlay over the read-only composefs base,
-// with the upperdir and workdir allocated under the overlay root (the
-// per-mount WithOverlayRoot if given, else Config.OverlayRoot).
+// WithWritable requests a writable overlay over the read-only composefs base.
+// Writable mounts are not supported: Mount rejects this option. A caller that
+// needs a writable rootfs assembles it over a WithMetadataOnly mount.
 func WithWritable() MountOption {
 	return func(o *MountOptions) { o.Writable = true }
 }
 
-// WithOverlayRoot allocates this mount's writable upperdir and workdir under
-// dir instead of the engine-wide Config.OverlayRoot. It implies a writable
-// overlay. A caller that owns a per-mount directory (for example a snapshotter
-// keying directories to its own identity) points ocicfs at that directory and
-// lets ocicfs lay out the upperdir and workdir under it.
+// WithOverlayRoot names a base directory for a writable mount's upperdir and
+// workdir. It implies a writable overlay, so Mount rejects it.
 func WithOverlayRoot(dir string) MountOption {
 	return func(o *MountOptions) {
 		o.OverlayRoot = dir
@@ -286,9 +283,8 @@ func WithOverlayRoot(dir string) MountOption {
 	}
 }
 
-// WithUpperDir names the overlay's writable upper directory explicitly,
-// bypassing allocation under an overlay root. It implies a writable overlay and
-// must be paired with WithWorkDir.
+// WithUpperDir names a writable overlay's upper directory explicitly. It
+// implies a writable overlay, so Mount rejects it.
 func WithUpperDir(dir string) MountOption {
 	return func(o *MountOptions) {
 		o.UpperDir = dir
@@ -296,8 +292,8 @@ func WithUpperDir(dir string) MountOption {
 	}
 }
 
-// WithWorkDir names the overlay work directory explicitly; it pairs with
-// WithUpperDir and must be on the same filesystem as the upper directory.
+// WithWorkDir names a writable overlay's work directory explicitly. It
+// implies a writable overlay, so Mount rejects it.
 func WithWorkDir(dir string) MountOption {
 	return func(o *MountOptions) {
 		o.WorkDir = dir
@@ -380,11 +376,12 @@ func WithForce() RemoveOption {
 // store.
 type Engine interface {
 	// Publish builds the tree at dir into a zstd:chunked OCI image and pushes
-	// it to dest.
+	// it to dest. It is not implemented yet and returns ErrNotImplemented.
 	Publish(ctx context.Context, dir, dest string) error
-	// Pull fetches ref into the local store, transferring only content the
-	// store does not already hold, and returns the stored image. Registry
-	// resolution requires Config.RegistrySource. A registry ref may be
+	// Pull fetches ref into the local store and returns the stored image. It
+	// reuses saved layer file lists and, with WithDelta, range-fetches missing
+	// files where that pays; other layers are read whole. Registry resolution
+	// requires Config.RegistrySource. A registry ref may be
 	// digest-pinned (the digest is the trust anchor) or tagged, in which case
 	// the tag is resolved to the digest the registry currently serves and
 	// recorded only as a reference alias; a sideload ref must be digest-pinned.
@@ -397,16 +394,19 @@ type Engine interface {
 	// NewBuild starts a pull whose layers are ingested on the caller's cue. It
 	// takes the same reference and options as Pull, resolves the reference
 	// and verifies the metadata chain up front, and returns a Build to feed
-	// layers to; Pull is NewBuild followed by Finish. The store is held
-	// against gc from NewBuild until the build's Finish or Close, so gc
-	// reports ErrStoreBusy for the build's whole lifetime. Registry resolution
-	// requires Config.RegistrySource.
+	// layers to; Pull without WithDelta is NewBuild followed by Finish, and
+	// NewBuild rejects WithDelta. The store is held against gc from NewBuild
+	// until the build's Finish or Close, so gc reports ErrStoreBusy for the
+	// build's whole lifetime. Registry resolution requires
+	// Config.RegistrySource.
 	NewBuild(ctx context.Context, ref string, opts ...PullOption) (Build, error)
-	// Mount mounts ref at target: a single read-only composefs mount by
-	// default, a writable overlay over that composefs base when a writable
-	// With* option opts in, or the image's verified EROFS metadata alone with
-	// WithMetadataOnly. Mount operates on content already present in the
-	// store and does not fetch over the network; pull ref first. A ref that
+	// Mount mounts ref at target: a read-only composefs tree by default — the
+	// image's EROFS metadata served through one overlay with ObjectsDir as a
+	// data-only lower and fs-verity required — or the image's verified EROFS
+	// metadata alone with WithMetadataOnly. Writable mounts are not
+	// supported: the writable With* options are rejected. Mount operates on
+	// content already present in the store and does not fetch over the
+	// network; pull ref first. A ref that
 	// does not pin a digest resolves locally to the identity its most recent
 	// pull recorded, and a pinned index digest resolves to the manifest it
 	// offers for the host platform; every verification keys on that identity.
@@ -500,9 +500,7 @@ type Config struct {
 	// no registry: such a pull fails with ErrNoRegistry. The ocicfs CLI sets it;
 	// an embedder that feeds blobs itself leaves it nil.
 	RegistrySource func(ctx context.Context, ref string) (BlobSource, digest.Digest, error)
-	// OverlayRoot is the default base directory under which a writable mount's
-	// per-mount upperdir and workdir are allocated. Empty defaults to a
-	// directory under Root. A per-mount WithOverlayRoot overrides it.
+	// OverlayRoot is unused because writable mounts are not supported.
 	OverlayRoot string
 	// IngestWorkers is the number of layers scanned concurrently across all
 	// builds of the engine. 0 means DefaultIngestWorkers; a negative value is

@@ -40,7 +40,7 @@ fs-verity. One pull writes three kinds of object here:
   once. Files of 64 bytes or fewer are inlined into each composefs image's EROFS
   metadata (as `mkcomposefs` does) and keep no object here — a payload-bounded
   duplication accepted for upstream canonicality.
-- **The composefs image** — the EROFS image that `mount -t composefs` mounts,
+- **The composefs image** — the EROFS metadata image a mount serves,
   whose per-file redirects reference the objects by their fs-verity digest
   through the view below.
 
@@ -294,7 +294,8 @@ re-storing it. Because they are not trusted, bindings are verified on use agains
 the object store — a binding's composefs image is content-addressed there, and at
 mount its measured fs-verity digest must match the enforced value (the identity
 manifest's sealing annotation for a sealed image, the binding's recorded digest
-otherwise), so a stale or tampered binding cannot serve unverified content. Ref
+otherwise). For an unsealed image that value is the binding's own record, so
+only sealing detects a coherent rewrite of binding and image object. Ref
 records are validated when read (schema, ref key, and sha256 digests), but they
 are not content trust anchors.
 

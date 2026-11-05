@@ -94,8 +94,9 @@ for more.
   ```bash
   ./devshell.sh make test-e2e
   ```
-- Every Go source file carries the Apache-2.0 SPDX header
-  (`// SPDX-License-Identifier: Apache-2.0`).
+- Every Go source file begins with the two-line header
+  `// Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.` and
+  `// SPDX-License-Identifier: Apache-2.0`.
 
 ## Continuous integration
 
