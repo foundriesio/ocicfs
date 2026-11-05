@@ -105,18 +105,6 @@ to each release.
 
 ## First steps
 
-Pull an image from Docker Hub, mount it, look inside, unmount:
-
-```sh
-sudo ocicfs pull ubuntu          # docker.io/library/ubuntu:latest
-sudo mkdir -p /mnt/image
-sudo ocicfs mount ubuntu /mnt/image
-ls /mnt/image
-sudo ocicfs unmount /mnt/image
-```
-
-In production, pull digest-pinned references (`<image>@sha256:<digest>`) —
-the digest is the trust anchor; see [docs/pull.md](docs/pull.md). Offline,
-`ocicfs pull --from-tar app.tar` sideloads a `docker save` archive. The
-[README](README.md) has the full documentation index — pulling, mounting,
-the on-disk store layout, and garbage collection.
+Continue with the [quick start](README.md#quick-start) in the README: pull
+an image, inspect it, mount it and unmount it. The README also indexes the
+rest of the documentation.
