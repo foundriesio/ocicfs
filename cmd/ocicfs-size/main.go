@@ -44,8 +44,10 @@ const (
 	inlineBeyondCap = "inline above 5000 B assumes a writer beyond composefs-c 1.0.8's limit; sized with EROFS flat-inline layout"
 )
 
-// options are the images command's flags.
+// options are the commands' flags.
 type options struct {
+	from, to     []string
+	rollback     bool
 	platform     string
 	fs           string
 	hostMetadata string
@@ -90,17 +92,38 @@ func run(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.
 			return runImages(cmd.Context(), args, o, stdin, stdout, open)
 		},
 	}
-	f := images.Flags()
-	f.StringVar(&o.platform, "platform", "", "platform to size, os/arch[/variant] (default linux/"+runtime.GOARCH+")")
-	f.StringVar(&o.fs, "fs", "ext4", "host filesystem profile (only ext4)")
-	f.StringVar(&o.hostMetadata, "host-metadata", "include", "count host directories and small files: include or exclude")
-	f.Int64Var(&o.inlineMax, "inline-max", composefs.InlineContentMax, fmt.Sprintf("largest regular file, in bytes, File CAS/image stores inline instead of as an object (%d-%d)", minInlineMax, maxInlineMax))
-	f.StringVar(&o.cacheDir, "cache-dir", "", "layer inventory cache (default $XDG_CACHE_HOME/ocicfs-size)")
-	f.BoolVar(&o.noCache, "no-cache", false, "neither read nor write the cache")
-	f.BoolVar(&o.details, "details", false, "add the storage projection, assumptions and analyzer diagnostics")
-	f.BoolVar(&o.json, "json", false, "write the full report as JSON")
-	f.BoolVarP(&o.verbose, "verbose", "v", false, "enable debug logging on stderr")
+	sizeFlags := func(c *cobra.Command) {
+		f := c.Flags()
+		f.StringVar(&o.platform, "platform", "", "platform to size, os/arch[/variant] (default linux/"+runtime.GOARCH+")")
+		f.StringVar(&o.fs, "fs", "ext4", "host filesystem profile (only ext4)")
+		f.StringVar(&o.hostMetadata, "host-metadata", "include", "count host directories and small files: include or exclude")
+		f.Int64Var(&o.inlineMax, "inline-max", composefs.InlineContentMax, fmt.Sprintf("largest regular file, in bytes, File CAS/image stores inline instead of as an object (%d-%d)", minInlineMax, maxInlineMax))
+		f.StringVar(&o.cacheDir, "cache-dir", "", "layer inventory cache (default $XDG_CACHE_HOME/ocicfs-size)")
+		f.BoolVar(&o.noCache, "no-cache", false, "neither read nor write the cache")
+		f.BoolVar(&o.details, "details", false, "add the storage projection, assumptions and analyzer diagnostics")
+		f.BoolVar(&o.json, "json", false, "write the full report as JSON")
+		f.BoolVarP(&o.verbose, "verbose", "v", false, "enable debug logging on stderr")
+	}
+	sizeFlags(images)
 	root.AddCommand(images)
+
+	update := &cobra.Command{
+		Use:   "update --from REF|@FILE... --to REF|@FILE...",
+		Short: "Estimate the download and the storage an update from one image set to another takes",
+		Long: "Estimate what an update from the --from images to the --to images downloads by each " +
+			"transfer path, and the storage it takes before, while both sets are held and after cleanup. " +
+			"--from and --to repeat or take a comma-separated list; @FILE reads one reference per line (@- reads stdin).",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			slog.SetDefault(cli.NewLogger(stderr, o.verbose, false))
+			return runUpdate(cmd.Context(), o, stdin, stdout, open)
+		},
+	}
+	update.Flags().StringSliceVar(&o.from, "from", nil, "images the device holds before the update (repeatable, comma-separated)")
+	update.Flags().StringSliceVar(&o.to, "to", nil, "images the device holds after the update (repeatable, comma-separated)")
+	update.Flags().BoolVar(&o.rollback, "rollback", false, "keep the from images after cleanup, as a rollback target")
+	sizeFlags(update)
+	root.AddCommand(update)
 
 	if len(argv) == 0 {
 		root.SetOut(stderr)
@@ -115,74 +138,112 @@ func run(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.
 
 // runImages sizes the images args name.
 func runImages(ctx context.Context, args []string, o options, stdin io.Reader, stdout io.Writer, open opener) error {
-	s, err := settings(o)
+	s, platform, cacheDir, err := runSettings(o)
 	if err != nil {
 		return err
-	}
-	platform, err := ocilayout.ParsePlatform(s.Platform)
-	if err != nil {
-		return &cli.UsageError{Err: err}
 	}
 	refs, err := readRefs(args, stdin)
 	if err != nil {
 		return err
 	}
-	cacheDir := ""
-	if !o.noCache {
-		if cacheDir = o.cacheDir; cacheDir == "" {
-			if cacheDir, err = defaultCacheDir(); err != nil {
-				return err
-			}
-		}
-	}
-	metaDir := ""
-	if cacheDir != "" {
-		metaDir = filepath.Join(cacheDir, "manifests", "sha256")
-	}
-	sp, err := newSpool(metaDir)
+	sp, err := newSpool(metaDir(cacheDir))
 	if err != nil {
 		return err
 	}
 	defer sp.close()
 
-	imgs, ls, err := loadImages(ctx, open, sp, cacheDir, refs, platform)
+	ls := newLayerSet(cacheDir)
+	imgs, err := loadImages(ctx, open, sp, ls, refs, platform, manifestKey, map[string]*Image{})
 	if err != nil {
 		return err
 	}
 	rep := buildReport(ctx, imgs, ls, s)
+	return writeReport(stdout, rep, sp, o)
+}
+
+// runSettings turns the flags into the models' profile, the platform to
+// resolve and the cache directory, "" when nothing is cached.
+func runSettings(o options) (Settings, ocispec.Platform, string, error) {
+	s, err := settings(o)
+	if err != nil {
+		return s, ocispec.Platform{}, "", err
+	}
+	platform, err := ocilayout.ParsePlatform(s.Platform)
+	if err != nil {
+		return s, platform, "", &cli.UsageError{Err: err}
+	}
+	if o.noCache {
+		return s, platform, "", nil
+	}
+	if o.cacheDir != "" {
+		return s, platform, o.cacheDir, nil
+	}
+	dir, err := defaultCacheDir()
+	return s, platform, dir, err
+}
+
+// metaDir is where manifests, configs and indexes are kept across runs, ""
+// when nothing is cached.
+func metaDir(cacheDir string) string {
+	if cacheDir == "" {
+		return ""
+	}
+	return filepath.Join(cacheDir, "manifests", "sha256")
+}
+
+// writeReport adds what the spool fetched to the report and writes it.
+func writeReport(w io.Writer, rep *Report, sp *spool, o options) error {
 	for _, n := range sp.fetched {
 		rep.Analyzer.BytesFetched += n
 	}
 	rep.Analyzer.BlobsFetched = len(sp.fetched)
 	if o.json {
-		return writeJSON(stdout, rep)
+		return writeJSON(w, rep)
 	}
-	return writeText(stdout, rep, o.details)
+	return writeText(w, rep, o.details)
+}
+
+// manifestKey identifies an image by its platform manifest, rootKey by the
+// blob its reference names: the index, or the manifest when there is none.
+func manifestKey(img *Image) string { return img.ManifestDigest }
+
+func rootKey(img *Image) string {
+	if img.IndexDigest != "" {
+		return img.IndexDigest
+	}
+	return img.ManifestDigest
 }
 
 // loadImages resolves every reference and loads each distinct layer once.
-// An image named twice, by the same or another reference, is kept once.
-func loadImages(ctx context.Context, open opener, sp *spool, cacheDir string, refs []string, platform ocispec.Platform) ([]*Image, *layerSet, error) {
-	ls := newLayerSet(cacheDir)
+// Images with the same key are one image, kept once in first-named order;
+// known holds the images earlier calls loaded, by key, and gains the new
+// ones, so an image two calls name is the same *Image in both results.
+func loadImages(ctx context.Context, open opener, sp *spool, ls *layerSet, refs []string, platform ocispec.Platform, key func(*Image) string, known map[string]*Image) ([]*Image, error) {
 	seen := map[string]bool{}
 	var imgs []*Image
 	for _, ref := range refs {
 		img, src, err := resolveImage(ctx, open, sp, ref, platform)
 		if err != nil {
-			return nil, nil, fmt.Errorf("%s: %w", ref, err)
+			return nil, fmt.Errorf("%s: %w", ref, err)
 		}
-		if seen[img.ManifestDigest] {
+		k := key(img)
+		if seen[k] {
 			continue
 		}
-		seen[img.ManifestDigest] = true
+		seen[k] = true
+		if old, ok := known[k]; ok {
+			imgs = append(imgs, old)
+			continue
+		}
+		known[k] = img
 		for _, l := range img.Layers {
 			if err := ls.load(ctx, src, l); err != nil {
-				return nil, nil, fmt.Errorf("%s: %w", ref, err)
+				return nil, fmt.Errorf("%s: %w", ref, err)
 			}
 		}
 		imgs = append(imgs, img)
 	}
-	return imgs, ls, nil
+	return imgs, nil
 }
 
 // settings turns the flags into the models' profile.

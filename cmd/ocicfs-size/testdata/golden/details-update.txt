@@ -1,0 +1,130 @@
+UPDATE ESTIMATE · LAYOUT@c45af63c1708 → LAYOUT@a5ec690885e2 · linux/amd64 · after cleanup: LAYOUT@a5ec690885e2 only
+- from: LAYOUT @c45af63c1708
+- to:   LAYOUT @a5ec690885e2
+
+Disk usage (fs-verity on; Overlay has none):
+─────────────────────────────────────────────────────────────────────────────────────────────
+Storage model       before       needed           vs Overlay      after            vs Overlay
+─────────────────────────────────────────────────────────────────────────────────────────────
+Overlay          104.0 KiB    +20.0 KiB                    -  100.0 KiB                     -
+EROFS/layer      124.0 KiB    +32.0 KiB  +12.0 KiB (+60.0%)   124.0 KiB   +24.0 KiB (+24.0%)
+File CAS/image   224.0 KiB   +108.0 KiB  +88.0 KiB (+440.0%)  224.0 KiB  +124.0 KiB (+124.0%)
+File CAS/layer   180.0 KiB    +44.0 KiB  +24.0 KiB (+120.0%)  180.0 KiB   +80.0 KiB (+80.0%)
+
+Disk usage (fs-verity off):
+──────────────────────────────────────────────────────────────────────────────────────────
+Storage model       before      needed           vs Overlay      after          vs Overlay
+──────────────────────────────────────────────────────────────────────────────────────────
+Overlay          104.0 KiB   +20.0 KiB                    -  100.0 KiB                   -
+EROFS/layer      100.0 KiB   +24.0 KiB   +4.0 KiB (+20.0%)   100.0 KiB       +0 B (+0.0%)
+File CAS/image   180.0 KiB   +84.0 KiB  +64.0 KiB (+320.0%)  180.0 KiB  +80.0 KiB (+80.0%)
+File CAS/layer   136.0 KiB   +32.0 KiB  +12.0 KiB (+60.0%)   136.0 KiB  +36.0 KiB (+36.0%)
+
+before = from images held · needed = extra space while both are held (rollback window) · after = to images only
+ext4 · 4 KiB blocks · no compression · inline max size 64 B (File CAS/image) · writable layers, blob cache and app data excluded
+
+OCI layers:       3 → 3 references · 4 unique blobs · 2 shared
+Compressed size:  546 B → 515 B
+
+STORAGE PROJECTION · modelled allocation per store, not paths
+█ allocation without fs-verity · ▒ fs-verity increment
+1 cell ≈ 0.0 MiB (40 cells = largest total)
+
+┌─ Overlay · 0.1 MiB ──────────────────────────────────────────────────┐
+│ 4 upper directories, one per snapshot                                │
+│ ███████████████                                              0.1 MiB │
+│ file payload 0.1 MiB (of which padding 0.0 MiB)                      │
+│ host 0.1 MiB · 12 inodes                                             │
+│ unused versions 0 (0.0 MiB allocated, kept)                          │
+│ reuse: snapshots shared between images 2 of 6 (0.0 MiB)              │
+│   hardlinked contents 0 (0.0 MiB named more than once)               │
+│   duplicated contents: none                                          │
+│ → overlayfs mount over the snapshot chain; no stored rootfs copy     │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ EROFS/layer · 0.2 MiB with fs-verity ───────────────────────────────┐
+│ 4 layer.erofs images, one per snapshot                               │
+│ ███████████████▒▒▒▒                                          0.2 MiB │
+│ without fs-verity 0.1 MiB · fs-verity +0.0 MiB                       │
+│ file payload 0.1 MiB · image layout 0.0 MiB · host 0.1 MiB           │
+│ unused versions 0 (0.0 MiB allocated, kept)                          │
+│ reuse: snapshots shared between images 2 of 6 (0.0 MiB)              │
+│   hardlinked contents 0 (0.0 MiB named more than once)               │
+│   duplicated contents: none                                          │
+│ → overlayfs over per-layer EROFS mounts; no stored rootfs copy       │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ File CAS/image · 0.3 MiB with fs-verity ────────────────────────────┐
+│ 2 composefs images (0.0 MiB) · 5 shared objects (0.1 MiB)            │
+│ ████████████████████████████████▒▒▒▒▒▒▒▒                     0.3 MiB │
+│ without fs-verity 0.3 MiB                                            │
+│ fs-verity +0.1 MiB · OCI metadata 0.0 MiB · host 0.2 MiB             │
+│ inline content 0.0 MiB, inside the composefs images                  │
+│ reuse: rootfs images shared between images 0 of 2 (0.0 MiB)          │
+│   contents used more than once 3 (0.0 MiB of extra uses)             │
+│   duplicated inline contents: none                                   │
+│ → composefs mount: metadata image + objects; no stored rootfs copy   │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ File CAS/layer · 0.2 MiB with fs-verity ────────────────────────────┐
+│ 4 layer metadata images (0.0 MiB) · 6 objects (0.1 MiB)              │
+│ ████████████████████▒▒▒▒▒▒▒                                  0.2 MiB │
+│ without fs-verity 0.2 MiB (not a valid configuration)                │
+│ fs-verity +0.1 MiB · host 0.1 MiB · unused versions 0 (0.0 MiB       │
+│   allocated, kept)                                                   │
+│ reuse: snapshots shared between images 2 of 6 (0.0 MiB)              │
+│   objects used more than once 0 (0.0 MiB of extra uses)              │
+│   duplicated contents: none                                          │
+│ → one flat overlay: layer metadata + objects as data-only lower      │
+└──────────────────────────────────────────────────────────────────────┘
+
+Reuse is logical bytes, before block rounding and fs-verity. Every name of a
+content is a use; hardlinked names share one stored copy. Snapshot and
+file-level reuse overlap and are never added.
+Unused = invisible in every retained final rootfs; counted in disk usage,
+not necessarily reclaimable.
+
+Notes:
+  - 4 layers · 4 snapshots
+  - EROFS 4 KiB blocks
+  - File CAS inline: image ≤64 B · layer 0 B (fixed)
+  - File CAS/layer: prototype on containerd v2.4+ (9b17276ec), not a release; 'off' is not a valid configuration of the prototype (requires verity=require)
+  - after cleanup; writable layers and application data excluded
+
+Assumptions:
+  - estimates after cleanup: every retained snapshot, object and image is kept and nothing else
+  - metadata sizes are modelled from the writers' layout rules, not measured
+  - ext4: 4 KiB blocks, 256-byte inodes, metadata_csum, no inline_data or ea_inode; contiguous allocation
+  - ext4: hashed directories assumed 75% full; an inode's xattrs sit all in the inode or all in one shared block
+  - sparse files are counted dense
+  - File CAS/image: composefs images are told apart by their dump, so images that differ only in fields mkcomposefs normalises are counted twice
+  - File CAS/image: fs-verity view names are spread over shards like content digests
+  - File CAS/layer: inline threshold 0 (layer metadata cannot inline file data) and sealed objects, as the prototype does; it mounts with verity=require, so fs-verity off is not a configuration it runs
+
+Exclusions:
+  - OCI content cache (compressed blobs) of containerd
+  - containerd metadata.db
+  - writable container layers and application data
+  - ocicfs saved-layer scan records
+  - extraction workspace and garbage-collection delay
+
+Pins:
+  - containerd v2.4.2, default configuration
+  - erofs-utils v1.9.4 (EROFS/layer: mkfs.erofs --tar=f --aufs -Enoinline_data -b4096)
+  - File CAS/layer prototype ce384325d (mkfs.erofs --tar=headerball --aufs -b4096)
+  - composefs-c 1.0.8 (mkcomposefs --min-version=1 --max-version=1)
+  - ocicfs v1.0.0 (0123abc)
+
+Estimator versions:
+  - cas: 1
+  - erofs: 1
+  - ext4: 1
+  - layercas: 1
+  - overlay: 1
+  - verity: 1
+
+Images:
+  - LAYOUT@sha256:c45af63c170894ded71a9831a955cd96e4e36d9910a5d55a234658fd8f30ca6d: manifest sha256:c45af63c170894ded71a9831a955cd96e4e36d9910a5d55a234658fd8f30ca6d, composefs image sha256:7d8296f3a9150d0166e8c7977eae8cbde10bd6ebdb4e1f790d8174c83ce4fd6e, canonical true
+  - LAYOUT@sha256:a5ec690885e2c4d2a2caa2021f39f642a05969a6d40c5a216302645b5179e141: manifest sha256:a5ec690885e2c4d2a2caa2021f39f642a05969a6d40c5a216302645b5179e141, composefs image sha256:498c20f6a9967a8d75e3db12d751dc15f630ae65eedce9de4e41db0b2709bd88, canonical true
+
+analyzer: fetched 0.0 MiB (8 blobs); 0 cache hits; 4 layer scans, 4 ocicfs scans

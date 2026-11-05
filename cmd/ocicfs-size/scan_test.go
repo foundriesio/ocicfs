@@ -210,7 +210,8 @@ func TestLoadImagesReadsEachLayerOnce(t *testing.T) {
 		}
 		defer sp.close()
 		spy := newSpyOpener()
-		_, ls, err := loadImages(context.Background(), spy.open, sp, cache, refs, platform)
+		ls := newLayerSet(cache)
+		_, err = loadImages(context.Background(), spy.open, sp, ls, refs, platform, manifestKey, map[string]*Image{})
 		if err != nil {
 			t.Fatal(err)
 		}

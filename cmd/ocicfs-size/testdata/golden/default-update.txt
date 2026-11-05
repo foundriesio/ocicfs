@@ -1,0 +1,24 @@
+UPDATE ESTIMATE · LAYOUT@c45af63c1708 → LAYOUT@a5ec690885e2 · linux/amd64 · after cleanup: LAYOUT@a5ec690885e2 only
+- from: LAYOUT @c45af63c1708
+- to:   LAYOUT @a5ec690885e2
+
+Disk usage (fs-verity on; Overlay has none):
+─────────────────────────────────────────────────────────────────────────────────────────────
+Storage model       before       needed           vs Overlay      after            vs Overlay
+─────────────────────────────────────────────────────────────────────────────────────────────
+Overlay          104.0 KiB    +20.0 KiB                    -  100.0 KiB                     -
+EROFS/layer      124.0 KiB    +32.0 KiB  +12.0 KiB (+60.0%)   124.0 KiB   +24.0 KiB (+24.0%)
+File CAS/image   224.0 KiB   +108.0 KiB  +88.0 KiB (+440.0%)  224.0 KiB  +124.0 KiB (+124.0%)
+File CAS/layer   180.0 KiB    +44.0 KiB  +24.0 KiB (+120.0%)  180.0 KiB   +80.0 KiB (+80.0%)
+
+Disk usage (fs-verity off):
+──────────────────────────────────────────────────────────────────────────────────────────
+Storage model       before      needed           vs Overlay      after          vs Overlay
+──────────────────────────────────────────────────────────────────────────────────────────
+Overlay          104.0 KiB   +20.0 KiB                    -  100.0 KiB                   -
+EROFS/layer      100.0 KiB   +24.0 KiB   +4.0 KiB (+20.0%)   100.0 KiB       +0 B (+0.0%)
+File CAS/image   180.0 KiB   +84.0 KiB  +64.0 KiB (+320.0%)  180.0 KiB  +80.0 KiB (+80.0%)
+File CAS/layer   136.0 KiB   +32.0 KiB  +12.0 KiB (+60.0%)   136.0 KiB  +36.0 KiB (+36.0%)
+
+before = from images held · needed = extra space while both are held (rollback window) · after = to images only
+ext4 · 4 KiB blocks · no compression · inline max size 64 B (File CAS/image) · writable layers, blob cache and app data excluded

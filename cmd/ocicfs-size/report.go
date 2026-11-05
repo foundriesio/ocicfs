@@ -26,6 +26,7 @@ type Report struct {
 	Assumptions       []string          `json:"assumptions"`
 	Exclusions        []string          `json:"exclusions"`
 	Unsupported       []string          `json:"unsupported,omitempty"`
+	Update            *UpdateReport     `json:"update,omitempty"`
 }
 
 // Settings are the inputs every model shares.
@@ -42,8 +43,9 @@ type Settings struct {
 // build for it.
 type ImageReport struct {
 	*Image
-	CASImage  string `json:"casImage,omitempty"` // sha256 of the composefs dump
-	Canonical *bool  `json:"canonical,omitempty"`
+	CASImage  string   `json:"casImage,omitempty"` // sha256 of the composefs dump
+	Canonical *bool    `json:"canonical,omitempty"`
+	Sets      []string `json:"sets,omitempty"` // of an update: "from", "to" or both
 }
 
 // LayerReport is one distinct layer of the retained images.
@@ -91,7 +93,7 @@ type Analyzer struct {
 }
 
 const (
-	reportSchema    = 1
+	reportSchema    = 2
 	layerCASBasis   = "prototype on containerd v2.4+ (9b17276ec)"
 	invalidLayerCAS = "not a valid configuration of the prototype (requires verity=require)"
 )
@@ -99,8 +101,17 @@ const (
 // buildReport replays every image, runs the four models over the set and
 // collects the report.
 func buildReport(ctx context.Context, imgs []*Image, ls *layerSet, s Settings) *Report {
-	p := s.Profile
-	rep := &Report{
+	rep, roots, cas, casErr := prepareReport(ctx, imgs, ls, s)
+	rep.Models = setModels(roots, cas, casErr, s.Profile)
+	return rep
+}
+
+// prepareReport starts the report of imgs and prepares them for the
+// models: each image replayed, and merged as ocicfs merges it, both indexed
+// as imgs. casErr is why ocicfs rejects the first image it rejects, and cas
+// is nil for such an image.
+func prepareReport(ctx context.Context, imgs []*Image, ls *layerSet, s Settings) (rep *Report, roots []*root, cas []*casRoot, casErr string) {
+	rep = &Report{
 		Schema:      reportSchema,
 		Tool:        "ocicfs-size",
 		ToolVersion: version.String(),
@@ -125,7 +136,6 @@ func buildReport(ctx context.Context, imgs []*Image, ls *layerSet, s Settings) *
 	}
 
 	mats := map[string]*matLayer{}
-	var roots []*root
 	for _, img := range imgs {
 		r := &root{img: img}
 		for _, l := range img.Layers {
@@ -148,6 +158,30 @@ func buildReport(ctx context.Context, imgs []*Image, ls *layerSet, s Settings) *
 		roots = append(roots, r)
 	}
 
+	for _, img := range imgs {
+		ir := ImageReport{Image: img}
+		cr, err := prepareCASRoot(ctx, ls, img, s.Profile.InlineMax)
+		if err != nil {
+			if casErr == "" {
+				casErr = "rejected by ocicfs: " + img.Ref + ": " + err.Error()
+			}
+		} else {
+			ir.CASImage = "sha256:" + cr.id
+			ir.Canonical = &cr.canonical
+		}
+		cas = append(cas, cr)
+		rep.Images = append(rep.Images, ir)
+	}
+	if casErr != "" {
+		rep.Unsupported = append(rep.Unsupported, casErr)
+	}
+	rep.Analyzer = Analyzer{CacheHits: ls.invHits + ls.recordHits, LayerScans: ls.scans, OcicfsScans: ls.ocicfsScans}
+	return rep, roots, cas, casErr
+}
+
+// setModels runs the four models over one set of prepared images. File
+// CAS/image is unavailable for casErr when it is not "".
+func setModels(roots []*root, cas []*casRoot, casErr string, p Profile) Models {
 	result := func(b *Breakdown, why string) *ModelResult {
 		if b == nil {
 			return &ModelResult{Reason: why}
@@ -159,36 +193,18 @@ func buildReport(ctx context.Context, imgs []*Image, ls *layerSet, s Settings) *
 	pair := func(f func([]*root, Profile) (*Breakdown, string)) *ModelPair {
 		return &ModelPair{Off: result(f(roots, off)), On: result(f(roots, on))}
 	}
-	rep.Models.Overlay = result(overlaySize(roots, off))
-	rep.Models.EROFS = pair(erofsSize)
-	rep.Models.LayerCAS = pair(layerCasSize)
-	rep.Models.LayerCAS.Provisional, rep.Models.LayerCAS.Basis = true, layerCASBasis
-	rep.Models.LayerCAS.Off.Note = invalidLayerCAS
-
-	var casRoots []*casRoot
-	var casErr string
-	for _, img := range imgs {
-		ir := ImageReport{Image: img}
-		cr, err := prepareCASRoot(ctx, ls, img, p.InlineMax)
-		if err != nil {
-			if casErr == "" {
-				casErr = "rejected by ocicfs: " + img.Ref + ": " + err.Error()
-			}
-		} else {
-			casRoots = append(casRoots, cr)
-			ir.CASImage = "sha256:" + cr.id
-			ir.Canonical = &cr.canonical
-		}
-		rep.Images = append(rep.Images, ir)
-	}
+	var ms Models
+	ms.Overlay = result(overlaySize(roots, off))
+	ms.EROFS = pair(erofsSize)
+	ms.LayerCAS = pair(layerCasSize)
+	ms.LayerCAS.Provisional, ms.LayerCAS.Basis = true, layerCASBasis
+	ms.LayerCAS.Off.Note = invalidLayerCAS
 	if casErr != "" {
-		rep.Models.CAS = &ModelPair{Off: &ModelResult{Reason: casErr}, On: &ModelResult{Reason: casErr}}
-		rep.Unsupported = append(rep.Unsupported, casErr)
+		ms.CAS = &ModelPair{Off: &ModelResult{Reason: casErr}, On: &ModelResult{Reason: casErr}}
 	} else {
-		rep.Models.CAS = &ModelPair{Off: result(casSize(casRoots, off), ""), On: result(casSize(casRoots, on), "")}
+		ms.CAS = &ModelPair{Off: result(casSize(cas, off), ""), On: result(casSize(cas, on), "")}
 	}
-	rep.Analyzer = Analyzer{CacheHits: ls.invHits + ls.recordHits, LayerScans: ls.scans, OcicfsScans: ls.ocicfsScans}
-	return rep
+	return ms
 }
 
 func assumptions(s Settings) []string {
