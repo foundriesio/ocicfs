@@ -258,8 +258,9 @@ type MountOptions struct {
 	// MetadataOnly mounts only the image's EROFS metadata, read-only on a
 	// loop device, without the object data plane a composefs mount attaches.
 	// The caller assembles its own single overlay over the mount with
-	// ObjectsDir as a data-only lower, passing verity=require so fs-verity
-	// stays enforced. It cannot be combined with the writable options.
+	// ObjectsDir as a data-only lower, passing verity=require when
+	// VerityRequired reports true so fs-verity stays enforced, and no verity
+	// option otherwise. It cannot be combined with the writable options.
 	MetadataOnly bool
 }
 
@@ -402,11 +403,11 @@ type Engine interface {
 	NewBuild(ctx context.Context, ref string, opts ...PullOption) (Build, error)
 	// Mount mounts ref at target: a read-only composefs tree by default — the
 	// image's EROFS metadata served through one overlay with ObjectsDir as a
-	// data-only lower and fs-verity required — or the image's verified EROFS
-	// metadata alone with WithMetadataOnly. Writable mounts are not
-	// supported: the writable With* options are rejected. Mount operates on
-	// content already present in the store and does not fetch over the
-	// network; pull ref first. A ref that
+	// data-only lower and fs-verity required unless this build runs the
+	// store in off mode — or the image's verified EROFS metadata alone with
+	// WithMetadataOnly. Writable mounts are not supported: the writable With*
+	// options are rejected. Mount operates on content already present in the
+	// store and does not fetch over the network; pull ref first. A ref that
 	// does not pin a digest resolves locally to the identity its most recent
 	// pull recorded, and a pinned index digest resolves to the manifest it
 	// offers for the host platform; every verification keys on that identity.

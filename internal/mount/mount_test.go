@@ -59,10 +59,17 @@ func TestReadOnlyRejectsInvalidSpec(t *testing.T) {
 // object, and the source name mounts are identified by — so a refactor
 // dropping any of them fails here.
 func TestOverlayOptionsPinTrustPosture(t *testing.T) {
-	got := overlayOptions("/run/ocicfs/mount-1", "/objects")
+	got := overlayOptions("/run/ocicfs/mount-1", "/objects", false)
 	want := "lowerdir=/run/ocicfs/mount-1::/objects,redirect_dir=on,metacopy=on,verity=require"
 	if got != want {
 		t.Fatalf("options = %q, want %q", got, want)
+	}
+	// A store without fs-verity requests no validation at all: verity=on
+	// would fail every redirected object, whose metacopy names a digest.
+	got = overlayOptions("/run/ocicfs/mount-1", "/objects", true)
+	want = "lowerdir=/run/ocicfs/mount-1::/objects,redirect_dir=on,metacopy=on"
+	if got != want {
+		t.Fatalf("options without fs-verity = %q, want %q", got, want)
 	}
 	if overlaySource != "composefs" {
 		t.Fatalf("overlay source = %q, want %q", overlaySource, "composefs")

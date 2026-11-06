@@ -117,12 +117,20 @@ func (e *engine) mount(ctx context.Context, ref, target string, opts ...MountOpt
 	if err != nil {
 		return err
 	}
+	required, err := e.VerityRequired()
+	if err != nil {
+		return err
+	}
+	if !required {
+		slog.Debug("ocicfs: mounting without fs-verity", "ref", ref, "target", target)
+	}
 
 	spec := mount.Spec{
 		ImagePath:      imagePath,
 		Basedir:        filepath.Join(e.root, b.ObjectStorePath),
 		Target:         target,
 		FsverityDigest: expected,
+		NoVerity:       !required,
 	}
 	if cfg.MetadataOnly {
 		return mount.MetadataOnly(ctx, spec)

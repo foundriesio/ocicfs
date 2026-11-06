@@ -1,7 +1,7 @@
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: Apache-2.0
 
-//go:build !ocicfs_verity_required
+//go:build !ocicfs_verity_required && !ocicfs_verity_off
 
 package verity
 
