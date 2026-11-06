@@ -49,6 +49,9 @@ func newVerityStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	// Required mode whatever the build mode; tests of other modes set their
+	// own.
+	s.mode = verity.ModeRequired
 	return s
 }
 
@@ -62,6 +65,13 @@ func writeObject(t *testing.T, s *Store, ctx context.Context, r io.Reader) (dige
 	}
 	fsv, err := sealed()
 	return d, fsv, err
+}
+
+// viewName returns the view-relative name ("ab/cdef...") of the object whose
+// fs-verity digest is fsv ("sha256:<hex>").
+func viewName(fsv string) string {
+	hex := strings.TrimPrefix(fsv, "sha256:")
+	return hex[:2] + "/" + hex[2:]
 }
 
 // skipIfNoVerity skips the test when err reports that the test filesystem does
@@ -88,7 +98,7 @@ func TestWriteObjectRoundTrip(t *testing.T) {
 	}
 	// WriteObject returns the measured fs-verity digest; it must agree with a
 	// fresh measurement of the committed object.
-	measured, err := s.VerityDigest(d)
+	measured, err := s.VerityDigest(context.Background(), d)
 	if err != nil {
 		t.Fatalf("VerityDigest: %v", err)
 	}
@@ -152,7 +162,7 @@ func TestWriteBlobLinksView(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteBlob: %v", err)
 	}
-	fsv, err := s.VerityDigest(d)
+	fsv, err := s.VerityDigest(context.Background(), d)
 	if err != nil {
 		t.Fatalf("VerityDigest: %v", err)
 	}
@@ -501,13 +511,12 @@ func TestRemoveDeletesBothNames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ObjectPath: %v", err)
 	}
-	hex := strings.TrimPrefix(fsv, "sha256:")
-	viewPath := filepath.Join(s.ViewDir(), hex[:2], hex[2:])
+	viewPath := filepath.Join(s.ViewDir(), viewName(fsv))
 	if _, err := os.Lstat(viewPath); err != nil {
 		t.Fatalf("view name missing before remove: %v", err)
 	}
 
-	if err := s.Remove(d); err != nil {
+	if err := s.Remove(d, viewName(fsv)); err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
 	if _, err := os.Lstat(objPath); !errors.Is(err, os.ErrNotExist) {
@@ -517,7 +526,7 @@ func TestRemoveDeletesBothNames(t *testing.T) {
 		t.Fatalf("view name still present: %v", err)
 	}
 	// Removing an absent object is a no-op success.
-	if err := s.Remove(d); err != nil {
+	if err := s.Remove(d, viewName(fsv)); err != nil {
 		t.Fatalf("Remove absent: %v", err)
 	}
 }
@@ -528,7 +537,7 @@ func TestRemoveDeletesBothNames(t *testing.T) {
 func TestRemoveRefusesInUseObject(t *testing.T) {
 	s := newVerityStore(t)
 	ctx := context.Background()
-	d, _, err := s.WriteObject(ctx, strings.NewReader("in use"))
+	d, fsv, err := writeObject(t, s, ctx, strings.NewReader("in use"))
 	if err != nil {
 		t.Fatalf("WriteObject: %v", err)
 	}
@@ -549,7 +558,7 @@ func TestRemoveRefusesInUseObject(t *testing.T) {
 		t.Fatalf("Flock: %v", err)
 	}
 
-	if err := s.Remove(d); !errors.Is(err, ErrInUse) {
+	if err := s.Remove(d, viewName(fsv)); !errors.Is(err, ErrInUse) {
 		t.Fatalf("Remove = %v, want ErrInUse", err)
 	}
 	if _, err := os.Lstat(path); err != nil {
@@ -559,7 +568,7 @@ func TestRemoveRefusesInUseObject(t *testing.T) {
 	if err := unix.Flock(int(mounter.Fd()), unix.LOCK_UN); err != nil { // #nosec G115 -- a file descriptor always fits in int
 		t.Fatalf("Funlock: %v", err)
 	}
-	if err := s.Remove(d); err != nil {
+	if err := s.Remove(d, viewName(fsv)); err != nil {
 		t.Fatalf("Remove after unlock: %v", err)
 	}
 }
@@ -703,7 +712,7 @@ func TestWriteObjectSymlinkAtObjectPath(t *testing.T) {
 	if _, err := os.Lstat(viewPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("view link must not be made through a symlink: lstat err = %v", err)
 	}
-	if _, err := s.resolveExisting(objPath, fsv); err == nil {
+	if _, err := s.resolveExisting(ctx, objPath, fsv); err == nil {
 		t.Fatal("expected resolveExisting to refuse a symlink at the object path")
 	}
 }
@@ -723,7 +732,7 @@ func TestResolveObject(t *testing.T) {
 		t.Fatalf("remove view name: %v", err)
 	}
 
-	got, size, err := s.ResolveObject(d)
+	got, size, err := s.ResolveObject(context.Background(), d)
 	if err != nil {
 		t.Fatalf("ResolveObject: %v", err)
 	}
@@ -741,10 +750,10 @@ func TestResolveObject(t *testing.T) {
 // one, so a caller knows to fetch it.
 func TestResolveObjectAbsent(t *testing.T) {
 	s := newTestStore(t)
-	if _, _, err := s.ResolveObject(digest.FromString("never written")); !errors.Is(err, os.ErrNotExist) {
+	if _, _, err := s.ResolveObject(context.Background(), digest.FromString("never written")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("ResolveObject(absent) = %v, want os.ErrNotExist", err)
 	}
-	if _, _, err := s.ResolveObject("sha256:short"); err == nil || errors.Is(err, os.ErrNotExist) {
+	if _, _, err := s.ResolveObject(context.Background(), "sha256:short"); err == nil || errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("ResolveObject(malformed digest) = %v, want a validation error", err)
 	}
 }
@@ -770,7 +779,7 @@ func TestResolveObjectRejectsNonRegular(t *testing.T) {
 	if err := os.Symlink(objPath+".real", objPath); err != nil {
 		t.Fatalf("symlink object path: %v", err)
 	}
-	if _, _, err := s.ResolveObject(d); err == nil || errors.Is(err, os.ErrNotExist) {
+	if _, _, err := s.ResolveObject(context.Background(), d); err == nil || errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("ResolveObject(symlink) = %v, want a non-ErrNotExist error", err)
 	}
 	if _, err := os.Lstat(viewPath); !errors.Is(err, os.ErrNotExist) {
@@ -781,7 +790,7 @@ func TestResolveObjectRejectsNonRegular(t *testing.T) {
 	if err := os.MkdirAll(s.objectPath(dirDigest.Hex()), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.ResolveObject(dirDigest); err == nil || errors.Is(err, os.ErrNotExist) {
+	if _, _, err := s.ResolveObject(context.Background(), dirDigest); err == nil || errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("ResolveObject(directory) = %v, want a non-ErrNotExist error", err)
 	}
 }
@@ -808,7 +817,7 @@ func TestResolveOrWriteConverges(t *testing.T) {
 	for i := range pulls {
 		go func(i int) {
 			defer wg.Done()
-			fsvs[i], _, errs[i] = s.ResolveObject(d)
+			fsvs[i], _, errs[i] = s.ResolveObject(context.Background(), d)
 			if !errors.Is(errs[i], os.ErrNotExist) {
 				return
 			}

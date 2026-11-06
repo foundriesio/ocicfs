@@ -59,7 +59,7 @@ func VerifyAnnotations(ctx context.Context, store *objectstore.Store, res ocicha
 		return fmt.Errorf("ociseal: annotation %s mismatch: expected %s, got %s", mergedKey, expected, mergedFsverity)
 	}
 	if value, ok := res.Manifest.Config.Annotations[configKey]; ok {
-		measured, err := store.VerityDigest(res.ConfigDesc.Digest)
+		measured, err := store.VerityDigest(ctx, res.ConfigDesc.Digest)
 		if err != nil {
 			return fmt.Errorf("ociseal: measure stored config: %w", err)
 		}

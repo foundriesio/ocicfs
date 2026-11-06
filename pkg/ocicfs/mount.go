@@ -100,7 +100,7 @@ func (e *engine) mount(ctx context.Context, ref, target string, opts ...MountOpt
 		return err
 	}
 
-	measured, err := e.obj.VerityDigest(b.Descriptor.Digest)
+	measured, err := e.obj.VerityDigest(ctx, b.Descriptor.Digest)
 	if errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("image object missing from store; run `ocicfs pull` first: %w", errors.Join(ErrNotFound, err))
 	}

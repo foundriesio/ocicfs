@@ -130,7 +130,7 @@ func (e *engine) gc(ctx context.Context, opts ...GCOption) (*GCReport, error) {
 			continue
 		}
 		if !cfg.DryRun {
-			err := e.obj.Remove(c.digest)
+			err := e.obj.Remove(c.digest, c.viewName)
 			if errors.Is(err, objectstore.ErrInUse) {
 				report.InUseSkipped++
 				continue
@@ -364,7 +364,7 @@ func (e *engine) markImage(ctx context.Context, m *gcMarks, root, wantIdentity d
 	if err != nil {
 		return fmt.Errorf("wanted image %s (%s): %w", wantIdentity, origin, err)
 	}
-	measured, err := e.obj.VerityDigest(b.Descriptor.Digest)
+	measured, err := e.obj.VerityDigest(ctx, b.Descriptor.Digest)
 	if err != nil {
 		return fmt.Errorf("wanted image %s (%s): verify composefs image %s: %w; run `ocicfs pull` to restore it, or `ocicfs remove`/`ocicfs release` to stop wanting it", wantIdentity, origin, b.Descriptor.Digest, err)
 	}
@@ -537,7 +537,7 @@ type gcObject struct {
 func (e *engine) inventoryObjects(ctx context.Context) ([]gcObject, error) {
 	var inventory []gcObject
 	err := e.obj.Walk(ctx, func(d digest.Digest, size int64) error {
-		fsv, err := e.obj.VerityDigest(d)
+		fsv, err := e.obj.VerityDigest(ctx, d)
 		if err != nil {
 			slog.Warn("ocicfs: gc skipping unmeasurable object", "digest", d, "err", err)
 			return nil

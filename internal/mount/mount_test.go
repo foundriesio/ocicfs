@@ -222,7 +222,7 @@ func TestReadOnlyRefusesVerityLessObject(t *testing.T) {
 		t.Fatalf("ObjectPath: %v", err)
 	}
 
-	fsv, err := obj.VerityDigest(digest.SHA256.FromString(mountBody))
+	fsv, err := obj.VerityDigest(context.Background(), digest.SHA256.FromString(mountBody))
 	if err != nil {
 		t.Fatalf("VerityDigest: %v", err)
 	}

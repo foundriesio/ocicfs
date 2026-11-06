@@ -104,7 +104,7 @@ func TestWriterMatchesSynchronousPath(t *testing.T) {
 		if err != nil {
 			t.Fatalf("object %d Sealed: %v", i, err)
 		}
-		measured, err := s.VerityDigest(got[i].d)
+		measured, err := s.VerityDigest(context.Background(), got[i].d)
 		if err != nil {
 			t.Fatalf("object %d VerityDigest: %v", i, err)
 		}
@@ -284,7 +284,7 @@ func TestWriterWriteExpected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sealed: %v", err)
 	}
-	measured, err := s.VerityDigest(d)
+	measured, err := s.VerityDigest(context.Background(), d)
 	if err != nil {
 		t.Fatalf("VerityDigest: %v", err)
 	}

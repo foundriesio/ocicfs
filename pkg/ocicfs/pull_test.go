@@ -397,7 +397,7 @@ func TestPullFromDirE2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("objectstore.New: %v", err)
 	}
-	measured, err := obj.VerityDigest(binding.RootFS.Descriptor.Digest)
+	measured, err := obj.VerityDigest(context.Background(), binding.RootFS.Descriptor.Digest)
 	if err != nil {
 		t.Fatalf("VerityDigest: %v", err)
 	}
@@ -985,7 +985,7 @@ func TestPullSealingAnnotationMatrix(t *testing.T) {
 				t.Fatalf("binding recorded canonical = %v, want %v", binding.Canonical, build.canonical)
 			}
 			merged := sealingValue(t, binding.FsverityDigest)
-			configFsverity, err := obj.VerityDigest(lay.Config)
+			configFsverity, err := obj.VerityDigest(context.Background(), lay.Config)
 			if err != nil {
 				t.Fatalf("VerityDigest(config): %v", err)
 			}
