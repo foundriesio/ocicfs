@@ -266,6 +266,9 @@ func TestReadOnlyRefusesVerityLessObject(t *testing.T) {
 // data plane, not just the metadata.
 func buildMountFixture(t *testing.T) (string, *objectstore.Store, rootfs.Image) {
 	t.Helper()
+	if verity.Mode == verity.ModeOff {
+		t.Skip("a build made in off mode gives a new store no fs-verity")
+	}
 	storeRoot, cleanup, err := devtest.VerityRoot()
 	if errors.Is(err, devtest.ErrNoVerity) {
 		t.Skipf("verity-capable store root unavailable: %v", err)

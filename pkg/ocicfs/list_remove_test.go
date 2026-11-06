@@ -253,6 +253,7 @@ func putEngineBinding(t *testing.T, root string, d digest.Digest, p ocispec.Plat
 // is filed under, as the verbs that read one require.
 func writeEngineObject(t *testing.T, root string, data []byte) (digest.Digest, string) {
 	t.Helper()
+	skipPlainObjects(t)
 	d := digest.SHA256.FromBytes(data)
 	path := octest.ObjectPath(root, d)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

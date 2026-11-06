@@ -469,8 +469,9 @@ func Materialize(ctx context.Context, store *objectstore.Store, img *imagestore.
 }
 
 // prepare does what every materialization does before its first layer:
-// verifies the store can enable fs-verity, resolves root from src for
-// platform, and writes the metadata blobs.
+// checks that the store's filesystem can enable fs-verity when this build
+// requires it, so a pull fails before writing anything to a store it cannot
+// use; resolves root from src for platform; and writes the metadata blobs.
 func prepare(ctx context.Context, store *objectstore.Store, img *imagestore.Store, src ocichain.BlobSource, root digest.Digest, platform ocispec.Platform, slots chan struct{}) (ocichain.Resolved, error) {
 	if store == nil {
 		return ocichain.Resolved{}, errors.New("materialize: nil object store")
@@ -484,7 +485,7 @@ func prepare(ctx context.Context, store *objectstore.Store, img *imagestore.Stor
 	if cap(slots) == 0 {
 		return ocichain.Resolved{}, errors.New("materialize: scan limiter must have a positive capacity")
 	}
-	if err := store.CheckVerity(); err != nil {
+	if err := store.Preflight(); err != nil {
 		return ocichain.Resolved{}, err
 	}
 
