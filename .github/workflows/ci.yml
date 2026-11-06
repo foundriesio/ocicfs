@@ -64,6 +64,23 @@ jobs:
             && test -x /tmp/install-check/usr/local/bin/ocicfs
           push: never
 
+  # The tagged fs-verity build modes change whether a pull writes objects with
+  # fs-verity and a mount requires it, so their unit tests run in a build of
+  # each mode; the default (auto) build runs above.
+  build-modes:
+    name: vet & test (${{ matrix.tags }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tags: [ocicfs_verity_required, ocicfs_verity_off]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: devcontainers/ci@v0.3
+        with:
+          runCmd: make GOFLAGS=-tags=${{ matrix.tags }} vet test
+          push: never
+
   lint:
     name: golangci-lint
     runs-on: ubuntu-latest
