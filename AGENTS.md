@@ -77,8 +77,8 @@ Run the project's standard targets; do not invent ad-hoc invocations.
   persisted (a delta pull may spool a whole blob to a store temp file for the
   duration of the pull). A mount attaches the image's verified EROFS metadata to
   a loop device and serves it through one read-only overlay with the store's
-  object directory as a data-only lower and `verity=require` — no per-layer
-  unpack or overlay stack. Every EROFS ocicfs builds or verifies is
+  object directory as a data-only lower and `verity=require` (left out by a
+  build running without fs-verity) — no per-layer unpack or overlay stack. Every EROFS ocicfs builds or verifies is
   **composefs-c 1.0.8-compatible V1**.
 - **Backend abstraction:** keep storage, pull, and mount behavior behind narrow
   interfaces rather than ad-hoc calls scattered through command handlers.

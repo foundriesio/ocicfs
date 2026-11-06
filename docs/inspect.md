@@ -20,7 +20,12 @@ platform   linux/arm64/v8           # the resolved platform (config-declared)
 composefs  sha256:<digest>          # the composefs image blob in the store
 fsverity   sha256:<digest>          # the binding's locally measured fs-verity digest
 rootfs     117.7 MiB                # apparent size of the merged rootfs
+verity     enabled (build: auto)    # this binary runs the store with fs-verity; its build mode
 ```
+
+The last row is the fs-verity state and build mode (see
+[the fs-verity mode](on-disk-layout.md#the-fs-verity-mode)); the JSON output
+carries them as `"verity":{"build":"auto","state":"enabled"}`.
 
 The rootfs size is recorded when the image is built at pull time: it is the
 merged tree's regular-file content bytes — each hardlink group counted once,
@@ -44,7 +49,8 @@ Use `--format json` for machine-readable output:
 ocicfs inspect app@sha256:<digest> --format json
 # {"root":"sha256:…","platform":"linux/arm64/v8","diff_ids":["sha256:…"],
 #  "composefs":{"mediaType":"…+erofs","digest":"sha256:…","size":12288},
-#  "fsverity":"sha256:…","rootfs_size":123456789}
+#  "fsverity":"sha256:…","rootfs_size":123456789,
+#  "verity":{"build":"auto","state":"enabled"}}
 ```
 
 ## Per-layer view (`--layers`)
@@ -109,7 +115,11 @@ the resolved `{identity, platform}`. Otherwise it fails with an error satisfying
 - **Wrong platform** — an image present only for a different platform is **not** reported as
   not-found; the error names the platform conflict instead.
 
-`inspect` does not measure fs-verity or open the composefs object; it reports what the store
-records. The reported fs-verity digest is the binding's local measurement from pull time; for
+`inspect` does not measure the image's fs-verity or any object. The `verity` row is the
+state described in [the fs-verity mode](on-disk-layout.md#the-fs-verity-mode); where it
+cannot be determined (a read-only store, where the probe cannot write its file), the row
+reads `unknown`, the JSON leaves `state` out, and `inspect` logs a warning and still reports
+the image. The rest is what the store records.
+The reported fs-verity digest is the binding's local measurement from pull time; for
 a sealed image, mount enforces the identity manifest's sealing annotation instead. Mount is
 the enforcement point (see [mount.md](mount.md)); the binding is auxiliary, verified on use.
