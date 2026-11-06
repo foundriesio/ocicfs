@@ -1292,7 +1292,12 @@ func assertMatchesFreshPull(t *testing.T, lay octest.Layout, root digest.Digest,
 func removeObjects(t *testing.T, obj *objectstore.Store, digests ...digest.Digest) {
 	t.Helper()
 	for _, d := range digests {
-		if err := obj.Remove(d); err != nil {
+		fsv, err := obj.VerityDigest(context.Background(), d)
+		if err != nil {
+			t.Fatalf("VerityDigest(%s): %v", d, err)
+		}
+		hex := strings.TrimPrefix(fsv, "sha256:")
+		if err := obj.Remove(d, hex[:2]+"/"+hex[2:]); err != nil {
 			t.Fatalf("Remove(%s): %v", d, err)
 		}
 	}

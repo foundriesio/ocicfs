@@ -208,7 +208,7 @@ func (b *Builder) Missing(ctx context.Context) ([]Payload, error) {
 			missing = append(missing, p)
 			continue
 		}
-		fsv, size, err := b.store.ResolveObject(p.Digest)
+		fsv, size, err := b.store.ResolveObject(ctx, p.Digest)
 		if errors.Is(err, os.ErrNotExist) {
 			missing = append(missing, p)
 			continue
