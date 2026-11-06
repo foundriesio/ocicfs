@@ -24,6 +24,7 @@ import (
 	"github.com/foundriesio/ocicfs/internal/composefs"
 	"github.com/foundriesio/ocicfs/internal/digestutil"
 	"github.com/foundriesio/ocicfs/internal/objectstore"
+	"github.com/foundriesio/ocicfs/internal/verity"
 )
 
 // MediaTypeComposefsImage is the descriptor media type for generated composefs
@@ -199,6 +200,10 @@ func (b *Builder) Missing(ctx context.Context) ([]Payload, error) {
 		pending[n.digest] = append(pending[n.digest], n)
 	}
 
+	// In off mode the fs-verity digest of an object already held is the
+	// name of its view entry, found for every object at once on the first
+	// one held, so reused objects are not hashed again.
+	var viewNames map[digest.Digest]objectstore.ObjectView
 	var missing []Payload
 	for _, p := range order {
 		if err := ctx.Err(); err != nil {
@@ -208,7 +213,20 @@ func (b *Builder) Missing(ctx context.Context) ([]Payload, error) {
 			missing = append(missing, p)
 			continue
 		}
-		fsv, size, err := b.store.ResolveObject(ctx, p.Digest)
+		held, err := b.store.Has(p.Digest)
+		if err != nil {
+			return nil, fmt.Errorf("rootfs: resolve payload %s: %w", p.Digest, err)
+		}
+		if !held {
+			missing = append(missing, p)
+			continue
+		}
+		if viewNames == nil {
+			if viewNames, err = b.offViewNames(ctx); err != nil {
+				return nil, err
+			}
+		}
+		fsv, size, err := b.store.ResolveObject(ctx, p.Digest, viewNames[p.Digest].ViewName)
 		if errors.Is(err, os.ErrNotExist) {
 			missing = append(missing, p)
 			continue
@@ -341,6 +359,23 @@ func (b *Builder) closeWriter() error {
 	b.cancel()
 	b.w = nil
 	return err
+}
+
+// offViewNames returns the view names of every object in the store in off
+// mode, and an empty map in required mode, whose objects are measured instead.
+func (b *Builder) offViewNames(ctx context.Context) (map[digest.Digest]objectstore.ObjectView, error) {
+	mode, err := b.store.Mode()
+	if err != nil {
+		return nil, fmt.Errorf("rootfs: %w", err)
+	}
+	if mode != verity.ModeOff {
+		return map[digest.Digest]objectstore.ObjectView{}, nil
+	}
+	names, err := b.store.ViewNames(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("rootfs: %w", err)
+	}
+	return names, nil
 }
 
 // Assemble merges decompressed layer tar streams, writes regular files larger

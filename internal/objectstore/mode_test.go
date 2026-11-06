@@ -148,7 +148,7 @@ func TestOffModeReadsObjectsWithFsverity(t *testing.T) {
 	if _, again, err := writeObject(t, s, ctx, bytes.NewReader(content)); err != nil || again != fsv {
 		t.Fatalf("colliding write = %s, %v; want %s", again, err, fsv)
 	}
-	if got, size, err := s.ResolveObject(ctx, d); err != nil || got != fsv || size != int64(len(content)) {
+	if got, size, err := s.ResolveObject(ctx, d, ""); err != nil || got != fsv || size != int64(len(content)) {
 		t.Fatalf("ResolveObject = %s, %d, %v; want %s, %d", got, size, err, fsv, len(content))
 	}
 	if got, err := s.VerityDigest(ctx, d); err != nil || got != fsv {
@@ -192,7 +192,7 @@ func TestOffModeObjects(t *testing.T) {
 	if got, err := s.VerityDigest(ctx, d); err != nil || got != want {
 		t.Fatalf("VerityDigest = %s, %v; want %s", got, err, want)
 	}
-	if got, size, err := s.ResolveObject(ctx, d); err != nil || got != want || size != int64(len(content)) {
+	if got, size, err := s.ResolveObject(ctx, d, ""); err != nil || got != want || size != int64(len(content)) {
 		t.Fatalf("ResolveObject = %s, %d, %v; want %s, %d", got, size, err, want, len(content))
 	}
 	// A blob goes through the same path.
@@ -204,7 +204,15 @@ func TestOffModeObjects(t *testing.T) {
 	if _, err := os.Lstat(viewPath); err != nil {
 		t.Fatalf("view name missing: %v", err)
 	}
+	// Given the view name, ResolveObject reads no content: a corrupted
+	// object of the same size still resolves to the name.
 	objPath, _ := s.ObjectPath(d)
+	if err := os.WriteFile(objPath, bytes.Repeat([]byte("x"), len(content)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, size, err := s.ResolveObject(ctx, d, viewName(want)); err != nil || got != want || size != int64(len(content)) {
+		t.Fatalf("ResolveObject with the view name = %s, %d, %v; want %s, %d", got, size, err, want, len(content))
+	}
 	if err := s.Remove(d, "zz/not-a-name"); err == nil {
 		t.Fatal("Remove accepted a malformed view name")
 	}

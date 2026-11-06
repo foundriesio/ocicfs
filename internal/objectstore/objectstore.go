@@ -36,6 +36,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/opencontainers/go-digest"
 	"golang.org/x/sys/unix"
@@ -449,6 +450,23 @@ func (s *Store) resolveExisting(ctx context.Context, path string, stagedFsv stri
 	return fsv, nil
 }
 
+// viewObject returns the fs-verity digest the view-relative name viewName
+// carries and the size of the object d at path, which must be a regular file.
+func viewObject(d digest.Digest, path, viewName string) (string, int64, error) {
+	fsv, err := viewNameDigest(d, viewName)
+	if err != nil {
+		return "", 0, err
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return "", 0, fmt.Errorf("objectstore: stat existing %s: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return "", 0, fmt.Errorf("objectstore: existing %s is not a regular file", path)
+	}
+	return fsv, fi.Size(), nil
+}
+
 // measureExisting returns the fs-verity digest and the size of the object
 // already at path, as objectVerity computes it. The path is opened without
 // following symlinks and must be a regular file: a view link made through
@@ -556,11 +574,20 @@ func (s *Store) objectVerity(ctx context.Context, f *os.File) (string, error) {
 // again. Ensuring the link repairs an object a crash left committed but
 // unlinked. The object path is opened without following symlinks and must be
 // a regular file. An absent object surfaces as an error satisfying
-// errors.Is(err, os.ErrNotExist).
-func (s *Store) ResolveObject(ctx context.Context, d digest.Digest) (string, int64, error) {
+// errors.Is(err, os.ErrNotExist). In off mode a non-empty viewName, the
+// view-relative name ("ab/cdef...") the caller found for the object, is its
+// fs-verity digest, and the object's bytes are hashed only without one.
+func (s *Store) ResolveObject(ctx context.Context, d digest.Digest, viewName string) (string, int64, error) {
 	path, err := s.ObjectPath(d)
 	if err != nil {
 		return "", 0, err
+	}
+	mode, err := s.Mode()
+	if err != nil {
+		return "", 0, err
+	}
+	if mode == verity.ModeOff && viewName != "" {
+		return viewObject(d, path, viewName)
 	}
 	fsv, size, err := s.measureExisting(ctx, path)
 	if err != nil {
@@ -602,20 +629,46 @@ var ErrInUse = errors.New("objectstore: object in use")
 // regular file, is skipped with a warning rather than failing the walk: a
 // foreign entry is not a stored object, and skipping it only retains it.
 func (s *Store) Walk(ctx context.Context, fn func(d digest.Digest, size int64) error) error {
-	base := s.objectPath("")
-	return filepath.WalkDir(base, func(path string, de fs.DirEntry, walkErr error) error {
+	return s.walk(ctx, func(d digest.Digest, fi fs.FileInfo) error {
+		return fn(d, fi.Size())
+	})
+}
+
+// ObjectView is one stored object as ViewNames saw it: its size and its
+// view name in view-relative form ("ab/cdef..."), empty when it has none.
+type ObjectView struct {
+	Size     int64
+	ViewName string
+}
+
+// ViewNames maps every stored object to its size and view name, by matching
+// inodes between one walk of the object tree and a later one of the view, so
+// an object committed during the walks is either left out or has an empty
+// view name when its view link lands after the view walk. It reads no object
+// content, which is how off mode, whose objects may carry no fs-verity
+// measurement, names them.
+func (s *Store) ViewNames(ctx context.Context) (map[digest.Digest]ObjectView, error) {
+	type inode struct{ dev, ino uint64 }
+	objects := map[digest.Digest]ObjectView{}
+	byInode := map[inode]digest.Digest{}
+	err := s.walk(ctx, func(d digest.Digest, fi fs.FileInfo) error {
+		st := fi.Sys().(*syscall.Stat_t)
+		objects[d] = ObjectView{Size: fi.Size()}
+		byInode[inode{dev: st.Dev, ino: st.Ino}] = d
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	base := s.viewPath("")
+	err = filepath.WalkDir(base, func(path string, de fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			return fmt.Errorf("objectstore: walk objects: %w", walkErr)
+			return fmt.Errorf("objectstore: walk view: %w", walkErr)
 		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if de.IsDir() {
-			return nil
-		}
-		d, ok := shardedDigest(base, path)
-		if !ok || !de.Type().IsRegular() {
-			slog.Warn("objectstore: skipping foreign entry in object store", "path", path)
+		if de.IsDir() || !de.Type().IsRegular() {
 			return nil
 		}
 		fi, err := de.Info()
@@ -623,10 +676,26 @@ func (s *Store) Walk(ctx context.Context, fn func(d digest.Digest, size int64) e
 			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("objectstore: stat object %s: %w", d, err)
+			return fmt.Errorf("objectstore: stat view entry %s: %w", path, err)
 		}
-		return fn(d, fi.Size())
+		st := fi.Sys().(*syscall.Stat_t)
+		d, ok := byInode[inode{dev: st.Dev, ino: st.Ino}]
+		if !ok {
+			return nil
+		}
+		rel, err := filepath.Rel(base, path)
+		if err != nil {
+			return fmt.Errorf("objectstore: view entry %s: %w", path, err)
+		}
+		o := objects[d]
+		o.ViewName = filepath.ToSlash(rel)
+		objects[d] = o
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return objects, nil
 }
 
 // Remove unlinks the stored object d, both its CAS name and its view name
@@ -777,6 +846,36 @@ func (s *Store) PruneEmptyDirs() error {
 		}
 	}
 	return nil
+}
+
+// walk calls fn for every stored object with its digest and its Lstat
+// information, skipping foreign entries as Walk describes.
+func (s *Store) walk(ctx context.Context, fn func(d digest.Digest, fi fs.FileInfo) error) error {
+	base := s.objectPath("")
+	return filepath.WalkDir(base, func(path string, de fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return fmt.Errorf("objectstore: walk objects: %w", walkErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if de.IsDir() {
+			return nil
+		}
+		d, ok := shardedDigest(base, path)
+		if !ok || !de.Type().IsRegular() {
+			slog.Warn("objectstore: skipping foreign entry in object store", "path", path)
+			return nil
+		}
+		fi, err := de.Info()
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("objectstore: stat object %s: %w", d, err)
+		}
+		return fn(d, fi)
+	})
 }
 
 // removeTemp removes a staging temp, logging any failure other than the temp
