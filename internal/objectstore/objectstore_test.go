@@ -732,7 +732,7 @@ func TestResolveObject(t *testing.T) {
 		t.Fatalf("remove view name: %v", err)
 	}
 
-	got, size, err := s.ResolveObject(context.Background(), d)
+	got, size, err := s.ResolveObject(context.Background(), d, "")
 	if err != nil {
 		t.Fatalf("ResolveObject: %v", err)
 	}
@@ -750,10 +750,10 @@ func TestResolveObject(t *testing.T) {
 // one, so a caller knows to fetch it.
 func TestResolveObjectAbsent(t *testing.T) {
 	s := newTestStore(t)
-	if _, _, err := s.ResolveObject(context.Background(), digest.FromString("never written")); !errors.Is(err, os.ErrNotExist) {
+	if _, _, err := s.ResolveObject(context.Background(), digest.FromString("never written"), ""); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("ResolveObject(absent) = %v, want os.ErrNotExist", err)
 	}
-	if _, _, err := s.ResolveObject(context.Background(), "sha256:short"); err == nil || errors.Is(err, os.ErrNotExist) {
+	if _, _, err := s.ResolveObject(context.Background(), "sha256:short", ""); err == nil || errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("ResolveObject(malformed digest) = %v, want a validation error", err)
 	}
 }
@@ -779,7 +779,7 @@ func TestResolveObjectRejectsNonRegular(t *testing.T) {
 	if err := os.Symlink(objPath+".real", objPath); err != nil {
 		t.Fatalf("symlink object path: %v", err)
 	}
-	if _, _, err := s.ResolveObject(context.Background(), d); err == nil || errors.Is(err, os.ErrNotExist) {
+	if _, _, err := s.ResolveObject(context.Background(), d, ""); err == nil || errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("ResolveObject(symlink) = %v, want a non-ErrNotExist error", err)
 	}
 	if _, err := os.Lstat(viewPath); !errors.Is(err, os.ErrNotExist) {
@@ -790,7 +790,7 @@ func TestResolveObjectRejectsNonRegular(t *testing.T) {
 	if err := os.MkdirAll(s.objectPath(dirDigest.Hex()), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.ResolveObject(context.Background(), dirDigest); err == nil || errors.Is(err, os.ErrNotExist) {
+	if _, _, err := s.ResolveObject(context.Background(), dirDigest, ""); err == nil || errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("ResolveObject(directory) = %v, want a non-ErrNotExist error", err)
 	}
 }
@@ -817,7 +817,7 @@ func TestResolveOrWriteConverges(t *testing.T) {
 	for i := range pulls {
 		go func(i int) {
 			defer wg.Done()
-			fsvs[i], _, errs[i] = s.ResolveObject(context.Background(), d)
+			fsvs[i], _, errs[i] = s.ResolveObject(context.Background(), d, "")
 			if !errors.Is(errs[i], os.ErrNotExist) {
 				return
 			}

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -24,6 +25,7 @@ import (
 	"github.com/foundriesio/ocicfs/internal/imagestore"
 	"github.com/foundriesio/ocicfs/internal/objectstore"
 	"github.com/foundriesio/ocicfs/internal/ocilayout"
+	"github.com/foundriesio/ocicfs/internal/verity"
 )
 
 // gcBetweenPhases, when set, runs after the inventory and before gc converts
@@ -48,11 +50,12 @@ func (e *engine) gc(ctx context.Context, opts ...GCOption) (*GCReport, error) {
 
 	// The lock is taken exclusive first, so a verb in flight fails the
 	// collection before any work, then converted to shared for the
-	// inventory, which fs-verity-measures every object and dominates the
-	// run time: pulls, holds, and mounts proceed alongside it. The
-	// conversion to exclusive that follows fails if a verb started during
-	// the inventory and is still running; every conversion is non-blocking
-	// and a failed one leaves no lock, so the release only closes the file.
+	// inventory, which names every object by its fs-verity digest and
+	// dominates the run time: pulls, holds, and mounts proceed alongside
+	// it. The conversion to exclusive that follows fails if a verb started
+	// during the inventory and is still running; every conversion is
+	// non-blocking and a failed one leaves no lock, so the release only
+	// closes the file.
 	lock, err := e.openStoreLock(unix.LOCK_EX | unix.LOCK_NB)
 	if err != nil {
 		return nil, err
@@ -523,20 +526,51 @@ func (e *engine) sweepSavedLayers(ctx context.Context, m *gcMarks, dryRun bool) 
 }
 
 // gcObject is one stored object as the inventory saw it: its content digest,
-// size, and the view-relative fs-verity name EROFS redirects carry.
+// size, and the view-relative fs-verity name EROFS redirects carry, which a
+// removal unlinks alongside the content name.
 type gcObject struct {
 	digest   digest.Digest
 	size     int64
 	viewName string
 }
 
-// inventoryObjects walks every object and measures it (a cheap read of the
-// sealed fs-verity root hash). An object that cannot be measured is skipped
-// with a warning, never deleted: wanted per-file objects are marked only by
-// fs-verity name, so an unmeasurable object cannot be proven unwanted.
+// inventoryObjects walks every object and finds its fs-verity name: in
+// required mode it measures each object (a cheap read of the sealed
+// fs-verity root hash); in off mode, whose objects may carry no
+// measurement, it takes the name of the view entry sharing the object's inode,
+// reading no object content, and computes the name from the content only for
+// an object without a view entry: one a crash left between its commit and its
+// view link, or one whose view link landed after the walk. An object whose
+// name cannot be found is skipped with a warning, never deleted: wanted
+// per-file objects are marked only by fs-verity name, so such an object
+// cannot be proven unwanted.
 func (e *engine) inventoryObjects(ctx context.Context) ([]gcObject, error) {
+	mode, err := e.obj.Mode()
+	if err != nil {
+		return nil, err
+	}
 	var inventory []gcObject
-	err := e.obj.Walk(ctx, func(d digest.Digest, size int64) error {
+	if mode == verity.ModeOff {
+		objects, err := e.obj.ViewNames(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range slices.Sorted(maps.Keys(objects)) {
+			o := objects[d]
+			name := o.ViewName
+			if name == "" {
+				fsv, err := e.obj.VerityDigest(ctx, d)
+				if err != nil {
+					slog.Warn("ocicfs: gc skipping unmeasurable object", "digest", d, "err", err)
+					continue
+				}
+				name = viewRelativeName(fsv)
+			}
+			inventory = append(inventory, gcObject{digest: d, size: o.Size, viewName: name})
+		}
+		return inventory, nil
+	}
+	err = e.obj.Walk(ctx, func(d digest.Digest, size int64) error {
 		fsv, err := e.obj.VerityDigest(ctx, d)
 		if err != nil {
 			slog.Warn("ocicfs: gc skipping unmeasurable object", "digest", d, "err", err)
