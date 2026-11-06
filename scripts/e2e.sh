@@ -41,7 +41,11 @@
 # `ocicfs seal` against the registry for the host platform of the multi-arch
 # image -- dry-run parity, the annotation check on the raw pushed manifest,
 # and the sealed image's own full lifecycle, whose pull verifies the seal
-# device-side. The registry legs run against a local zot
+# device-side. A last leg builds the required and off build modes beside
+# the default auto one and checks the fs-verity state each reports and runs
+# with on tmpfs and on the verity loopback, that a required build reports a
+# filesystem without fs-verity unsupported and refuses it and a store
+# written without fs-verity, and that an off build reads objects with it. The registry legs run against a local zot
 # instance -- a real OCI registry that enforces the distribution spec on
 # manifest PUTs, unlike an in-process test registry. It needs a privileged,
 # fs-verity-capable environment with mkcomposefs on PATH -- i.e. the dev
@@ -83,6 +87,7 @@ DSTORE=""
 TARBALL=""
 TARINDEX=""
 COPYTAR=""
+VDIR=""
 SECTION="setup"
 NSECTIONS=0
 NSKIPPED=0
@@ -113,6 +118,14 @@ cleanup() {
 	[ -n "$TARBALL" ] && rm -f "$TARBALL"
 	[ -n "$TARINDEX" ] && rm -rf "$TARINDEX"
 	[ -n "$COPYTAR" ] && rm -f "$COPYTAR"
+	if [ -n "$VDIR" ]; then
+		if mountpoint -q "$VDIR/tmpfs" && ! umount "$VDIR/tmpfs"; then
+			rc=1
+			FAILMSG="cannot unmount $VDIR/tmpfs; left $VDIR in place"
+		else
+			rm -rf "$VDIR"
+		fi
+	fi
 	# The summary and verdict are the last lines of the run, after any cleanup
 	# output. Sections after a failure never ran, so they are not listed.
 	if [ "$NSECTIONS" -gt 0 ]; then
@@ -709,3 +722,141 @@ if [ "$(go env GOARCH)" = amd64 ]; then
 else
 	skip "the delta fixtures are linux/amd64 images"
 fi
+
+section "fs-verity build modes: the state on tmpfs and on the verity loopback"
+# The build mode alone decides whether objects get fs-verity and mounts
+# require it; an auto build probes the store's filesystem. Nothing reads a
+# mode from the objects: a required build meeting an object written without
+# fs-verity fails where it measures it, naming the remedy. The required and
+# off binaries are built here from the same tree.
+VDIR="$(mktemp -d /var/lib/ocicfs/e2e-modes-XXXXXX)"
+mkdir "$VDIR/tmpfs"
+mount -t tmpfs tmpfs "$VDIR/tmpfs"
+for mode in required off; do
+	CGO_ENABLED=0 go build -tags "ocicfs_verity_$mode" -o "$VDIR/ocicfs-$mode" ./cmd/ocicfs
+done
+VAUTO=bin/ocicfs
+VREQ="$VDIR/ocicfs-required"
+VOFF="$VDIR/ocicfs-off"
+vref="e2e@$digest"
+MISMATCH="carries no fs-verity, which this build requires"
+
+# expect_state checks the verity line binary $1, built in mode $2, prints
+# for store $3 against the state $4, and that every object in the store
+# carries fs-verity exactly when $4 is enabled.
+expect_state() {
+	local bin="$1" build="$2" store="$3" want="$4" out obj
+	out="$("$bin" --root "$store" version)"
+	printf '%s\n' "$out"
+	printf '%s\n' "$out" | grep -qx "verity: $want (build: $build)" || fail "version does not report verity: $want (build: $build)"
+	while read -r obj; do
+		if fsverity measure "$obj" >/dev/null 2>&1; then
+			[ "$want" = enabled ] || fail "object $obj in the $want store has fs-verity"
+		else
+			[ "$want" = disabled ] || fail "object $obj in the $want store has no fs-verity"
+		fi
+	done < <(find "$store/objects/sha256" -type f)
+}
+
+# mount_and_read mounts the image with binary $1 from store $2 and reads an
+# object-backed file through it.
+mount_and_read() {
+	local bin="$1" store="$2" f
+	"$bin" --root "$store" mount "$vref" "$MNT"
+	f="$(find "$MNT" -xdev -type f -size +64c -print -quit)"
+	[ -n "$f" ] || fail "the mount from $store has no object-backed file"
+	cat "$f" >/dev/null || fail "reading $f through the mount from $store failed"
+	"$bin" --root "$store" unmount "$MNT"
+}
+
+# expect_mount_mismatch asserts binary $1 fails to mount from store $2 naming
+# the fs-verity mismatch.
+expect_mount_mismatch() {
+	local bin="$1" store="$2" out
+	if out="$("$bin" --root "$store" mount "$vref" "$MNT" 2>&1)"; then
+		"$bin" --root "$store" unmount "$MNT"
+		fail "$bin mounted from $store, whose objects carry no fs-verity"
+	fi
+	printf '%s\n' "$out"
+	printf '%s\n' "$out" | grep -qF "$MISMATCH" || fail "the refused mount did not name the fs-verity mismatch"
+	! mountpoint -q "$MNT" || fail "the refused mount left $MNT mounted"
+}
+
+step "auto on tmpfs: expect verity disabled, then pull, mount and read"
+expect_state "$VAUTO" auto "$VDIR/tmpfs/auto" disabled
+"$VAUTO" --root "$VDIR/tmpfs/auto" pull --from-dir "$LAYOUT" "$vref"
+expect_state "$VAUTO" auto "$VDIR/tmpfs/auto" disabled
+mount_and_read "$VAUTO" "$VDIR/tmpfs/auto"
+out="$("$VAUTO" --root "$VDIR/tmpfs/auto" inspect "$vref")"
+printf '%s\n' "$out" | grep -E '^verity '
+printf '%s\n' "$out" | grep -qE '^verity +disabled \(build: auto\)$' || fail "inspect does not report verity disabled (build: auto)"
+
+step "auto on the verity loopback: expect verity enabled"
+"$VAUTO" --root "$VDIR/auto" pull --from-dir "$LAYOUT" "$vref"
+expect_state "$VAUTO" auto "$VDIR/auto" enabled
+
+step "required on tmpfs: expect verity unsupported, the pull to fail and nothing written"
+expect_state "$VREQ" required "$VDIR/tmpfs/required" unsupported
+[ -z "$(find "$VDIR/tmpfs/required/objects" -type f -print -quit)" ] || fail "the version report wrote objects"
+if out="$("$VREQ" --root "$VDIR/tmpfs/required" pull --from-dir "$LAYOUT" "$vref" 2>&1)"; then
+	fail "a required build pulled into a store without fs-verity"
+fi
+printf '%s\n' "$out"
+printf '%s\n' "$out" | grep -qF "fs-verity-capable filesystem" || fail "the refused pull did not name the missing fs-verity"
+[ -z "$(find "$VDIR/tmpfs/required/objects" -type f -print -quit)" ] || fail "the refused pull wrote objects"
+
+step "off on the verity loopback: expect verity disabled, then mount and read"
+"$VOFF" --root "$VDIR/off" pull --from-dir "$LAYOUT" "$vref"
+expect_state "$VOFF" off "$VDIR/off" disabled
+mount_and_read "$VOFF" "$VDIR/off"
+
+step "required and auto on the store the off build filled: expect the mount refused, naming the mismatch"
+"$VREQ" --root "$VDIR/off" ls >/dev/null || fail "a required build cannot list a store written without fs-verity"
+expect_mount_mismatch "$VREQ" "$VDIR/off"
+expect_mount_mismatch "$VAUTO" "$VDIR/off"
+
+# enable_in_place enables fs-verity in place on the objects of store $1: it
+# checks every object's content digest against its name, then enables
+# fs-verity on each with the parameters ocicfs digests use.
+enable_in_place() {
+	(
+		cd "$1/objects/sha256" &&
+			for f in */*; do
+				[ "$(sha256sum <"$f" | cut -d' ' -f1)" = "${f%%/*}${f#*/}" ] ||
+					{ echo "$f does not match its name" >&2; exit 1; }
+			done &&
+			for f in */*; do
+				fsverity measure "$f" >/dev/null 2>&1 ||
+					fsverity enable --hash-alg=sha256 --block-size=4096 "$f" ||
+					exit 1
+			done
+	)
+}
+
+step "fs-verity enabled in place on a corrupted object: expect the conversion refused, nothing enabled"
+vobj="$(find "$VDIR/off/objects/sha256" -type f -size +64c -print -quit)"
+cp -p "$vobj" "$VDIR/saved-object"
+head -c "$(stat -c %s "$vobj")" /dev/zero >"$vobj"
+if enable_in_place "$VDIR/off"; then
+	fail "the conversion accepted an object that does not match its name"
+fi
+expect_state "$VOFF" off "$VDIR/off" disabled
+cp -p "$VDIR/saved-object" "$vobj"
+
+step "fs-verity enable failing on the first object: expect the conversion to fail"
+vfirst="$(cd "$VDIR/off/objects/sha256" && printf '%s\n' */* | head -n1)"
+# The kernel refuses to enable fs-verity on a file open for writing.
+exec 9>>"$VDIR/off/objects/sha256/$vfirst"
+if enable_in_place "$VDIR/off"; then
+	fail "the conversion succeeded although enabling fs-verity on $vfirst failed"
+fi
+exec 9>&-
+
+step "fs-verity enabled in place on the off build's objects: expect required and auto to mount and read"
+enable_in_place "$VDIR/off" || fail "the in-place conversion failed"
+expect_state "$VREQ" required "$VDIR/off" enabled
+mount_and_read "$VREQ" "$VDIR/off"
+mount_and_read "$VAUTO" "$VDIR/off"
+
+step "off on the store the auto build filled: expect the objects with fs-verity read"
+mount_and_read "$VOFF" "$VDIR/auto"
