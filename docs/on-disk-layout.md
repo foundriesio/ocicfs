@@ -1,9 +1,10 @@
 # On-disk store layout
 
 This describes what ocicfs writes under its data root (`--root`, default
-`/var/lib/ocicfs`) — the tree a `pull` produces and a `mount` reads. The store
-filesystem must support **fs-verity** (e.g. ext4 formatted with `-b 4096`); ocicfs
-seals every content object with it and refuses a store that cannot.
+`/var/lib/ocicfs`) — the tree a `pull` produces and a `mount` reads. When the
+store filesystem supports **fs-verity** (e.g. ext4 formatted with `-b 4096 -O
+verity`) ocicfs seals every content object with it; whether a filesystem without
+it is usable depends on the build mode (see [the fs-verity mode](#the-fs-verity-mode)).
 
 ```
 <root>/
@@ -27,11 +28,110 @@ recorded, or a mount being set up. See [gc.md](gc.md).
 Every digest is sharded by its first byte (`<aa>` = first two hex chars, `<rest>`
 = the remaining 62) to keep directories shallow.
 
+## The fs-verity mode
+
+The binary's build mode alone decides whether a pull writes objects with
+fs-verity and a mount requires it. No file records a mode and nothing reads one
+from the objects.
+
+| Build mode | Objects written | Mount | Probe |
+|---|---|---|---|
+| `required` (tag `ocicfs_verity_required`) | with fs-verity | `verity=require` | the filesystem must enable fs-verity before a pull writes anything, or the pull fails |
+| `off` (tag `ocicfs_verity_off`) | without fs-verity; the digest is computed in userspace | no `verity=` | none |
+| `auto` (default) | as `required` when the probe enables fs-verity, else as `off` | likewise | once per process, on the first operation that needs the mode; a filesystem or kernel that cannot enable fs-verity means `off`, any other failure is an error |
+
+The build mode is fixed at compile time (`make build
+GOFLAGS=-tags=ocicfs_verity_required`; the `=` form, as `go` also reads
+`GOFLAGS` from the environment make exports it to); there is no runtime
+setting. An `auto` build decides from a probe that anyone who can write the
+store root can influence, for example by pointing its `tmp` at a filesystem
+without fs-verity, which makes mounts leave out `verity=require`; where an
+attacker who can write `/var` is in scope, deploy a `required` build.
+`ocicfs version` and `ocicfs inspect` print whether the build runs the store
+with fs-verity (`verity: enabled`) or without (`verity: disabled`), and the
+build mode:
+
+```
+verity: enabled (build: auto)
+```
+
+A build made in `required` mode prints `verity: unsupported` for a store
+whose filesystem cannot enable fs-verity; a pull into it fails. The state
+describes how this binary runs the store, not the objects it holds: an `off`
+build reading objects that have fs-verity still reports `disabled`, and a store
+that cannot be opened or probed reports `unknown`, with the cause.
+
+A store written with fs-verity and read without, or the reverse, is not
+checked up front; the mismatch fails loudly where ocicfs measures an object,
+naming the remedy, and `verity=require` is never dropped silently:
+
+- With fs-verity (`verity: enabled`), ocicfs names an object only by the
+  kernel's fs-verity measurement, never a userspace fallback. An object written without fs-verity
+  that a pull reuses (the same content already in the store), or the composefs
+  image a mount serves, fails with `object carries no fs-verity, which this
+  build requires`, naming the remedy below. For a file object without fs-verity that an image points at,
+  the mount succeeds and opening that file fails with EIO under
+  `verity=require`; the other files read fine.
+- A kernel without fs-verity support cannot open an object that has it
+  (`EOPNOTSUPP`); the error says so.
+- Without fs-verity (`verity: disabled`), ocicfs reads objects with and
+  without it: the userspace digest of an object with fs-verity equals its
+  measurement.
+- A store filesystem that gains fs-verity support after an `auto` build pulled
+  into it without (`tune2fs -O verity`, a kernel update) runs with fs-verity
+  from then on, so the images pulled before fail to mount until their objects
+  get fs-verity — the same remedy as above.
+- An `auto` build keeps its probe result for the life of the process; a
+  long-running embedder whose store moves to another filesystem restarts.
+
+To move a store written without fs-verity to a build running with it, enable
+fs-verity on its objects in place. fs-verity is enabled with the parameters ocicfs
+computes its digests with, so every image keeps referencing its objects by the
+same names. Enabling fs-verity seals whatever bytes a file holds, so the
+script below first checks every object against its sha256 name and enables
+nothing if one differs; remove the store and pull again then. Stop every
+ocicfs and cfs-snapshotter process and unmount every mount served from the
+store first, container overlays included: a mount made without
+`verity=require` keeps reading without it until it is made again with the
+new build.
+
+```sh
+(
+	cd /var/lib/ocicfs/objects/sha256 &&
+	for f in */*; do
+		[ "$(sha256sum <"$f" | cut -d' ' -f1)" = "${f%%/*}${f#*/}" ] ||
+			{ echo "$f does not match its name" >&2; exit 1; }
+	done &&
+	for f in */*; do
+		fsverity measure "$f" >/dev/null 2>&1 ||
+			fsverity enable --hash-alg=sha256 --block-size=4096 "$f" ||
+			exit 1
+	done
+)
+```
+
+Removing the store and pulling again works in every case.
+
+A build running without fs-verity writes the same bytes one running with it
+does: every object still has its fs-verity digest, computed in userspace, and
+the view, the composefs image and the binding are identical. A mount without
+fs-verity re-hashes the composefs image instead of measuring it and assembles
+its overlay without the `verity=` option, which would fail every object; gc
+names objects by their view entries rather than hashing them. A binding's
+`rootfs.fsverity` fields are written the same either way.
+
+Without fs-verity, ocicfs verifies every byte against the pinned digests when it is
+written and re-hashes the composefs image at every mount, but it does not check the
+file objects the image points at: a file object changed on disk, before or after a
+mount, is served as it now is. Kernel checks on every read and immutable objects need
+fs-verity.
+
 ## `objects/` — the content-addressed store (authoritative)
 
 A single decompressed copy of every regular file larger than 64 bytes (smaller
 files live inline in their EROFS), keyed by its sha256 digest and sealed with
-fs-verity. One pull writes three kinds of object here:
+fs-verity unless the build runs the store without it (`verity: disabled`).
+One pull writes three kinds of object here:
 
 - **Metadata blobs** — the verified OCI chain: the root (index or manifest),
   the image manifest, and the config, each stored under its own digest.
@@ -55,8 +155,9 @@ versions are not backfilled; each gains its view name when a write next
 deduplicates onto it.
 
 The object store is the **source of truth**: every byte a mount serves is
-content-addressed and fs-verity-sealed here, and the auxiliary indexes below are
-never trusted, only verified against it. The indexes are still the only local
+content-addressed here, and fs-verity-sealed by a build running with it (see
+[the fs-verity mode](#the-fs-verity-mode)); the auxiliary
+indexes below are never trusted, only verified against it. The indexes are still the only local
 map from a pinned root to its composefs image — losing them loses no content,
 and a re-pull regenerates them while deduplicating against the objects already
 present. The compressed wire form of a layer is **never** persisted — only its

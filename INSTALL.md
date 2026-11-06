@@ -59,6 +59,23 @@ sudo make install
 `make install` places the binary under `/usr/local/bin`; override with
 `PREFIX=/usr` or `DESTDIR=<staging>` for packaging.
 
+The default build uses fs-verity whenever the store's filesystem supports it.
+To build a binary that refuses a filesystem without fs-verity, or one that
+never uses fs-verity, pass one Go tag:
+
+```sh
+make build GOFLAGS=-tags=ocicfs_verity_required   # or ocicfs_verity_off
+sudo make install GOFLAGS=-tags=ocicfs_verity_required
+ocicfs version   # prints "verity: enabled (build: required)" on an fs-verity-capable store
+```
+
+`make install` builds again, so pass it the same `GOFLAGS`; without them it
+installs a default (auto) binary. Pass at most one of the two tags; with both,
+the build fails with `undefined: verity.Mode`.
+
+See [docs/on-disk-layout.md](docs/on-disk-layout.md#the-fs-verity-mode)
+for what each mode does.
+
 - **Uninstall:** `sudo rm /usr/local/bin/ocicfs` (or your `PREFIX`)
 
 ## Check the installation
@@ -67,20 +84,34 @@ sudo make install
 ocicfs --version
 ```
 
-prints `ocicfs v<ver> (<commit>)` for a release build.
+prints `ocicfs v<ver> (<commit>)` for a release build. `ocicfs version` adds
+whether the binary runs the store with fs-verity (`enabled`) or without
+(`disabled`), and the fs-verity mode it was built with; see
+[the fs-verity mode](docs/on-disk-layout.md#the-fs-verity-mode) for what each
+state means and when to build with `ocicfs_verity_required`:
+
+```
+ocicfs v<ver> (<commit>)
+verity: enabled (build: auto)
+```
 
 ## Runtime requirements
 
 Installation works on any Linux; *using* ocicfs needs:
 
-- **Kernel: Linux 6.6 or newer** for mounting — EROFS, fs-verity, and
-  overlayfs with data-only lower layers and verity validation. A vendor
+- **Kernel: Linux 6.6 or newer** for mounting — EROFS, loop devices, and
+  overlayfs with `metacopy`, `redirect_dir` and data-only lower layers, plus
+  fs-verity and overlayfs verity validation for a store with fs-verity. A vendor
   kernel carrying the same support also works; [docs/mount.md](docs/mount.md)
   lists the exact mainline commits.
-- **A store filesystem with fs-verity enabled.** ext4 needs a 4096-byte
-  block size and the `verity` feature; btrfs supports fs-verity out of the
-  box. [docs/mount.md](docs/mount.md) shows a loopback-ext4 fallback for
-  hosts without one.
+- **A store filesystem with hardlinks, and fs-verity for integrity on read.**
+  ext4 needs a 4096-byte block size and the `verity` feature for fs-verity;
+  btrfs supports it out of the box. On a filesystem without it (ext4 without
+  `-O verity`, XFS, tmpfs) the default build stores objects without
+  fs-verity, which checks content when it is written but not when it is read; see
+  [docs/on-disk-layout.md](docs/on-disk-layout.md#the-fs-verity-mode) for what
+  that does and does not protect. [docs/mount.md](docs/mount.md) shows a loopback-ext4
+  setup for hosts without fs-verity.
 - **`mkcomposefs`** (from the
   [composefs](https://github.com/composefs/composefs) project) — needed
   only by `pull` and `seal`; all other commands work without it. The .deb

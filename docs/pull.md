@@ -15,8 +15,11 @@ the store lacks from zstd:chunked layers, for updates
 
 ## Prerequisites
 
-- A store on an **fs-verity-capable filesystem** (e.g. ext4 made with `-b 4096`).
-  ocicfs fails fast if the store root cannot enable fs-verity.
+- A store, normally on an **fs-verity-capable filesystem** (e.g. ext4 made with
+  `-b 4096 -O verity`). The default build writes objects without fs-verity when
+  the filesystem cannot enable it, and a `required` build fails fast instead,
+  before anything is written (see
+  [on-disk-layout.md](on-disk-layout.md#the-fs-verity-mode)).
 - `mkcomposefs` on `PATH` (from the composefs tools).
 - A registry reference (digest-pinned for production, tagged for testing), or a
   local OCI image layout and a digest-pinned reference when using `--from-dir`
