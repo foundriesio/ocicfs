@@ -4,6 +4,7 @@
 package ocicfs
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -24,6 +25,7 @@ import (
 	"github.com/foundriesio/ocicfs/internal/devtest"
 	"github.com/foundriesio/ocicfs/internal/imagestore"
 	"github.com/foundriesio/ocicfs/internal/octest"
+	"github.com/foundriesio/ocicfs/internal/verity"
 )
 
 const gcSharedBody = "shared payload stored once in the CAS, larger than the inline threshold\n"
@@ -803,6 +805,9 @@ func TestGCNewMountProtectsInventoriedObject(t *testing.T) {
 // wanted per-file objects are marked only by fs-verity name — so gc must
 // skip it with a warning, never delete it, and still complete.
 func TestGCSkipsUnmeasurableObject(t *testing.T) {
+	if verity.Mode == verity.ModeOff {
+		t.Skip("a build made in off mode gives the store no fs-verity, so no object is unmeasurable")
+	}
 	eng, storeRoot, _ := gcEngine(t, "measure")
 	raw := digest.SHA256.FromString("unmeasurable bytes")
 	path := octest.ObjectPath(storeRoot, raw)
@@ -1051,4 +1056,112 @@ func TestGCSweepsSavedLayers(t *testing.T) {
 	}
 	assertObjectAbsent(t, storeRoot, gcUniqueDigest("dropped"))
 	assertNoEmptyDirs(t, storeRoot)
+}
+
+// TestGCOffStoreReadsNoObjectContent runs a collection in a store without
+// fs-verity. Its objects carry no fs-verity measurement, so the inventory names
+// them by their view entries: the survivor's object is corrupted in place
+// first, and a collection that hashed it would name it wrongly and delete it
+// as unwanted.
+func TestGCOffStoreReadsNoObjectContent(t *testing.T) {
+	if verity.Mode == verity.ModeRequired {
+		t.Skip("a build made in required mode creates no store without fs-verity")
+	}
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+	storeRoot := plainStoreRoot(t)
+	eng, err := New(registryConfig(storeRoot))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gcPull(t, eng, "keep")
+	layB := gcPull(t, eng, "drop")
+	if required, err := eng.VerityRequired(); err != nil || required {
+		t.Fatalf("VerityRequired = %v, %v; want an off store", required, err)
+	}
+	ctx := context.Background()
+
+	keep := octest.ObjectPath(storeRoot, gcUniqueDigest("keep"))
+	data, err := os.ReadFile(keep) // #nosec G304 -- test store path
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[0] ^= 0xff
+	if err := os.WriteFile(keep, data, 0o600); err != nil { // #nosec G703 -- test store path
+		t.Fatal(err)
+	}
+	if err := eng.Remove(ctx, layB.Ref); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	report, err := eng.GC(ctx)
+	if err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	if report.ObjectsRemoved == 0 {
+		t.Fatalf("GC = %+v, want removals", report)
+	}
+	assertObjectAbsent(t, storeRoot, gcUniqueDigest("drop"))
+	assertObjectAbsent(t, storeRoot, layB.Manifest)
+	assertObjectExists(t, storeRoot, gcUniqueDigest("keep"))
+	assertObjectExists(t, storeRoot, digest.SHA256.FromString(gcSharedBody))
+	// Every view entry left still has its CAS partner.
+	err = filepath.WalkDir(filepath.Join(storeRoot, "objects", "fsverity-sha256-12"), func(path string, de fs.DirEntry, err error) error {
+		if err != nil || de.IsDir() {
+			return err
+		}
+		var st unix.Stat_t
+		if err := unix.Lstat(path, &st); err != nil {
+			return err
+		}
+		if st.Nlink != 2 {
+			t.Errorf("view entry %s has %d names, want 2", path, st.Nlink)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestGCOffStoreReclaimsObjectWithoutViewName asserts gc in an off store
+// reclaims an unwanted object whose view entry a crash left missing, by
+// computing its fs-verity name from its content.
+func TestGCOffStoreReclaimsObjectWithoutViewName(t *testing.T) {
+	if verity.Mode == verity.ModeRequired {
+		t.Skip("a build made in required mode creates no store without fs-verity")
+	}
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+	storeRoot := plainStoreRoot(t)
+	eng, err := New(registryConfig(storeRoot))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gcPull(t, eng, "keep")
+	layB := gcPull(t, eng, "drop")
+	ctx := context.Background()
+
+	drop := gcUniqueDigest("drop")
+	data, err := os.ReadFile(octest.ObjectPath(storeRoot, drop)) // #nosec G304 -- test store path
+	if err != nil {
+		t.Fatal(err)
+	}
+	fsv, err := verity.Digest(ctx, bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hex := strings.TrimPrefix(fsv, "sha256:")
+	if err := os.Remove(filepath.Join(storeRoot, "objects", "fsverity-sha256-12", hex[:2], hex[2:])); err != nil { // #nosec G703 -- test store path
+		t.Fatalf("remove the view entry: %v", err)
+	}
+	if err := eng.Remove(ctx, layB.Ref); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if _, err := eng.GC(ctx); err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	assertObjectAbsent(t, storeRoot, drop)
+	assertObjectExists(t, storeRoot, gcUniqueDigest("keep"))
 }

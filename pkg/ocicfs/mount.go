@@ -100,7 +100,7 @@ func (e *engine) mount(ctx context.Context, ref, target string, opts ...MountOpt
 		return err
 	}
 
-	measured, err := e.obj.VerityDigest(b.Descriptor.Digest)
+	measured, err := e.obj.VerityDigest(ctx, b.Descriptor.Digest)
 	if errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("image object missing from store; run `ocicfs pull` first: %w", errors.Join(ErrNotFound, err))
 	}
@@ -117,12 +117,20 @@ func (e *engine) mount(ctx context.Context, ref, target string, opts ...MountOpt
 	if err != nil {
 		return err
 	}
+	required, err := e.VerityRequired()
+	if err != nil {
+		return err
+	}
+	if !required {
+		slog.Debug("ocicfs: mounting without fs-verity", "ref", ref, "target", target)
+	}
 
 	spec := mount.Spec{
 		ImagePath:      imagePath,
 		Basedir:        filepath.Join(e.root, b.ObjectStorePath),
 		Target:         target,
 		FsverityDigest: expected,
+		NoVerity:       !required,
 	}
 	if cfg.MetadataOnly {
 		return mount.MetadataOnly(ctx, spec)

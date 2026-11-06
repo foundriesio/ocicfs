@@ -25,6 +25,11 @@ type Spec struct {
 	Basedir        string
 	Target         string
 	FsverityDigest string
+	// NoVerity mounts without fs-verity: the image's fs-verity digest is
+	// computed from its bytes in userspace instead of measured by the
+	// kernel, and the overlay requests no fs-verity validation of the
+	// backing objects.
+	NoVerity bool
 }
 
 // ErrNotMounted reports that the unmount target had no mount to tear down, so
@@ -43,7 +48,8 @@ const overlaySource = "composefs"
 
 // ReadOnly mounts s.ImagePath at s.Target as a read-only composefs tree: the
 // image's EROFS metadata served through a single overlay whose data-only lower
-// layer is s.Basedir, with fs-verity required on every backing object.
+// layer is s.Basedir, with fs-verity required on every backing object unless
+// s.NoVerity is set.
 //
 // The image is verified and attached exactly as on the metadata-only path, so
 // the shared in-use lock rides the loop device and lives as long as the mount.
@@ -59,7 +65,7 @@ func ReadOnly(ctx context.Context, s Spec) error {
 		return err
 	}
 
-	dev, err := attachVerified(s.ImagePath, s.FsverityDigest)
+	dev, err := attachVerified(ctx, s)
 	if err != nil {
 		return err
 	}
@@ -78,7 +84,7 @@ func ReadOnly(ctx context.Context, s Spec) error {
 
 	// MS_RDONLY is explicit: an overlay without an upper layer is read-only
 	// only as a side effect, and this mount's contract is read-only.
-	mountErr := unix.Mount(overlaySource, s.Target, "overlay", unix.MS_RDONLY, overlayOptions(scratch, s.Basedir))
+	mountErr := unix.Mount(overlaySource, s.Target, "overlay", unix.MS_RDONLY, overlayOptions(scratch, s.Basedir, s.NoVerity))
 	if mountErr != nil {
 		mountErr = fmt.Errorf("mount: overlay on %s: %w", s.Target, mountErr)
 	}
@@ -129,7 +135,8 @@ func ReadOnly(ctx context.Context, s Spec) error {
 // descriptor the loop device attaches, so the mounted bytes are the measured
 // bytes even if the pathname is swapped concurrently. A raw EROFS mount has
 // no in-kernel digest option, which makes this measurement the enforcement
-// point on this path.
+// point on this path. With s.NoVerity the digest is computed from the
+// descriptor's bytes in userspace rather than measured.
 func MetadataOnly(ctx context.Context, s Spec) error {
 	if s.ImagePath == "" {
 		return errors.New("mount: empty image path")
@@ -144,7 +151,7 @@ func MetadataOnly(ctx context.Context, s Spec) error {
 		return err
 	}
 
-	dev, err := attachVerified(s.ImagePath, s.FsverityDigest)
+	dev, err := attachVerified(ctx, s)
 	if err != nil {
 		return err
 	}
@@ -173,27 +180,34 @@ func Unmount(target string) error {
 	return nil
 }
 
-// attachVerified opens and locks the image at path, requires its measured
-// fs-verity digest to equal want, and attaches it to a read-only autoclear
-// loop device, which it returns. The loop device retains the locked open file
+// attachVerified opens and locks the image at s.ImagePath, requires its
+// fs-verity digest to equal s.FsverityDigest, and attaches it to a read-only
+// autoclear loop device, which it returns. The digest is the kernel's
+// measurement, or with s.NoVerity the userspace digest of the locked
+// descriptor's bytes. The loop device retains the locked open file
 // description: the shared in-use lock lives exactly as long as the loop
 // device — and, with autoclear, as long as the mount built on it — surviving
 // this process, and the digest is enforced on the very descriptor the device
 // serves, so the mounted bytes are the measured bytes even if the pathname is
 // swapped concurrently.
-func attachVerified(path, want string) (*os.File, error) {
-	img, err := lockImage(path)
+func attachVerified(ctx context.Context, s Spec) (*os.File, error) {
+	img, err := lockImage(s.ImagePath)
 	if err != nil {
 		return nil, err
 	}
 	defer warnClose("mount: failed to close image", img)
 
-	measured, err := verity.Measure(img)
+	var measured string
+	if s.NoVerity {
+		measured, err = verity.Digest(ctx, img)
+	} else {
+		measured, err = verity.Measure(img)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("mount: measure image: %w", err)
 	}
-	if measured != want {
-		return nil, fmt.Errorf("mount: image fs-verity digest mismatch: measured %s, expected %s", measured, want)
+	if measured != s.FsverityDigest {
+		return nil, fmt.Errorf("mount: image fs-verity digest mismatch: measured %s, expected %s", measured, s.FsverityDigest)
 	}
 	return attachLoop(img)
 }
@@ -297,9 +311,14 @@ func scratchDir() (string, error) {
 // overlayOptions builds the overlay option string that carries the trust
 // posture: the EROFS metadata as the top lower layer, basedir as the data-only
 // lower ("::") its redirects resolve through, and fs-verity required on every
-// redirected object.
-func overlayOptions(scratch, basedir string) string {
-	return "lowerdir=" + scratch + "::" + basedir + ",redirect_dir=on,metacopy=on,verity=require"
+// redirected object. With noVerity the verity option is left out, so overlayfs
+// does not validate the objects, which carry no fs-verity.
+func overlayOptions(scratch, basedir string, noVerity bool) string {
+	opts := "lowerdir=" + scratch + "::" + basedir + ",redirect_dir=on,metacopy=on"
+	if noVerity {
+		return opts
+	}
+	return opts + ",verity=require"
 }
 
 // validateSpec checks a composefs mount spec before any I/O: no empty fields,

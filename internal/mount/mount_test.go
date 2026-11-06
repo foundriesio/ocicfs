@@ -59,10 +59,17 @@ func TestReadOnlyRejectsInvalidSpec(t *testing.T) {
 // object, and the source name mounts are identified by — so a refactor
 // dropping any of them fails here.
 func TestOverlayOptionsPinTrustPosture(t *testing.T) {
-	got := overlayOptions("/run/ocicfs/mount-1", "/objects")
+	got := overlayOptions("/run/ocicfs/mount-1", "/objects", false)
 	want := "lowerdir=/run/ocicfs/mount-1::/objects,redirect_dir=on,metacopy=on,verity=require"
 	if got != want {
 		t.Fatalf("options = %q, want %q", got, want)
+	}
+	// A store without fs-verity requests no validation at all: verity=on
+	// would fail every redirected object, whose metacopy names a digest.
+	got = overlayOptions("/run/ocicfs/mount-1", "/objects", true)
+	want = "lowerdir=/run/ocicfs/mount-1::/objects,redirect_dir=on,metacopy=on"
+	if got != want {
+		t.Fatalf("options without fs-verity = %q, want %q", got, want)
 	}
 	if overlaySource != "composefs" {
 		t.Fatalf("overlay source = %q, want %q", overlaySource, "composefs")
@@ -222,7 +229,7 @@ func TestReadOnlyRefusesVerityLessObject(t *testing.T) {
 		t.Fatalf("ObjectPath: %v", err)
 	}
 
-	fsv, err := obj.VerityDigest(digest.SHA256.FromString(mountBody))
+	fsv, err := obj.VerityDigest(context.Background(), digest.SHA256.FromString(mountBody))
 	if err != nil {
 		t.Fatalf("VerityDigest: %v", err)
 	}
@@ -266,6 +273,9 @@ func TestReadOnlyRefusesVerityLessObject(t *testing.T) {
 // data plane, not just the metadata.
 func buildMountFixture(t *testing.T) (string, *objectstore.Store, rootfs.Image) {
 	t.Helper()
+	if verity.Mode == verity.ModeOff {
+		t.Skip("a build made in off mode gives a new store no fs-verity")
+	}
 	storeRoot, cleanup, err := devtest.VerityRoot()
 	if errors.Is(err, devtest.ErrNoVerity) {
 		t.Skipf("verity-capable store root unavailable: %v", err)

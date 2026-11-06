@@ -3,15 +3,20 @@
 
 // Package objectstore is the immutable, sha256-keyed content-addressed object
 // store. It holds the decompressed per-file objects, the OCI metadata blobs, and
-// the generated composefs image, enables fs-verity on objects, and commits with
-// no-replace semantics. It also owns the build temp dir. Concurrent writers are
-// safe by construction: every write goes to a unique temp, every commit is
-// no-replace, and a collision re-verifies the existing object, so no store-wide
-// lock is needed.
+// the generated composefs image, enables fs-verity on objects unless the
+// build's mode is off, and commits with no-replace semantics. It also owns
+// the build temp dir. Concurrent writers are safe by construction: every write
+// goes to a unique temp, every commit is no-replace, and a collision
+// re-verifies the existing object, so no store-wide lock is needed.
 //
 // The store is private to the ocicfs process, which runs privileged and
-// performs the mount itself: object files are owner-only (0600) and protected
-// by fs-verity, so the digest store does not need to be world-readable. Objects
+// performs the mount itself: object files are owner-only (0600), so the
+// digest store does not need to be world-readable.
+//
+// Every object carries an fs-verity digest, its name in the view directory.
+// In required mode the kernel computes and enforces it; in off mode it is
+// computed in userspace from the same bytes, with the same parameters, so
+// both modes lay out identical bytes on disk (see Mode). Objects
 // are not fsynced individually; a pull makes all of its writes durable with a
 // single store-wide Sync before it writes the binding that references them, so
 // a crash leaves either a complete, durable pull or one with no binding. An
@@ -30,6 +35,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 
 	"github.com/opencontainers/go-digest"
 	"golang.org/x/sys/unix"
@@ -48,6 +55,11 @@ const verityDirName = "fsverity-sha256-12"
 // Its objects live under <root>/objects and transient build state under <root>/tmp.
 type Store struct {
 	root string
+	mu   sync.Mutex
+	// mode is the fs-verity mode Mode returns, verity.ModeRequired or
+	// verity.ModeOff, and verity.ModeAuto until an auto build has probed the
+	// filesystem. It starts as the build mode, verity.Mode; tests set others.
+	mode verity.Policy
 }
 
 // New opens the content-addressed store under root, creating its directories
@@ -56,7 +68,7 @@ func New(root string) (*Store, error) {
 	if root == "" {
 		return nil, errors.New("objectstore: empty store root")
 	}
-	s := &Store{root: root}
+	s := &Store{root: root, mode: verity.Mode}
 	// Create store directories on first use. The directories are traversable
 	// (0755) but the object files within are owner-only (0600); the store is
 	// read by the privileged ocicfs process that performs the mount.
@@ -100,7 +112,7 @@ func (s *Store) Open(d digest.Digest) (io.ReadCloser, error) {
 	}
 	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0) // #nosec G304 -- digest-derived object path
 	if err != nil {
-		return nil, fmt.Errorf("objectstore: open object %s: %w", d, err)
+		return nil, fmt.Errorf("objectstore: open object %s: %w", d, openError(err))
 	}
 	fi, err := f.Stat()
 	if err != nil {
@@ -142,10 +154,10 @@ func (s *Store) Has(d digest.Digest) (bool, error) {
 	return fi.Mode().IsRegular(), nil
 }
 
-// CheckVerity verifies the store filesystem can enable fs-verity, which ocicfs
-// requires for every content object. It enables verity on a throwaway probe file
-// so a pull fails fast with a clear error when the store is on a filesystem
-// without fs-verity support, rather than partway through writing objects.
+// CheckVerity reports whether the store filesystem can enable fs-verity. It
+// enables verity on a throwaway probe file, so a pull in required mode fails
+// fast with a clear error when it cannot, rather than partway through writing
+// objects, and an auto build can tell whether it runs with fs-verity.
 func (s *Store) CheckVerity() error {
 	f, err := os.CreateTemp(s.TempDir(), ".verity-check-*") // #nosec G304 -- store-owned temp dir
 	if err != nil {
@@ -174,10 +186,10 @@ func (s *Store) CheckVerity() error {
 	defer func() { _ = rf.Close() }()
 	if err := verity.Enable(rf); err != nil {
 		if errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOTTY) {
-			return fmt.Errorf("the store at %s is not on an fs-verity-capable filesystem, which ocicfs requires; point the store root at a filesystem with fs-verity support: %w", s.root, err)
+			return fmt.Errorf("the store at %s is not on an fs-verity-capable filesystem: %w", s.root, err)
 		}
 		if errors.Is(err, unix.EINVAL) {
-			return fmt.Errorf("the kernel on this host cannot build a %d-byte fs-verity Merkle block (page size %d), which ocicfs requires for stable per-file digests: %w", verity.BlockSize, os.Getpagesize(), err)
+			return fmt.Errorf("the kernel on this host cannot build a %d-byte fs-verity Merkle block (page size %d), which stable per-file digests need: %w", verity.BlockSize, os.Getpagesize(), err)
 		}
 		return fmt.Errorf("objectstore: verity preflight: %w", err)
 	}
@@ -249,18 +261,19 @@ func (s *Store) stage(ctx context.Context, tempPrefix string, expect digest.Dige
 }
 
 // seal commits the staged temp whose content digest is d at its
-// content-addressed path and returns its measured fs-verity digest. A temp for
-// an object the store does not hold is fs-verity-enabled, measured and committed
-// with no-replace semantics. A temp for an object already held is never
-// sealed: its fs-verity digest is computed in userspace and compared against
-// the existing object's measurement, which proves the bytes identical without
-// the enable ioctl's Merkle write, and the existing object's view link is
-// ensured. A collision on commit is resolved the same way. The temp is consumed
-// on every path: renamed into place on success, removed otherwise. Once
-// enabled, fs-verity makes the bytes immutable and kernel-verified on every
-// read for the life of the object. No fsync is taken per object: a pull makes
-// all of its writes durable with a single store-wide Sync before it writes the
-// binding that references them.
+// content-addressed path and returns its fs-verity digest. A temp for an object
+// the store does not hold is fs-verity-enabled, measured and committed with
+// no-replace semantics; in off mode its fs-verity digest is computed in
+// userspace instead and nothing is enabled. A temp for an
+// object already held is never sealed: its fs-verity digest is computed in
+// userspace and compared against the existing object's measurement, which
+// proves the bytes identical without the enable ioctl's Merkle write, and the
+// existing object's view link is ensured. A collision on commit is resolved the
+// same way. The temp is consumed on every path: renamed into place on success,
+// removed otherwise. Once enabled, fs-verity makes the bytes immutable and
+// kernel-verified on every read for the life of the object. No fsync is taken
+// per object: a pull makes all of its writes durable with a single store-wide
+// Sync before it writes the binding that references them.
 func (s *Store) seal(ctx context.Context, tempPath string, d digest.Digest) (string, error) {
 	defer removeTemp(tempPath)
 
@@ -269,6 +282,11 @@ func (s *Store) seal(ctx context.Context, tempPath string, d digest.Digest) (str
 	if err := ctx.Err(); err != nil {
 		return "", fmt.Errorf("objectstore: %w", err)
 	}
+	mode, err := s.Mode()
+	if err != nil {
+		return "", err
+	}
+	off := mode == verity.ModeOff
 	finalPath := s.objectPath(d.Hex())
 	present, err := presentObject(finalPath)
 	if err != nil {
@@ -279,7 +297,7 @@ func (s *Store) seal(ctx context.Context, tempPath string, d digest.Digest) (str
 		return "", fmt.Errorf("objectstore: reopen temp: %w", err)
 	}
 	var fsv string
-	if present {
+	if present || off {
 		fsv, err = verity.Digest(ctx, rf)
 		if err != nil {
 			_ = rf.Close()
@@ -296,7 +314,7 @@ func (s *Store) seal(ctx context.Context, tempPath string, d digest.Digest) (str
 		_ = rf.Close()
 		return "", fmt.Errorf("objectstore: %w", err)
 	}
-	if !present {
+	if !present && !off {
 		fsv, err = verity.Measure(rf)
 		if err != nil {
 			_ = rf.Close()
@@ -307,7 +325,7 @@ func (s *Store) seal(ctx context.Context, tempPath string, d digest.Digest) (str
 		return "", fmt.Errorf("objectstore: close verity temp: %w", err)
 	}
 	if present {
-		return s.resolveExisting(finalPath, fsv)
+		return s.resolveExisting(ctx, finalPath, fsv)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil { // #nosec G301 -- ocicfs-owned object-store shard dir
@@ -317,7 +335,7 @@ func (s *Store) seal(ctx context.Context, tempPath string, d digest.Digest) (str
 	// against the existing one rather than overwriting an immutable object.
 	if err := commitNoReplace(tempPath, finalPath); err != nil {
 		if errors.Is(err, os.ErrExist) {
-			return s.resolveExisting(finalPath, fsv)
+			return s.resolveExisting(ctx, finalPath, fsv)
 		}
 		return "", fmt.Errorf("objectstore: commit to %s: %w", finalPath, err)
 	}
@@ -411,15 +429,15 @@ func (s *Store) WriteObject(ctx context.Context, r io.Reader) (digest.Digest, Se
 }
 
 // resolveExisting confirms the object already at path is the one just staged
-// by comparing its measured fs-verity digest against stagedFsv, ensures its
-// view link, and returns that digest. The fs-verity measurement is a Merkle
-// root over the file's content, so a match proves byte-for-byte content
-// identity and that the existing object was sealed with the same fs-verity
-// parameters; an O(1) metadata read replaces a full re-hash of the existing
-// bytes. Ensuring the view link repairs an object a crash left committed but
-// unlinked.
-func (s *Store) resolveExisting(path string, stagedFsv string) (string, error) {
-	fsv, _, err := measureExisting(path)
+// by comparing its fs-verity digest against stagedFsv, ensures its view link,
+// and returns that digest. The fs-verity digest is a Merkle root over the
+// file's content, so a match proves byte-for-byte content identity; in
+// required mode it also proves the existing object was sealed with the same
+// parameters, and an O(1) metadata read replaces a full re-hash of the
+// existing bytes, which off mode re-hashes instead. Ensuring the view link
+// repairs an object a crash left committed but unlinked.
+func (s *Store) resolveExisting(ctx context.Context, path string, stagedFsv string) (string, error) {
+	fsv, _, err := s.measureExisting(ctx, path)
 	if err != nil {
 		return "", err
 	}
@@ -432,15 +450,32 @@ func (s *Store) resolveExisting(path string, stagedFsv string) (string, error) {
 	return fsv, nil
 }
 
-// measureExisting returns the measured fs-verity digest and the size of the
-// object already at path. The path is opened without following symlinks and
-// must be a regular file: a view link made through anything else would put
-// mutable indirection under the fs-verity view. A missing path surfaces as an
-// error satisfying errors.Is(err, os.ErrNotExist).
-func measureExisting(path string) (string, int64, error) {
+// viewObject returns the fs-verity digest the view-relative name viewName
+// carries and the size of the object d at path, which must be a regular file.
+func viewObject(d digest.Digest, path, viewName string) (string, int64, error) {
+	fsv, err := viewNameDigest(d, viewName)
+	if err != nil {
+		return "", 0, err
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return "", 0, fmt.Errorf("objectstore: stat existing %s: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return "", 0, fmt.Errorf("objectstore: existing %s is not a regular file", path)
+	}
+	return fsv, fi.Size(), nil
+}
+
+// measureExisting returns the fs-verity digest and the size of the object
+// already at path, as objectVerity computes it. The path is opened without
+// following symlinks and must be a regular file: a view link made through
+// anything else would put mutable indirection under the fs-verity view. A
+// missing path surfaces as an error satisfying errors.Is(err, os.ErrNotExist).
+func (s *Store) measureExisting(ctx context.Context, path string) (string, int64, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0) // #nosec G304 -- digest-derived object-store path
 	if err != nil {
-		return "", 0, fmt.Errorf("objectstore: open existing %s: %w", path, err)
+		return "", 0, fmt.Errorf("objectstore: open existing %s: %w", path, openError(err))
 	}
 	defer func() { _ = f.Close() }()
 	fi, err := f.Stat()
@@ -450,7 +485,7 @@ func measureExisting(path string) (string, int64, error) {
 	if !fi.Mode().IsRegular() {
 		return "", 0, fmt.Errorf("objectstore: existing %s is not a regular file", path)
 	}
-	fsv, err := verity.Measure(f)
+	fsv, err := s.objectVerity(ctx, f)
 	if err != nil {
 		return "", 0, fmt.Errorf("objectstore: cannot measure fs-verity for %s: %w", path, err)
 	}
@@ -497,33 +532,64 @@ func commitNoReplace(tempPath, finalPath string) error {
 	}
 }
 
-// VerityDigest returns the measured fs-verity digest of the stored object d.
-func (s *Store) VerityDigest(d digest.Digest) (string, error) {
+// VerityDigest returns the fs-verity digest of the stored object d: measured
+// by the kernel, or computed in userspace from its bytes in off mode.
+func (s *Store) VerityDigest(ctx context.Context, d digest.Digest) (string, error) {
 	path, err := s.ObjectPath(d)
 	if err != nil {
 		return "", err
 	}
 	f, err := os.Open(path) // #nosec G304 -- digest-derived object-store path
 	if err != nil {
-		return "", fmt.Errorf("objectstore: open %s: %w", path, err)
+		return "", fmt.Errorf("objectstore: open %s: %w", path, openError(err))
 	}
 	defer func() { _ = f.Close() }()
 
-	return verity.Measure(f)
+	return s.objectVerity(ctx, f)
 }
 
-// ResolveObject returns the measured fs-verity digest and the size of the
-// stored object d and ensures its view link, so an object the store already
-// holds can be referenced without staging its bytes again. Ensuring the link
-// repairs an object a crash left committed but unlinked. The object path is
-// opened without following symlinks and must be a regular file. An absent
-// object surfaces as an error satisfying errors.Is(err, os.ErrNotExist).
-func (s *Store) ResolveObject(d digest.Digest) (string, int64, error) {
+// objectVerity returns the fs-verity digest of the open object f: in off
+// mode the userspace digest of its bytes, otherwise the kernel's measurement.
+// Off mode reads an object with or without fs-verity, the userspace digest
+// of one with it equalling its measurement; required mode measures only, so
+// an object without fs-verity fails with the mismatch named.
+func (s *Store) objectVerity(ctx context.Context, f *os.File) (string, error) {
+	mode, err := s.Mode()
+	if err != nil {
+		return "", err
+	}
+	if mode == verity.ModeOff {
+		return verity.Digest(ctx, f)
+	}
+	fsv, err := verity.Measure(f)
+	if err != nil {
+		return "", requireVerity(err)
+	}
+	return fsv, nil
+}
+
+// ResolveObject returns the fs-verity digest and the size of the stored
+// object d, as VerityDigest computes it, and ensures its view link, so an
+// object the store already holds can be referenced without staging its bytes
+// again. Ensuring the link repairs an object a crash left committed but
+// unlinked. The object path is opened without following symlinks and must be
+// a regular file. An absent object surfaces as an error satisfying
+// errors.Is(err, os.ErrNotExist). In off mode a non-empty viewName, the
+// view-relative name ("ab/cdef...") the caller found for the object, is its
+// fs-verity digest, and the object's bytes are hashed only without one.
+func (s *Store) ResolveObject(ctx context.Context, d digest.Digest, viewName string) (string, int64, error) {
 	path, err := s.ObjectPath(d)
 	if err != nil {
 		return "", 0, err
 	}
-	fsv, size, err := measureExisting(path)
+	mode, err := s.Mode()
+	if err != nil {
+		return "", 0, err
+	}
+	if mode == verity.ModeOff && viewName != "" {
+		return viewObject(d, path, viewName)
+	}
+	fsv, size, err := s.measureExisting(ctx, path)
 	if err != nil {
 		return "", 0, err
 	}
@@ -563,20 +629,46 @@ var ErrInUse = errors.New("objectstore: object in use")
 // regular file, is skipped with a warning rather than failing the walk: a
 // foreign entry is not a stored object, and skipping it only retains it.
 func (s *Store) Walk(ctx context.Context, fn func(d digest.Digest, size int64) error) error {
-	base := s.objectPath("")
-	return filepath.WalkDir(base, func(path string, de fs.DirEntry, walkErr error) error {
+	return s.walk(ctx, func(d digest.Digest, fi fs.FileInfo) error {
+		return fn(d, fi.Size())
+	})
+}
+
+// ObjectView is one stored object as ViewNames saw it: its size and its
+// view name in view-relative form ("ab/cdef..."), empty when it has none.
+type ObjectView struct {
+	Size     int64
+	ViewName string
+}
+
+// ViewNames maps every stored object to its size and view name, by matching
+// inodes between one walk of the object tree and a later one of the view, so
+// an object committed during the walks is either left out or has an empty
+// view name when its view link lands after the view walk. It reads no object
+// content, which is how off mode, whose objects may carry no fs-verity
+// measurement, names them.
+func (s *Store) ViewNames(ctx context.Context) (map[digest.Digest]ObjectView, error) {
+	type inode struct{ dev, ino uint64 }
+	objects := map[digest.Digest]ObjectView{}
+	byInode := map[inode]digest.Digest{}
+	err := s.walk(ctx, func(d digest.Digest, fi fs.FileInfo) error {
+		st := fi.Sys().(*syscall.Stat_t)
+		objects[d] = ObjectView{Size: fi.Size()}
+		byInode[inode{dev: st.Dev, ino: st.Ino}] = d
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	base := s.viewPath("")
+	err = filepath.WalkDir(base, func(path string, de fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			return fmt.Errorf("objectstore: walk objects: %w", walkErr)
+			return fmt.Errorf("objectstore: walk view: %w", walkErr)
 		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if de.IsDir() {
-			return nil
-		}
-		d, ok := shardedDigest(base, path)
-		if !ok || !de.Type().IsRegular() {
-			slog.Warn("objectstore: skipping foreign entry in object store", "path", path)
+		if de.IsDir() || !de.Type().IsRegular() {
 			return nil
 		}
 		fi, err := de.Info()
@@ -584,33 +676,56 @@ func (s *Store) Walk(ctx context.Context, fn func(d digest.Digest, size int64) e
 			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("objectstore: stat object %s: %w", d, err)
+			return fmt.Errorf("objectstore: stat view entry %s: %w", path, err)
 		}
-		return fn(d, fi.Size())
+		st := fi.Sys().(*syscall.Stat_t)
+		d, ok := byInode[inode{dev: st.Dev, ino: st.Ino}]
+		if !ok {
+			return nil
+		}
+		rel, err := filepath.Rel(base, path)
+		if err != nil {
+			return fmt.Errorf("objectstore: view entry %s: %w", path, err)
+		}
+		o := objects[d]
+		o.ViewName = filepath.ToSlash(rel)
+		objects[d] = o
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return objects, nil
 }
 
-// Remove unlinks the stored object d, both its CAS name and its fs-verity
-// view name, unless a mounter holds the shared in-use lock on it, in which
-// case it returns an error matching ErrInUse. The unlinks happen while the
-// exclusive lock is held, pairing with the mount side, which takes the shared
-// lock and then refuses an inode whose name count dropped to zero. The view
-// name goes first: a crash between the unlinks then leaves the authoritative
-// CAS object with a missing view link, which the next deduplicating write
-// repairs, where the reverse order would leave an orphan view inode that
-// fails that write's same-inode check. An absent object removes nothing and
-// succeeds.
-func (s *Store) Remove(d digest.Digest) error {
+// Remove unlinks the stored object d, both its CAS name and its view name
+// viewName, in view-relative form ("ab/cdef..."), unless a mounter holds the
+// shared in-use lock on it, in which case it returns an error matching
+// ErrInUse. The unlinks happen while the exclusive lock is held, pairing
+// with the mount side, which takes the shared lock and then refuses an inode
+// whose name count dropped to zero. The view name goes first: a crash
+// between the unlinks then leaves the authoritative CAS object with a
+// missing view link, which the next deduplicating write repairs, where the
+// reverse order would leave an orphan view inode that fails that write's
+// same-inode check. An absent object removes nothing and succeeds. The
+// caller names the view entry, as the inventory that judged the object
+// unwanted found it, so nothing measures or hashes the object here.
+func (s *Store) Remove(d digest.Digest, viewName string) error {
 	path, err := s.ObjectPath(d)
 	if err != nil {
 		return err
 	}
+	fsv, err := viewNameDigest(d, viewName)
+	if err != nil {
+		return err
+	}
+	viewPath := s.viewPath(strings.TrimPrefix(fsv, "sha256:"))
 	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0) // #nosec G304 -- digest-derived object path
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("objectstore: open object %s: %w", d, err)
+		return fmt.Errorf("objectstore: open object %s: %w", d, openError(err))
 	}
 	defer func() {
 		if err := f.Close(); err != nil {
@@ -623,11 +738,6 @@ func (s *Store) Remove(d digest.Digest) error {
 		}
 		return fmt.Errorf("objectstore: lock object %s: %w", d, err)
 	}
-	fsv, err := verity.Measure(f)
-	if err != nil {
-		return fmt.Errorf("objectstore: measure object %s: %w", d, err)
-	}
-	viewPath := s.viewPath(strings.TrimPrefix(fsv, "sha256:"))
 	if err := os.Remove(viewPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("objectstore: remove view name %s: %w", viewPath, err)
 	}
@@ -635,6 +745,17 @@ func (s *Store) Remove(d digest.Digest) error {
 		return fmt.Errorf("objectstore: remove object %s: %w", d, err)
 	}
 	return nil
+}
+
+// viewNameDigest returns the fs-verity digest ("sha256:<hex>") that the
+// view-relative name viewName ("ab/cdef...") of object d carries.
+func viewNameDigest(d digest.Digest, viewName string) (string, error) {
+	shard, rest, _ := strings.Cut(viewName, "/")
+	fsv := digest.NewDigestFromEncoded(digest.SHA256, shard+rest)
+	if len(shard) != 2 || digestutil.ValidateSHA256(fsv) != nil {
+		return "", fmt.Errorf("objectstore: object %s: invalid view name %q", d, viewName)
+	}
+	return fsv.String(), nil
 }
 
 // InUse reports whether a mounter currently holds the shared in-use lock on
@@ -725,6 +846,36 @@ func (s *Store) PruneEmptyDirs() error {
 		}
 	}
 	return nil
+}
+
+// walk calls fn for every stored object with its digest and its Lstat
+// information, skipping foreign entries as Walk describes.
+func (s *Store) walk(ctx context.Context, fn func(d digest.Digest, fi fs.FileInfo) error) error {
+	base := s.objectPath("")
+	return filepath.WalkDir(base, func(path string, de fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return fmt.Errorf("objectstore: walk objects: %w", walkErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if de.IsDir() {
+			return nil
+		}
+		d, ok := shardedDigest(base, path)
+		if !ok || !de.Type().IsRegular() {
+			slog.Warn("objectstore: skipping foreign entry in object store", "path", path)
+			return nil
+		}
+		fi, err := de.Info()
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("objectstore: stat object %s: %w", d, err)
+		}
+		return fn(d, fi)
+	})
 }
 
 // removeTemp removes a staging temp, logging any failure other than the temp

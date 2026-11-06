@@ -384,6 +384,7 @@ func seedPoisonImage(t *testing.T, root, refFmt string) digest.Digest {
 // the fs-verity sealing a pull performs, so metadata is seedable on any host.
 func seedObject(t *testing.T, root string, d digest.Digest, data []byte) {
 	t.Helper()
+	skipPlainObjects(t)
 	path := octest.ObjectPath(root, d)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)

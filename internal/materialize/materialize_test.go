@@ -36,6 +36,7 @@ import (
 	"github.com/foundriesio/ocicfs/internal/ociseal"
 	"github.com/foundriesio/ocicfs/internal/octest"
 	"github.com/foundriesio/ocicfs/internal/rootfs"
+	"github.com/foundriesio/ocicfs/internal/verity"
 )
 
 // canonicalLayerFiles is a standard-layout single-layer tree — /usr and its
@@ -88,6 +89,102 @@ func TestMaterializeMatchesDirectoryAndMemorySources(t *testing.T) {
 	assertObjectBytesEqual(t, dirRoot, memRoot, lay.FileDigest)
 	assertObjectBytesEqual(t, dirRoot, memRoot, dirBuilt.Descriptor.Digest)
 	assertFileBytesEqual(t, octest.BindingPath(dirRoot, lay.Root, lay.Platform), octest.BindingPath(memRoot, lay.Root, lay.Platform))
+}
+
+// TestMaterializeStoreModesMatchOnDisk asserts a store without fs-verity
+// holds exactly the bytes a store with fs-verity holds for the same image:
+// every name, file type, symlink target and file content agrees. The store
+// without it is an auto build's store on the test temp dir, whose filesystem
+// cannot enable fs-verity.
+func TestMaterializeStoreModesMatchOnDisk(t *testing.T) {
+	if verity.Mode != verity.ModeAuto {
+		t.Skip("needs an auto build, which takes both modes from the filesystem")
+	}
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+	lay, err := octest.BuildSingleLayerGzip(t.TempDir(), ocispec.Platform{OS: "linux", Architecture: "amd64"},
+		octest.File{Name: "etc/config.txt", Mode: 0o644, Body: "hello from ocicfs - a config payload larger than the sixty-four byte inline limit\n"},
+		octest.File{Name: "usr/bin/app", Mode: 0o755, Body: strings.Repeat("binary ", 2000)},
+		octest.File{Name: "etc/link", Link: "etc/config.txt"},
+	)
+	if err != nil {
+		t.Fatalf("build layout: %v", err)
+	}
+
+	roots := map[verity.Policy]string{}
+	for _, mode := range []verity.Policy{verity.ModeOff, verity.ModeRequired} {
+		var root string
+		var obj *objectstore.Store
+		var img *imagestore.Store
+		if mode == verity.ModeOff {
+			root, obj, img = newPlainStores(t)
+		} else {
+			root, obj, img = newStores(t)
+		}
+		if got, err := obj.Mode(); err != nil || got != mode {
+			t.Fatalf("Mode = %q, %v; want %q", got, err, mode)
+		}
+		src, err := ocilayout.Open(lay.Dir)
+		if err != nil {
+			t.Fatalf("ocilayout.Open: %v", err)
+		}
+		if _, err := Materialize(context.Background(), obj, img, src, lay.Root, lay.Platform, newSlots(2)); err != nil {
+			t.Fatalf("Materialize into the %s store: %v", mode, err)
+		}
+		roots[mode] = root
+	}
+	off, required := treeContents(t, roots[verity.ModeOff]), treeContents(t, roots[verity.ModeRequired])
+	if !reflect.DeepEqual(off, required) {
+		for name, v := range required {
+			if off[name] != v {
+				t.Errorf("%s differs: off store %.40q, required store %.40q", name, off[name], v)
+			}
+		}
+		for name := range off {
+			if _, ok := required[name]; !ok {
+				t.Errorf("%s is only in the off store", name)
+			}
+		}
+		t.Fatal("the off and required stores differ on disk")
+	}
+}
+
+// treeContents maps every path under root to its type and its content or
+// link target.
+func treeContents(t *testing.T, root string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	err := filepath.WalkDir(root, func(path string, de fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		switch {
+		case de.IsDir():
+			out[rel] = "dir"
+		case de.Type()&fs.ModeSymlink != 0:
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			out[rel] = "link " + target
+		default:
+			data, err := os.ReadFile(path) // #nosec G304 G122 -- test store path
+			if err != nil {
+				return err
+			}
+			out[rel] = "file " + string(data)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
+	}
+	return out
 }
 
 // TestMaterializePersistsCanonicalFlag asserts the binding written by Materialize
@@ -157,6 +254,25 @@ func (s memorySource) Open(ctx context.Context, desc ocispec.Descriptor) (io.Rea
 		return nil, fmt.Errorf("materialize: memory blob %s: %w", desc.Digest, os.ErrNotExist)
 	}
 	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+// newPlainStores opens the stores on the test temp dir, skipping when its
+// filesystem can enable fs-verity.
+func newPlainStores(t *testing.T) (string, *objectstore.Store, *imagestore.Store) {
+	t.Helper()
+	root := t.TempDir()
+	obj, err := objectstore.New(root)
+	if err != nil {
+		t.Fatalf("objectstore.New: %v", err)
+	}
+	if obj.CheckVerity() == nil {
+		t.Skip("temp dir filesystem unexpectedly supports fs-verity")
+	}
+	img, err := imagestore.New(root)
+	if err != nil {
+		t.Fatalf("imagestore.New: %v", err)
+	}
+	return root, obj, img
 }
 
 func newStores(t *testing.T) (string, *objectstore.Store, *imagestore.Store) {
@@ -1292,7 +1408,12 @@ func assertMatchesFreshPull(t *testing.T, lay octest.Layout, root digest.Digest,
 func removeObjects(t *testing.T, obj *objectstore.Store, digests ...digest.Digest) {
 	t.Helper()
 	for _, d := range digests {
-		if err := obj.Remove(d); err != nil {
+		fsv, err := obj.VerityDigest(context.Background(), d)
+		if err != nil {
+			t.Fatalf("VerityDigest(%s): %v", d, err)
+		}
+		hex := strings.TrimPrefix(fsv, "sha256:")
+		if err := obj.Remove(d, hex[:2]+"/"+hex[2:]); err != nil {
 			t.Fatalf("Remove(%s): %v", d, err)
 		}
 	}

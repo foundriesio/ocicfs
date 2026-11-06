@@ -30,11 +30,12 @@ import (
 	"github.com/foundriesio/ocicfs/internal/ocilayout"
 	"github.com/foundriesio/ocicfs/internal/octest"
 	"github.com/foundriesio/ocicfs/internal/refstore"
+	"github.com/foundriesio/ocicfs/pkg/ocicfs"
 )
 
 func TestCommandsCoverM1Verbs(t *testing.T) {
 	root, _ := newRootCommand(io.Discard, io.Discard)
-	want := []string{"copy", "gc", "hold", "inspect", "ls", "mount", "publish", "pull", "release", "remove", "seal", "unmount"}
+	want := []string{"copy", "gc", "hold", "inspect", "ls", "mount", "publish", "pull", "release", "remove", "seal", "unmount", "version"}
 
 	// cobra adds its own "help" and "completion" commands; compare only ocicfs's.
 	builtins := map[string]bool{"help": true, "completion": true}
@@ -958,6 +959,9 @@ func writeCLIImage(t *testing.T, root, refFmt string, p ocispec.Platform) (diges
 // writeCLIObject stores data at the content-addressed path digest d names.
 func writeCLIObject(t *testing.T, root string, d digest.Digest, data []byte) {
 	t.Helper()
+	if ocicfs.BuildVerityMode == "required" {
+		t.Skip("seeds objects without fs-verity, which a build made in required mode refuses")
+	}
 	path := octest.ObjectPath(root, d)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("MkdirAll object: %v", err)

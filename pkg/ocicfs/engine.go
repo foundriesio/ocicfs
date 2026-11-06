@@ -258,8 +258,9 @@ type MountOptions struct {
 	// MetadataOnly mounts only the image's EROFS metadata, read-only on a
 	// loop device, without the object data plane a composefs mount attaches.
 	// The caller assembles its own single overlay over the mount with
-	// ObjectsDir as a data-only lower, passing verity=require so fs-verity
-	// stays enforced. It cannot be combined with the writable options.
+	// ObjectsDir as a data-only lower, passing verity=require when
+	// VerityRequired reports true so fs-verity stays enforced, and no verity
+	// option otherwise. It cannot be combined with the writable options.
 	MetadataOnly bool
 }
 
@@ -402,11 +403,11 @@ type Engine interface {
 	NewBuild(ctx context.Context, ref string, opts ...PullOption) (Build, error)
 	// Mount mounts ref at target: a read-only composefs tree by default — the
 	// image's EROFS metadata served through one overlay with ObjectsDir as a
-	// data-only lower and fs-verity required — or the image's verified EROFS
-	// metadata alone with WithMetadataOnly. Writable mounts are not
-	// supported: the writable With* options are rejected. Mount operates on
-	// content already present in the store and does not fetch over the
-	// network; pull ref first. A ref that
+	// data-only lower and fs-verity required unless this build runs the
+	// store in off mode — or the image's verified EROFS metadata alone with
+	// WithMetadataOnly. Writable mounts are not supported: the writable With*
+	// options are rejected. Mount operates on content already present in the
+	// store and does not fetch over the network; pull ref first. A ref that
 	// does not pin a digest resolves locally to the identity its most recent
 	// pull recorded, and a pinned index digest resolves to the manifest it
 	// offers for the host platform; every verification keys on that identity.
@@ -484,11 +485,27 @@ type Engine interface {
 	// into the store fail fast, or report the prerequisite on its own,
 	// without starting a build.
 	PreflightTools() error
-	// PreflightStore verifies the store's filesystem can enable fs-verity,
-	// which every content object requires. Materialization performs the
-	// same probe before writing objects; PreflightStore reports it up
-	// front, with the same error, independently of the tools check.
+	// PreflightStore verifies this build can write to the store: in a build
+	// made in required mode the filesystem must enable fs-verity, and an auto
+	// build probes it once to decide its mode, passing without fs-verity
+	// where the filesystem cannot enable it. Materialization makes the same
+	// check before writing objects; PreflightStore reports it up front, with
+	// the same error, independently of the tools check.
 	PreflightStore() error
+	// VerityState reports how this build runs the store: "enabled" with
+	// fs-verity, "disabled" without, or "unsupported" for a build made in
+	// required mode whose store filesystem cannot enable fs-verity, where a
+	// pull fails. It describes the build and the filesystem, not the objects
+	// the store holds. A build made in required mode probes the filesystem
+	// on every call; the probe writes a temporary file under the store.
+	VerityState() (string, error)
+	// VerityRequired reports whether this build runs the store with
+	// fs-verity: true in required mode, false in off mode, and in auto mode
+	// whatever the store's filesystem decided when it was probed; constant
+	// for the engine's life. A caller assembling its own overlay over a
+	// metadata-only mount passes verity=require exactly when it is true, and
+	// omits the verity option otherwise.
+	VerityRequired() (bool, error)
 }
 
 // Config configures a new Engine.

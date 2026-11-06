@@ -201,7 +201,8 @@ func skipMountEnvironment(err error) bool {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "Operation not permitted") ||
+	return errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) ||
+		strings.Contains(msg, "Operation not permitted") ||
 		strings.Contains(msg, "Permission denied")
 }
 
@@ -426,6 +427,7 @@ func TestUnmountNotMountedReturnsErrNotMounted(t *testing.T) {
 // store's object directory, and check that file content is served through the
 // data plane and that the upper takes writes.
 func TestMountMetadataOnlyConsumerOverlayE2E(t *testing.T) {
+	const consumerObjectBody = "served from the object store through the data-only lower, over the inline threshold\n"
 	storeRoot, cleanup, err := devtest.VerityRoot()
 	if errors.Is(err, devtest.ErrNoVerity) {
 		t.Skipf("verity-capable store root unavailable: %v", err)
@@ -437,6 +439,7 @@ func TestMountMetadataOnlyConsumerOverlayE2E(t *testing.T) {
 
 	lay, err := octest.BuildSingleLayerGzip(t.TempDir(), hostPlatform(),
 		octest.File{Name: "etc/config.txt", Mode: 0o644, Body: "hello from ocicfs\n"},
+		octest.File{Name: "etc/object.txt", Mode: 0o644, Body: consumerObjectBody},
 	)
 	if err != nil {
 		t.Fatalf("build layout: %v", err)
@@ -449,6 +452,10 @@ func TestMountMetadataOnlyConsumerOverlayE2E(t *testing.T) {
 		t.Skipf("fs-verity unsupported on the test filesystem: %v", err)
 	} else if err != nil {
 		t.Fatalf("Pull: %v", err)
+	}
+	required, err := eng.VerityRequired()
+	if err != nil {
+		t.Fatalf("VerityRequired: %v", err)
 	}
 
 	objects, err := eng.ObjectsDir()
@@ -493,10 +500,14 @@ func TestMountMetadataOnlyConsumerOverlayE2E(t *testing.T) {
 	metaMounted = true
 
 	// The metadata mount alone carries no file data; content is served only
-	// through an overlay with the object directory as its data-only lower.
+	// through an overlay with the object directory as its data-only lower,
+	// fs-verity-validated when the build runs the store with fs-verity.
 	opts := "lowerdir=" + meta + "::" + objects +
 		",upperdir=" + upper + ",workdir=" + work +
-		",redirect_dir=on,metacopy=on,verity=require"
+		",redirect_dir=on,metacopy=on"
+	if required {
+		opts += ",verity=require"
+	}
 	if err := unix.Mount("overlay", merged, "overlay", 0, opts); err != nil {
 		t.Fatalf("overlay mount: %v", err)
 	}
@@ -508,6 +519,10 @@ func TestMountMetadataOnlyConsumerOverlayE2E(t *testing.T) {
 	}
 	if !bytes.Equal(data, []byte("hello from ocicfs\n")) {
 		t.Fatalf("merged file = %q", data)
+	}
+	data, err = os.ReadFile(filepath.Join(merged, "etc", "object.txt")) // #nosec G304 -- test mount path
+	if err != nil || string(data) != consumerObjectBody {
+		t.Fatalf("merged object file = %q, %v", data, err)
 	}
 	if err := os.WriteFile(filepath.Join(merged, "scratch.txt"), []byte("rw"), 0o644); err != nil {
 		t.Fatalf("write through overlay upper: %v", err)

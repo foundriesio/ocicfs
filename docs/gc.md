@@ -98,7 +98,10 @@ legitimate one, for gc exactly as for mount; sealing is what closes that gap.
 
 A collection runs in two phases under the store lock, and never blocks on
 it. The first, the inventory, walks every object and measures its fs-verity
-digest; on a store of tens of thousands of objects that is nearly all of
+digest (a build running without fs-verity, whose objects may carry none, takes the
+name of the view entry sharing the object's inode, reading no content,
+and hashes only an object a crash left without a view entry); on a store
+of tens of thousands of objects that is nearly all of
 gc's run time, so it holds the lock shared, and pulls, holds, and mounts
 proceed alongside it. The second takes the lock exclusive, lists the
 reference records and holds afresh, decides what is unwanted, probes every

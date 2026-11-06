@@ -247,7 +247,7 @@ func verifiedPulledImage(ctx context.Context, obj *objectstore.Store, imgStore *
 	if err != nil {
 		return cachedImage{}, false, nil
 	}
-	measured, err := obj.VerityDigest(b.Descriptor.Digest)
+	measured, err := obj.VerityDigest(ctx, b.Descriptor.Digest)
 	if err != nil || measured != b.FsverityDigest {
 		return cachedImage{}, false, nil
 	}
