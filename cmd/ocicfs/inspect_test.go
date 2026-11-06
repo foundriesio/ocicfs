@@ -57,7 +57,7 @@ func TestWriteImageInfoRendering(t *testing.T) {
 	}
 
 	var text bytes.Buffer
-	if err := cli.WriteImageInfo(&text, cli.FormatText, info, false); err != nil {
+	if err := cli.WriteImageInfo(&text, cli.FormatText, info, "", false); err != nil {
 		t.Fatalf("WriteImageInfo text: %v", err)
 	}
 	lines := strings.Split(strings.TrimRight(text.String(), "\n"), "\n")
@@ -66,6 +66,7 @@ func TestWriteImageInfoRendering(t *testing.T) {
 		{"platform", "linux/arm64/v8"},
 		{"composefs", info.Composefs.Digest.String()},
 		{"fsverity", info.FsverityDigest},
+		{"verity", "unknown (build: " + ocicfs.BuildVerityMode + ")"},
 	}
 	if len(lines) != len(wantRows) {
 		t.Fatalf("text output has %d lines, want %d:\n%s", len(lines), len(wantRows), text.String())
@@ -101,7 +102,7 @@ func TestWriteImageInfoRendering(t *testing.T) {
 	}
 
 	var jsonBuf bytes.Buffer
-	if err := cli.WriteImageInfo(&jsonBuf, cli.FormatJSON, info, false); err != nil {
+	if err := cli.WriteImageInfo(&jsonBuf, cli.FormatJSON, info, "", false); err != nil {
 		t.Fatalf("WriteImageInfo json: %v", err)
 	}
 	var got cli.ImageInfoOutput
@@ -112,20 +113,20 @@ func TestWriteImageInfoRendering(t *testing.T) {
 		got.Composefs.Digest != info.Composefs.Digest.String() || got.Fsverity != info.FsverityDigest {
 		t.Fatalf("json output = %#v", got)
 	}
-	// Without --layers, and with no recorded rootfs size, the JSON contract is
-	// byte-compatible with the pre-layer shape: exactly the five legacy keys —
-	// no "layers", no "rootfs_size".
+	// Without --layers, and with no recorded rootfs size, the JSON carries
+	// the five legacy keys and the verity object — no "layers", no
+	// "rootfs_size".
 	var keys map[string]json.RawMessage
 	if err := json.Unmarshal(jsonBuf.Bytes(), &keys); err != nil {
 		t.Fatalf("unmarshal json keys: %v", err)
 	}
-	for _, k := range []string{"root", "platform", "diff_ids", "composefs", "fsverity"} {
+	for _, k := range []string{"root", "platform", "diff_ids", "composefs", "fsverity", "verity"} {
 		if _, ok := keys[k]; !ok {
-			t.Errorf("json missing legacy key %q:\n%s", k, jsonBuf.String())
+			t.Errorf("json missing key %q:\n%s", k, jsonBuf.String())
 		}
 	}
-	if len(keys) != 5 {
-		t.Errorf("json has %d keys, want exactly the 5 legacy fields:\n%s", len(keys), jsonBuf.String())
+	if len(keys) != 6 {
+		t.Errorf("json has %d keys, want exactly the 5 legacy fields and verity:\n%s", len(keys), jsonBuf.String())
 	}
 }
 
@@ -163,7 +164,7 @@ func TestWriteImageInfoLayersRendering(t *testing.T) {
 	}
 
 	var text bytes.Buffer
-	if err := cli.WriteImageInfo(&text, cli.FormatText, info, true); err != nil {
+	if err := cli.WriteImageInfo(&text, cli.FormatText, info, "", true); err != nil {
 		t.Fatalf("WriteImageInfo text: %v", err)
 	}
 	got := text.String()
@@ -204,7 +205,7 @@ func TestWriteImageInfoLayersRendering(t *testing.T) {
 	}
 
 	var jsonBuf bytes.Buffer
-	if err := cli.WriteImageInfo(&jsonBuf, cli.FormatJSON, info, true); err != nil {
+	if err := cli.WriteImageInfo(&jsonBuf, cli.FormatJSON, info, "", true); err != nil {
 		t.Fatalf("WriteImageInfo json: %v", err)
 	}
 	var out cli.ImageInfoOutput
@@ -235,7 +236,7 @@ func TestWriteImageInfoLayersRendering(t *testing.T) {
 	// The rootfs size row is part of the identity block, not layer detail: it
 	// renders in the default text output too, without --layers.
 	var plain bytes.Buffer
-	if err := cli.WriteImageInfo(&plain, cli.FormatText, info, false); err != nil {
+	if err := cli.WriteImageInfo(&plain, cli.FormatText, info, "", false); err != nil {
 		t.Fatalf("WriteImageInfo text without layers: %v", err)
 	}
 	if !strings.Contains(plain.String(), "rootfs") || !strings.Contains(plain.String(), "23.8 MiB") {

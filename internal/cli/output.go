@@ -138,7 +138,8 @@ func WriteHold(w io.Writer, format Format, ref, holder string, held bool) error 
 // field names are a stable contract for callers that parse ocicfs's output.
 // RootfsSize is the merged rootfs's apparent size in bytes (regular-file
 // content, hardlink groups counted once), omitted when the local binding
-// predates the field.
+// predates the field. Verity is the fs-verity state this binary runs the
+// store in.
 type ImageInfoOutput struct {
 	Root       string           `json:"root"`
 	Platform   string           `json:"platform"`
@@ -147,6 +148,46 @@ type ImageInfoOutput struct {
 	Fsverity   string           `json:"fsverity"`
 	RootfsSize int64            `json:"rootfs_size,omitempty"`
 	Layers     []LayerOutput    `json:"layers,omitempty"`
+	Verity     VerityOutput     `json:"verity"`
+}
+
+// VerityOutput is the JSON shape of the fs-verity state: the binary's build
+// mode ("auto", "required" or "off") and the state this build runs the store
+// in ("enabled", "disabled" or "unsupported"), left out when the store's
+// state could not be determined.
+type VerityOutput struct {
+	Build string `json:"build"`
+	State string `json:"state,omitempty"`
+}
+
+// text renders the state and build mode as one text value, "<state> (build:
+// <mode>)", with "unknown" for a state that could not be determined.
+func (v VerityOutput) text() string {
+	state := v.State
+	if state == "" {
+		state = "unknown"
+	}
+	return state + " (build: " + v.Build + ")"
+}
+
+// VersionOutput is the JSON shape of `ocicfs version`.
+type VersionOutput struct {
+	Version  string       `json:"version"`
+	Revision string       `json:"revision"`
+	Verity   VerityOutput `json:"verity"`
+}
+
+// WriteVersion renders the binary's version and the fs-verity state to w.
+// The text form is two lines: "ocicfs <version> (<revision>)" and
+// "verity: <state> (build: <mode>)". An empty state, for a store whose state
+// could not be determined, prints as unknown and is left out of the JSON.
+func WriteVersion(w io.Writer, format Format, version, revision, state string) error {
+	out := VersionOutput{Version: version, Revision: revision, Verity: VerityOutput{Build: ocicfs.BuildVerityMode, State: state}}
+	if format == FormatJSON {
+		return emitJSON(w, out)
+	}
+	_, err := fmt.Fprintf(w, "ocicfs %s (%s)\nverity: %s\n", out.Version, out.Revision, out.Verity.text())
+	return err
 }
 
 // DescriptorOutput is the JSON shape for an OCI descriptor in command output.
@@ -242,8 +283,11 @@ func digestRef(repo string, d digest.Digest) string {
 // WriteImageInfo renders an inspected image to w in the requested format.
 // withLayers appends the per-layer view — an aligned table in text output,
 // the layers array in JSON; without it the output is unchanged from before
-// the layer view existed.
-func WriteImageInfo(w io.Writer, format Format, info *ocicfs.ImageInfo, withLayers bool) error {
+// the layer view existed. state is the fs-verity state this binary runs the
+// store in, rendered with the build mode as one row in text output and the
+// verity object in JSON; an empty state, for one that could not be
+// determined, prints as unknown and is left out of the JSON.
+func WriteImageInfo(w io.Writer, format Format, info *ocicfs.ImageInfo, state string, withLayers bool) error {
 	diffIDs := make([]string, 0, len(info.DiffIDs))
 	for _, d := range info.DiffIDs {
 		diffIDs = append(diffIDs, d.String())
@@ -259,6 +303,7 @@ func WriteImageInfo(w io.Writer, format Format, info *ocicfs.ImageInfo, withLaye
 		},
 		Fsverity:   info.FsverityDigest,
 		RootfsSize: info.RootfsSize,
+		Verity:     VerityOutput{Build: ocicfs.BuildVerityMode, State: state},
 	}
 	if withLayers {
 		out.Layers = make([]LayerOutput, 0, len(info.Layers))
@@ -295,6 +340,7 @@ func WriteImageInfo(w io.Writer, format Format, info *ocicfs.ImageInfo, withLaye
 	if out.RootfsSize > 0 {
 		rows = append(rows, [2]string{"rootfs", humanBytes(out.RootfsSize)})
 	}
+	rows = append(rows, [2]string{"verity", out.Verity.text()})
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, r := range rows {
 		if _, err := fmt.Fprintf(tw, "%s\t%s\n", r[0], r[1]); err != nil {

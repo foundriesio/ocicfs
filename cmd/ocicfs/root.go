@@ -100,6 +100,7 @@ func newRootCommand(stdout, stderr io.Writer) (*cobra.Command, *globalOptions) {
 		newReleaseCommand(g),
 		newRemoveCommand(g),
 		newGCCommand(g),
+		newVersionCommand(g),
 	)
 	return root, g
 }

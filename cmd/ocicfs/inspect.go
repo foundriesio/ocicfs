@@ -4,6 +4,8 @@
 package main
 
 import (
+	"log/slog"
+
 	"github.com/spf13/cobra"
 
 	"github.com/foundriesio/ocicfs/internal/cli"
@@ -18,6 +20,10 @@ func newInspectCommand(g *globalOptions) *cobra.Command {
 		Short: "show a local image's identity and composefs binding",
 		Long: `Inspect reports the OCI identity of an image already in the local store and
 the composefs image built for it, reading only local state.
+
+It also shows whether this binary runs the store with fs-verity, with the
+fs-verity mode it was built with (see "ocicfs version --help"); the state is
+unknown, with a warning, when it cannot be determined.
 
 With --layers it adds a per-layer view. The archive size is the layer blob's
 size from the manifest descriptor (compressed for +gzip/+zstd layers); the
@@ -39,7 +45,14 @@ Examples:
 			if err != nil {
 				return err
 			}
-			return cli.WriteImageInfo(cmd.OutOrStdout(), format, info, layers)
+			// The image is reported even when the store's fs-verity state
+			// cannot be determined, for example on a read-only store where
+			// the probe cannot write its file.
+			state, err := eng.VerityState()
+			if err != nil {
+				slog.Warn("inspect: cannot determine the store's fs-verity state", "err", err)
+			}
+			return cli.WriteImageInfo(cmd.OutOrStdout(), format, info, state, layers)
 		},
 	}
 
