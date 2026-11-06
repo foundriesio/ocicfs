@@ -247,6 +247,31 @@ func TestRequiredModeFailsOnObjectWithoutFsverity(t *testing.T) {
 	}
 }
 
+// TestMountOffMode mounts an image pulled in off mode, on a filesystem
+// without fs-verity, and reads an object-backed file through it.
+func TestMountOffMode(t *testing.T) {
+	if verity.Mode == verity.ModeRequired {
+		t.Skip("a build made in required mode never runs a store in off mode")
+	}
+	root := plainStoreRoot(t)
+	eng, err := New(Config{Root: root})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	lay, err := pullModeLayout(t, eng, modeBody)
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	mountAndRead(t, eng, lay.Ref)
+	target := t.TempDir()
+	if err := eng.Mount(context.Background(), lay.Ref, target, WithMetadataOnly()); err != nil {
+		t.Fatalf("Mount metadata-only: %v", err)
+	}
+	if err := eng.Unmount(context.Background(), target); err != nil {
+		t.Fatalf("Unmount: %v", err)
+	}
+}
+
 // mountAndRead mounts ref read-only, reads the image's object-backed file
 // through the mount, and unmounts it, skipping where mounting is unavailable.
 func mountAndRead(t *testing.T, eng Engine, ref string) {
