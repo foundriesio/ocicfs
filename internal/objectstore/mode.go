@@ -31,7 +31,7 @@ func (s *Store) Mode() (verity.Policy, error) {
 	switch {
 	case err == nil:
 		s.mode = verity.ModeRequired
-	case verityUnsupported(err):
+	case VerityUnsupported(err):
 		slog.Debug("objectstore: the store's filesystem cannot enable fs-verity; storing objects without it", "root", s.root, "err", err)
 		s.mode = verity.ModeOff
 	default:
@@ -83,9 +83,9 @@ func noVerity(err error) bool {
 	return errors.Is(err, unix.ENODATA) || errors.Is(err, unix.ENOTTY) || errors.Is(err, unix.EOPNOTSUPP)
 }
 
-// verityUnsupported reports whether err from the fs-verity probe means the
+// VerityUnsupported reports whether err from the fs-verity probe means the
 // store's filesystem or kernel cannot enable fs-verity, as opposed to a
 // failure to run the probe.
-func verityUnsupported(err error) bool {
+func VerityUnsupported(err error) bool {
 	return errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOTTY) || errors.Is(err, unix.EINVAL)
 }
