@@ -35,7 +35,7 @@ import (
 
 func TestCommandsCoverM1Verbs(t *testing.T) {
 	root, _ := newRootCommand(io.Discard, io.Discard)
-	want := []string{"copy", "gc", "hold", "inspect", "ls", "mount", "publish", "pull", "release", "remove", "seal", "unmount"}
+	want := []string{"copy", "gc", "hold", "inspect", "ls", "mount", "publish", "pull", "release", "remove", "seal", "unmount", "version"}
 
 	// cobra adds its own "help" and "completion" commands; compare only ocicfs's.
 	builtins := map[string]bool{"help": true, "completion": true}
