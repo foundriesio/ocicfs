@@ -5,12 +5,14 @@ For a digest-pinned image manifest it computes the composefs integrity digests
 and records them as annotations, then pushes the annotated manifest back to
 the same repository. It reconstructs the platform's merged composefs image
 exactly as a device would at pull time, measures its fs-verity digest, and
-writes two annotations:
+rewrites only the image manifest, adding two annotations to it:
 
-- `composefs.merged.erofs.v1.fsverity-sha256-12` on the image manifest — the
-  fs-verity digest of the merged EROFS.
-- `composefs.config.fsverity-sha256-12` on the manifest's config descriptor —
-  the fs-verity digest of the config JSON.
+- `composefs.merged.erofs.v1.fsverity-sha256-12` in the manifest's top-level
+  `annotations` — the fs-verity digest of the merged EROFS.
+- `composefs.config.fsverity-sha256-12` in the `annotations` of the
+  manifest's `config` descriptor — the fs-verity digest of the config JSON.
+
+The config JSON blob itself is not changed.
 
 Both values are recorded as bare lowercase hex. The annotations are defined
 by the upstream
