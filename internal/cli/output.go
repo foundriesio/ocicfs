@@ -465,24 +465,29 @@ func FlagErrorFunc(_ *cobra.Command, err error) error {
 
 // HandleExit converts the error returned by cobra's ExecuteC into a process
 // exit code, printing diagnostics to errOut. cmd is the command cobra resolved,
-// used to print usage on a usage error.
+// used to print usage on a usage error; its root names the program in
+// diagnostics.
 func HandleExit(cmd *cobra.Command, err error, errOut io.Writer) int {
+	prog := "ocicfs"
+	if cmd != nil {
+		prog = cmd.Root().Name()
+	}
 	// Diagnostic writes to stderr are best-effort: a failed terminal write is
 	// not actionable, so the error is discarded.
 	switch {
 	case err == nil:
 		return 0
 	case errors.Is(err, context.Canceled):
-		_, _ = fmt.Fprintln(errOut, "ocicfs: cancelled")
+		_, _ = fmt.Fprintf(errOut, "%s: cancelled\n", prog)
 		return 130
 	case isUsageError(err):
-		_, _ = fmt.Fprintf(errOut, "ocicfs: %s\n", err.Error())
+		_, _ = fmt.Fprintf(errOut, "%s: %s\n", prog, err.Error())
 		if cmd != nil {
 			_, _ = fmt.Fprint(errOut, cmd.UsageString())
 		}
 		return 2
 	default:
-		_, _ = fmt.Fprintf(errOut, "ocicfs: %s\n", err.Error())
+		_, _ = fmt.Fprintf(errOut, "%s: %s\n", prog, err.Error())
 		return 1
 	}
 }
