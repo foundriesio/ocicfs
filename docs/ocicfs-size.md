@@ -1,7 +1,9 @@
 # Estimating image storage (`ocicfs-size`)
 
 `ocicfs-size` estimates how much disk space a set of OCI images needs under
-four storage models. Run it on a developer or CI machine, not on the device.
+four storage models. It also estimates update downloads and extra space
+needed while old and new images are both held. Run it on a developer or CI
+machine, not on the device.
 
 ## Build and run
 
@@ -112,3 +114,58 @@ Measurements against real ext4 stores on an amd64 VM and an arm64 board
 matched Overlay and EROFS/layer to the byte. File CAS/image was within
 0.11% after garbage collection. On boards with little RAM, ext4
 fragmentation adds some space that the model does not count.
+
+## Estimate an update
+
+Compare the image sets held before and after an update:
+
+```sh
+bin/ocicfs-size update --from docker.io/library/nginx:1.29.7 --to docker.io/library/nginx:1.29.8
+```
+
+```text
+UPDATE ESTIMATE · nginx:1.29.7 → nginx:1.29.8 · linux/amd64 · after cleanup: nginx:1.29.8 only
+- from: docker.io/library/nginx:1.29.7 @5a28f02fc9f6
+- to:   docker.io/library/nginx:1.29.8 @ab15d428b6a7
+
+Download (compressed bytes the device fetches):
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Transfer path                           Download  What it fetches                                Feeds
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+containerd pull                         60.0 MiB  7 of 7 layers (none shared with nginx:1.29.7)  every storage model
+ocicfs pull                             60.1 MiB  7 of 7 layers                                  File CAS/image
+ocicfs pull --delta                     60.1 MiB  7 of 7 layers whole: no zstd:chunked layers    File CAS/image
+ocicfs pull --delta, as zstd:chunked   ~12.6 MiB  modeled: 7 TOCs + 15 ranges (-79.1%)           File CAS/image
+
+Disk usage (fs-verity on; Overlay has none):
+───────────────────────────────────────────────────────────────────────────────────────────
+Storage model       before       needed           vs Overlay      after          vs Overlay
+───────────────────────────────────────────────────────────────────────────────────────────
+Overlay          166.2 MiB   +166.2 MiB                    -  166.2 MiB                   -
+EROFS/layer      165.0 MiB   +165.0 MiB    -1.2 MiB (-0.7%)   165.0 MiB   -1.2 MiB (-0.7%)
+File CAS/image   181.2 MiB    +30.6 MiB  -135.6 MiB (-81.6%)  181.2 MiB  +15.0 MiB (+9.0%)
+File CAS/layer   183.0 MiB    +31.0 MiB  -135.2 MiB (-81.4%)  183.0 MiB  +16.8 MiB (+10.1%)
+…
+```
+
+**Before** is the current storage; **needed** is extra free space while
+both sets are held; **after** is storage after cleanup. `--rollback` keeps
+the old images after cleanup. Each is the size above, taken over a set of
+images:
+
+```text
+before = size(from)
+needed = size(from and to together) − size(from)
+after  = size(to), or size(from and to together) with --rollback
+```
+
+`containerd pull` fetches whole layers not already held. `ocicfs pull`
+fetches whole layers it has not already saved; `--delta` fetches the table
+of contents and changed file byte ranges for zstd:chunked layers, and
+other layers whole. Every path also fetches each new image's index,
+manifest and config.
+
+The “as zstd:chunked” row models republishing images in that format; it is
+not the download for the images as published. Its per-file compression
+estimates were 4.5% below measured downloads for nginx and 6.5% for python,
+so treat it as a slight underestimate. See `update --help` for options.
