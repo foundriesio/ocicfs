@@ -104,14 +104,14 @@ Installation works on any Linux; *using* ocicfs needs:
   fs-verity and overlayfs verity validation for a store with fs-verity. A vendor
   kernel carrying the same support also works; [docs/mount.md](docs/mount.md)
   lists the exact mainline commits.
-- **A store filesystem with hardlinks, and fs-verity for integrity on read.**
-  ext4 needs a 4096-byte block size and the `verity` feature for fs-verity;
-  btrfs supports it out of the box. On a filesystem without it (ext4 without
-  `-O verity`, XFS, tmpfs) the default build stores objects without
-  fs-verity, which checks content when it is written but not when it is read; see
-  [docs/on-disk-layout.md](docs/on-disk-layout.md#the-fs-verity-mode) for what
-  that does and does not protect. [docs/mount.md](docs/mount.md) shows a loopback-ext4
-  setup for hosts without fs-verity.
+- **A store filesystem with hardlinks.** fs-verity is optional and adds
+  checks on every read. For fs-verity, ext4 needs 4096-byte blocks and
+  `-O verity`; btrfs supports it out of the box. Without it, the default
+  build checks content when written, not on later reads. The Go build tag
+  `ocicfs_verity_required` makes fs-verity mandatory. See
+  [the fs-verity mode](docs/on-disk-layout.md#the-fs-verity-mode).
+  To add it on a host without it, see the
+  [loopback ext4 setup](docs/mount.md#optional-add-fs-verity-with-a-loop-device).
 - **`mkcomposefs`** (from the
   [composefs](https://github.com/composefs/composefs) project) — needed
   only by `pull` and `seal`; all other commands work without it. The .deb
