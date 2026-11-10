@@ -248,7 +248,9 @@ For an image rooted at an index, `index.json` has two entries:
 
 A pin on either digest resolves for both `--from-tar` and the image Docker
 loads. Both `io.containerd.image.name` and
-`org.opencontainers.image.ref.name` carry the full name.
+`org.opencontainers.image.ref.name` carry the full name. `docker load`
+therefore registers the image under both names, the tag and
+`<repo>@<manifest digest>`; remove both to drop it from Docker.
 
 Copy verifies every blob as it writes it. The archive appears under its
 output name only when complete. The command prints each `index.json`
