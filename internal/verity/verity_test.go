@@ -55,6 +55,51 @@ func TestEnableMeasure(t *testing.T) {
 	}
 }
 
+// TestEnableRetriesWhileChildHoldsWriter reproduces the fork race: a child
+// process inherits a writable descriptor to the file and keeps it briefly after
+// the parent has closed its own, so the first enable attempts fail with ETXTBSY.
+// Enable must succeed once the child exits.
+func TestEnableRetriesWhileChildHoldsWriter(t *testing.T) {
+	root, cleanup, err := devtest.VerityRoot()
+	if errors.Is(err, devtest.ErrNoVerity) {
+		t.Skipf("verity-capable filesystem unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	p := filepath.Join(root, "obj")
+	w, err := os.Create(p) //nolint:gosec // p is a file under the verity test root
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.WriteString("hello fs-verity"); err != nil {
+		t.Fatal(err)
+	}
+	child := exec.Command("sleep", "0.1")
+	child.ExtraFiles = []*os.File{w}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = child.Wait() }()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.Open(p) //nolint:gosec // p is a file under the verity test root
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	if err := Enable(f); err != nil {
+		if devtest.IsVerityUnsupported(err) {
+			t.Skipf("fs-verity unsupported on the test filesystem: %v", err)
+		}
+		t.Fatalf("Enable: %v", err)
+	}
+}
+
 // TestDigestMatchesKernelAndTools cross-checks the userspace Digest against
 // three independent oracles: the kernel fs-verity measure, composefs-info
 // measure-file, and fsverity digest.
