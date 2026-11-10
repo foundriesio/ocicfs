@@ -143,8 +143,22 @@ func TestReadOnlyMountsComposefs(t *testing.T) {
 		t.Fatal("expected read-only mount to reject writes")
 	}
 
-	if len(loopsBacking(t, imagePath)) == 0 {
+	loops := loopsBacking(t, imagePath)
+	if len(loops) == 0 {
 		t.Fatal("no loop device backs the mounted image")
+	}
+	// The loop device reads the image with direct I/O wherever the backing
+	// filesystem supports it, so the image is not cached twice.
+	if supportsDirectIO(t, imagePath) {
+		for _, l := range loops {
+			dio, err := os.ReadFile(filepath.Join(filepath.Dir(l), "dio")) // #nosec G304 -- sysfs loop attribute path
+			if err != nil {
+				t.Fatalf("read loop dio: %v", err)
+			}
+			if strings.TrimSpace(string(dio)) != "1" {
+				t.Errorf("%s: dio = %q, want 1", filepath.Dir(l), strings.TrimSpace(string(dio)))
+			}
+		}
 	}
 	// The in-use lock must outlive the mounting process's own descriptors —
 	// ReadOnly already closed its image and loop handles — because the loop
@@ -357,6 +371,20 @@ func loopsBacking(t *testing.T, path string) []string {
 		}
 	}
 	return devs
+}
+
+// supportsDirectIO reports whether path's filesystem accepts O_DIRECT opens,
+// which the loop device needs to read it with direct I/O.
+func supportsDirectIO(t *testing.T, path string) bool {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_DIRECT, 0) // #nosec G304 -- test image path
+	if err != nil {
+		return false
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close %s: %v", path, err)
+	}
+	return true
 }
 
 // waitFor polls cond until it holds, failing the test after a short deadline.
