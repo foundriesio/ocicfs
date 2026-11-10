@@ -22,6 +22,7 @@ import (
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"github.com/foundriesio/ocicfs/internal/composefs"
 	"github.com/foundriesio/ocicfs/internal/devtest"
 	"github.com/foundriesio/ocicfs/internal/zstdchunked"
 	"github.com/foundriesio/ocicfs/pkg/ocicfs"
@@ -821,6 +822,13 @@ func TestDeltaMatchesPull(t *testing.T) {
 // process, keeping the per-layer figures the JSON report leaves out.
 func buildUpdate(t *testing.T, from, to string) *UpdateReport {
 	t.Helper()
+	return buildUpdateInline(t, from, to, composefs.InlineContentMax)
+}
+
+// buildUpdateInline is buildUpdate with regular files of at most inlineMax
+// bytes inline.
+func buildUpdateInline(t *testing.T, from, to string, inlineMax int64) *UpdateReport {
+	t.Helper()
 	ctx := context.Background()
 	sp, err := newSpool("")
 	if err != nil {
@@ -839,7 +847,47 @@ func buildUpdate(t *testing.T, from, to string) *UpdateReport {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return buildUpdateReport(ctx, a, b, false, ls, Settings{Profile: testProfile()}).Update
+	profile := testProfile()
+	profile.InlineMax = inlineMax
+	return buildUpdateReport(ctx, a, b, false, ls, Settings{Profile: profile}).Update
+}
+
+// TestUpdateInlineMax checks the download rows follow --inline-max. A file
+// the store lost with the from image is an object at 64 B, so both pulls
+// read the saved layer listing it again; at 4 KiB it is inline and comes
+// with the saved layer. A delta pull of a relabelled chunked image fetches
+// the inline files from the tables, more of them at 4 KiB.
+func TestUpdateInlineMax(t *testing.T) {
+	l0 := tarOf(t, dir("./"), file("x", strings.Repeat("x", 3000)))
+	gone := tarOf(t, whiteout("x"))
+	refs := writeLayout(t, t.TempDir(), testImage{layers: [][]byte{l0, gone}}, testImage{layers: [][]byte{l0}})
+	for _, c := range []struct {
+		inlineMax int64
+		blobs     int
+	}{{64, 1}, {4096, 0}} {
+		w := buildUpdateInline(t, refs[0], refs[1], c.inlineMax).Wire
+		if w.Ocicfs.Blobs != c.blobs || w.OcicfsDelta.Blobs != c.blobs {
+			t.Errorf("inline max %d: ocicfs %d blobs, delta %d, want %d", c.inlineMax, w.Ocicfs.Blobs, w.OcicfsDelta.Blobs, c.blobs)
+		}
+	}
+
+	to := relabelled(t, releaseN)
+	var missing [2]int
+	var bytes [2]int64
+	for i, inlineMax := range []int64{64, 4096} {
+		up := buildUpdateInline(t, releaseN, to, inlineMax)
+		var inline int
+		for _, d := range up.deltaLayers {
+			missing[i], inline = missing[i]+d.missing, inline+d.inline
+		}
+		if inline != missing[i] {
+			t.Errorf("inline max %d: %d missing, %d inline", inlineMax, missing[i], inline)
+		}
+		bytes[i] = up.Wire.OcicfsDelta.Bytes
+	}
+	if missing[1] <= missing[0] || bytes[1] <= bytes[0] {
+		t.Errorf("4 KiB: %d files, %d bytes; 64 B: %d files, %d bytes", missing[1], bytes[1], missing[0], bytes[0])
+	}
 }
 
 // TestDeltaConfigOnly checks a delta pull of an image that differs from the

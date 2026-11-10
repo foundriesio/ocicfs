@@ -12,7 +12,6 @@ import (
 	"github.com/opencontainers/go-digest"
 
 	"github.com/foundriesio/ocicfs/internal/cli"
-	"github.com/foundriesio/ocicfs/internal/composefs"
 	ocimat "github.com/foundriesio/ocicfs/internal/materialize"
 	"github.com/foundriesio/ocicfs/internal/rootfs"
 	"github.com/foundriesio/ocicfs/internal/zstdchunked"
@@ -160,10 +159,10 @@ func buildUpdateReport(ctx context.Context, from, to []*Image, rollback bool, ls
 		for i, img := range union {
 			rootOf[img], casOf[img] = roots[i], cas[i]
 		}
-		up.Wire.Ocicfs, up.details = ocicfsPull(from, to, rootOf, casOf)
+		up.Wire.Ocicfs, up.details = ocicfsPull(from, to, rootOf, casOf, s.Profile.InlineMax)
 		published := func(l LayerRef) (*LayerTOC, int64, string) { return tableOf(ls, l) }
 		var err error
-		if up.Wire.OcicfsDelta, up.deltaLayers, err = deltaPull(from, to, rootOf, casOf, published); err != nil {
+		if up.Wire.OcicfsDelta, up.deltaLayers, err = deltaPull(from, to, rootOf, casOf, s.Profile.InlineMax, published); err != nil {
 			up.Wire.OcicfsDelta = WirePath{Unavailable: err.Error()}
 		}
 		if lacksTable(ls, to) {
@@ -179,7 +178,7 @@ func buildUpdateReport(ctx context.Context, from, to []*Image, rollback bool, ls
 				}
 				return t, n, ""
 			}
-			w, layers, err := deltaPull(from, to, rootOf, casOf, modeled)
+			w, layers, err := deltaPull(from, to, rootOf, casOf, s.Profile.InlineMax, modeled)
 			if err == nil {
 				err = unmodeled
 			}
@@ -202,6 +201,7 @@ var wireAssumptions = []string{
 	"ocicfs pull: a layer is saved when read from its tar stream, never when built from its table",
 	"delta: TOC extents from the published blob; registry serves ranges; HTTP overhead and redirects not counted (5–13 % measured)",
 	"survivors from ocicfs-size's replay, which agrees with ocicfs's merge for the layers it accepts",
+	"ocicfs rows: a file at or below --inline-max comes from its table or a saved layer on every pull, never from the held images",
 }
 
 // containerdPull is what containerd's unpacker fetches for the to images
@@ -265,15 +265,17 @@ func metadataBlobs(img *Image) []metadataBlob {
 
 // ocicfsState is what an ocicfs store holds across the pulls of one update:
 // the images by identity, the metadata blobs by digest, the saved layers by
-// blob, size and diff_id, and the objects by content digest.
+// blob, size and diff_id, and the objects by content digest. Regular files
+// of at most inlineMax bytes live inline in their image, never as objects.
 type ocicfsState struct {
 	held, metadata, saved, objects map[string]bool
+	inlineMax                      int64
 }
 
 // newOcicfsState is the store the from images leave once collected: the
 // objects their merged roots reference, and the layers save keeps saved.
-func newOcicfsState(from []*Image, cas map[*Image]*casRoot, save func(*Image, int) bool) *ocicfsState {
-	st := &ocicfsState{held: map[string]bool{}, metadata: map[string]bool{}, saved: map[string]bool{}, objects: map[string]bool{}}
+func newOcicfsState(from []*Image, cas map[*Image]*casRoot, inlineMax int64, save func(*Image, int) bool) *ocicfsState {
+	st := &ocicfsState{held: map[string]bool{}, metadata: map[string]bool{}, saved: map[string]bool{}, objects: map[string]bool{}, inlineMax: inlineMax}
 	for _, img := range from {
 		st.held[identity(img)] = true
 		st.metadata[rootKey(img)], st.metadata[img.ManifestDigest] = true, true
@@ -283,7 +285,7 @@ func newOcicfsState(from []*Image, cas map[*Image]*casRoot, save func(*Image, in
 			}
 		}
 		for _, e := range cas[img].entries {
-			if e.Hardlink == "" && e.Mode.IsRegular() && e.Content == nil && e.Size > composefs.InlineContentMax {
+			if e.Hardlink == "" && e.Mode.IsRegular() && e.Content == nil && e.Size > inlineMax {
 				st.objects[e.Digest.String()] = true
 			}
 		}
@@ -332,7 +334,7 @@ func (st *ocicfsState) resolve(w *WirePath, img *Image) (held bool, detail strin
 // readLayer stores every file layer j of r carries, read whole, and
 // reports whether that read its blob: an image reads each blob once.
 func (st *ocicfsState) readLayer(read map[string]bool, r *root, j int) bool {
-	for d := range layerObjects(r.mats[j].inv) {
+	for d := range st.layerObjects(r.mats[j].inv) {
 		st.objects[d] = true
 	}
 	blob := r.img.Layers[j].BlobDigest
@@ -345,10 +347,10 @@ func (st *ocicfsState) readLayer(read map[string]bool, r *root, j int) bool {
 
 // layerObjects are the contents of the regular files of a layer ocicfs
 // stores as objects, hidden or not.
-func layerObjects(inv *LayerInv) map[string]bool {
+func (st *ocicfsState) layerObjects(inv *LayerInv) map[string]bool {
 	out := map[string]bool{}
 	for _, e := range inv.Entries {
-		if e.Kind == KindReg && e.Size > composefs.InlineContentMax {
+		if e.Kind == KindReg && e.Size > st.inlineMax {
 			out["sha256:"+e.Digest] = true
 		}
 	}
@@ -389,8 +391,8 @@ func survivors(r *root) []survivor {
 // image reads every layer it has no saved layer for, then each saved layer
 // that is the first to list a stored file the image shows and the store
 // still lacks. It returns the per-layer lines for --details too.
-func ocicfsPull(from, to []*Image, roots map[*Image]*root, cas map[*Image]*casRoot) (WirePath, []string) {
-	st := newOcicfsState(from, cas, func(*Image, int) bool { return true })
+func ocicfsPull(from, to []*Image, roots map[*Image]*root, cas map[*Image]*casRoot, inlineMax int64) (WirePath, []string) {
+	st := newOcicfsState(from, cas, inlineMax, func(*Image, int) bool { return true })
 	var w WirePath
 	var details []string
 	for _, img := range to {
@@ -415,7 +417,7 @@ func ocicfsPull(from, to []*Image, roots map[*Image]*root, cas map[*Image]*casRo
 		}
 		missing := map[string]bool{}
 		for _, s := range survivors(r) {
-			if s.size > composefs.InlineContentMax && !st.objects[s.digest] {
+			if s.size > st.inlineMax && !st.objects[s.digest] {
 				missing[s.digest] = true
 			}
 		}
@@ -424,7 +426,7 @@ func ocicfsPull(from, to []*Image, roots map[*Image]*root, cas map[*Image]*casRo
 				break
 			}
 			lists := false
-			for d := range layerObjects(r.mats[j].inv) {
+			for d := range st.layerObjects(r.mats[j].inv) {
 				if missing[d] {
 					delete(missing, d)
 					lists = true
@@ -575,8 +577,8 @@ func tableOf(ls *layerSet, l LayerRef) (*LayerTOC, int64, string) {
 // layer listing it, read whole. table gives each layer's table, the bytes
 // reading it costs and why a layer without one goes to its tar stream; a
 // table's blob size stands for the layer's.
-func deltaPull(from, to []*Image, roots map[*Image]*root, cas map[*Image]*casRoot, table func(LayerRef) (*LayerTOC, int64, string)) (WirePath, []deltaLayer, error) {
-	st := newOcicfsState(from, cas, func(img *Image, j int) bool {
+func deltaPull(from, to []*Image, roots map[*Image]*root, cas map[*Image]*casRoot, inlineMax int64, table func(LayerRef) (*LayerTOC, int64, string)) (WirePath, []deltaLayer, error) {
+	st := newOcicfsState(from, cas, inlineMax, func(img *Image, j int) bool {
 		t, _, _ := table(img.Layers[j])
 		return t == nil
 	})
@@ -625,7 +627,7 @@ func deltaPull(from, to []*Image, roots map[*Image]*root, cas map[*Image]*casRoo
 		var missing []rootfs.Payload
 		seen := map[string]bool{}
 		for _, s := range survivors(r) {
-			inline := s.size <= composefs.InlineContentMax
+			inline := s.size <= st.inlineMax
 			if seen[s.digest] || (inline && !layers[s.layer].table) || (!inline && st.objects[s.digest]) {
 				continue
 			}
@@ -645,7 +647,7 @@ func deltaPull(from, to []*Image, roots map[*Image]*root, cas map[*Image]*casRoo
 		}
 		// An inline file comes from the lowest layer whose table lists it.
 		for _, p := range listed {
-			if p.Size > composefs.InlineContentMax {
+			if p.Size > st.inlineMax {
 				continue
 			}
 		lowest:
@@ -660,7 +662,7 @@ func deltaPull(from, to []*Image, roots map[*Image]*root, cas map[*Image]*casRoo
 		}
 		for _, p := range unlisted {
 			for _, j := range reused {
-				if layerObjects(r.mats[j].inv)[p.Digest.String()] {
+				if st.layerObjects(r.mats[j].inv)[p.Digest.String()] {
 					if layers[j].reason == "saved" {
 						layers[j].reason = "saved, read whole"
 						layers[j].fetched += img.Layers[j].BlobSize
