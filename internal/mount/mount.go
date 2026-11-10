@@ -46,6 +46,10 @@ const runDir = "/run/ocicfs"
 // registered under, so /proc/mounts identifies them.
 const overlaySource = "composefs"
 
+// loopBlockSize is the loop device's logical block size: the EROFS block size,
+// which direct I/O on 4 KiB-sector backing storage needs.
+const loopBlockSize = 4096
+
 // ReadOnly mounts s.ImagePath at s.Target as a read-only composefs tree: the
 // image's EROFS metadata served through a single overlay whose data-only lower
 // layer is s.Basedir, with fs-verity required on every backing object unless
@@ -246,9 +250,13 @@ func lockLinked(img *os.File) error {
 	return nil
 }
 
-// attachLoop attaches img to a free loop device, read-only with autoclear,
-// and returns the open device. Allocation can race with other loop users, so
-// a device that is already busy by configure time is retried with a fresh one.
+// attachLoop attaches img to a free loop device, read-only with autoclear and
+// direct I/O, and returns the open device. Direct I/O with 4 KiB logical
+// blocks (the EROFS block size) stops the image's pages from being cached a
+// second time under the loop device. The kernel reads buffered anyway when
+// the image has fs-verity enabled or its filesystem lacks direct I/O.
+// Allocation can race with other loop users, so a device that is already busy
+// by configure time is retried with a fresh one.
 func attachLoop(img *os.File) (*os.File, error) {
 	ctl, err := os.OpenFile("/dev/loop-control", os.O_RDWR, 0)
 	if err != nil {
@@ -276,9 +284,10 @@ func attachLoop(img *os.File) (*os.File, error) {
 			return nil, fmt.Errorf("mount: open loop device %d: %w", n, err)
 		}
 		cfg := unix.LoopConfig{
-			Fd: uint32(img.Fd()), // #nosec G115 -- a file descriptor always fits in uint32
+			Fd:   uint32(img.Fd()), // #nosec G115 -- a file descriptor always fits in uint32
+			Size: loopBlockSize,
 			Info: unix.LoopInfo64{
-				Flags: unix.LO_FLAGS_READ_ONLY | unix.LO_FLAGS_AUTOCLEAR,
+				Flags: unix.LO_FLAGS_READ_ONLY | unix.LO_FLAGS_DIRECT_IO | unix.LO_FLAGS_AUTOCLEAR,
 			},
 		}
 		err = unix.IoctlLoopConfigure(int(dev.Fd()), &cfg) // #nosec G115 -- a file descriptor always fits in int
