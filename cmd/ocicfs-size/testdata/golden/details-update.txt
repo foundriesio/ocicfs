@@ -128,6 +128,7 @@ Assumptions:
   - ocicfs pull: a layer is saved when read from its tar stream, never when built from its table
   - delta: TOC extents from the published blob; registry serves ranges; HTTP overhead and redirects not counted (5–13 % measured)
   - survivors from ocicfs-size's replay, which agrees with ocicfs's merge for the layers it accepts
+  - ocicfs rows: a file at or below --inline-max comes from its table or a saved layer on every pull, never from the held images
 
 Exclusions:
   - OCI content cache (compressed blobs) of containerd
