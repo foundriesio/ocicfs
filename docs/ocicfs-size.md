@@ -4,6 +4,8 @@
 four storage models. It also estimates update downloads and extra space
 needed while old and new images are both held. Run it on a developer or CI
 machine, not on the device.
+Results for real updates of public images are in
+[ocicfs-size-results.md](ocicfs-size-results.md).
 
 ## Build and run
 
