@@ -17,13 +17,14 @@ import (
 
 // casRoot is one retained image as ocicfs prepares it: the merged rootfs
 // entries, the identity of the composefs image built from them and that
-// image's size.
+// image's size, and the saved layers its pull leaves.
 type casRoot struct {
 	img       *Image
 	id        string // sha256 of the composefs dump
 	canonical bool
 	entries   []composefs.Entry
 	size      int64
+	saved     map[string]int64 // saved layer file size by layer blob digest hex
 }
 
 // prepareCASRoot merges an image's layers the way ocicfs does, from the
@@ -31,15 +32,22 @@ type casRoot struct {
 // with regular files of at most inlineMax bytes inline. The image is
 // identified by the dump ocicfs writes: it carries the bytes of files ocicfs
 // inlines and the content digest of the others, so it pins the image for
-// any inlineMax.
+// any inlineMax. A pull saves each layer's scan record under the layer's blob
+// digest so a later pull can skip the blob; the record kept here is that
+// file, short of the blob size its header carries, and a layer without one
+// is too large for ocicfs to save.
 func prepareCASRoot(ctx context.Context, ls *layerSet, img *Image, inlineMax int64) (*casRoot, error) {
 	layers := make([]*rootfs.Layer, len(img.Layers))
+	saved := map[string]int64{}
 	for i, l := range img.Layers {
 		layer, err := ls.ocicfsLayer(ctx, l.DiffID, i)
 		if err != nil {
 			return nil, fmt.Errorf("layer %s: %w", l.DiffID, err)
 		}
 		layers[i] = layer
+		if data := ls.records[l.DiffID]; data != nil {
+			saved[digest.Digest(l.BlobDigest).Encoded()] = int64(len(data))
+		}
 	}
 	entries, canonical, err := rootfs.MergeEntries(layers, func(d digest.Digest) digest.Digest { return d })
 	if err != nil {
@@ -53,15 +61,15 @@ func prepareCASRoot(ctx context.Context, ls *layerSet, img *Image, inlineMax int
 	if err != nil {
 		return nil, err
 	}
-	return &casRoot{img: img, id: hex.EncodeToString(h.Sum(nil)), canonical: canonical, entries: entries, size: size}, nil
+	return &casRoot{img: img, id: hex.EncodeToString(h.Sum(nil)), canonical: canonical, entries: entries, size: size, saved: saved}, nil
 }
 
 // casSize estimates the ocicfs object store on ext4 for prepared roots:
 // one composefs image per distinct dump, and one object per distinct
 // digest among the files too large to inline and the roots' manifests,
 // configs and indexes, every file sealed with fs-verity when the store
-// seals. Its host metadata is the two sharded object namespaces and each
-// root's binding and reference files.
+// seals. Its host metadata is the two sharded object namespaces, each
+// root's binding and reference files, and the sharded saved layers.
 func casSize(roots []*casRoot, p Profile) *Breakdown {
 	b := &Breakdown{}
 	seal := func(size int64) {
@@ -122,8 +130,19 @@ func casSize(roots []*casRoot, p Profile) *Breakdown {
 		names = append(names, id)
 	}
 	blocks, files := casHostBlocks(roots, names)
-	b.Host = blocks * p.HostBlock
-	b.Files = int64(len(names)) + files
+	saved := map[string]int64{}
+	for _, r := range roots {
+		for d, size := range r.saved {
+			saved[d] = size
+		}
+	}
+	savedNames := make([]string, 0, len(saved))
+	for d, size := range saved {
+		savedNames = append(savedNames, d)
+		b.Host += alloc(size, p.HostBlock)
+	}
+	b.Host += (blocks + shardedDirBlocks(savedNames, 0)) * p.HostBlock
+	b.Files = int64(len(names)) + files + int64(len(saved))
 	b.Units = len(images)
 	b.Objects = len(payloads)
 	b.Reuse = casReuse(roots, p.InlineMax)

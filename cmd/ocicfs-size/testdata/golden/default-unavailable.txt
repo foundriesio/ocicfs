@@ -11,6 +11,6 @@ Storage model    Stored files  vs Overlay          Size  vs Overlay      Size (v
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 Overlay                  n/a‡           —          n/a‡           —                      —               —
 EROFS/layer              n/a‡           —          n/a‡           —                   n/a‡               —
-File CAS/image              6           —     100.0 KiB           —     124.0 KiB (+24.0%)               —
+File CAS/image              8           —     120.0 KiB           —     144.0 KiB (+20.0%)               —
 File CAS/layer           n/a‡           —          n/a‡           —                   n/a‡               —
 ‡ Overlay, EROFS/layer, File CAS/layer unavailable: layer sha256:d20abfa7638124c6b1bc367c7d38db170b6868172544a4f061021acf4c83a097: cross-layer hardlink /b -> /a

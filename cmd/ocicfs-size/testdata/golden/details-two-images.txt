@@ -6,14 +6,14 @@ OCI layers:       6 references · 4 unique blobs
 Compressed size:  89.5 KiB total · 53.5 KiB unique
 
 Estimated disk usage (formula-based): ext4 · 4 KiB blocks · no compression · inline max size 64 B (File CAS/image)
-───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-                                                        fs-verity off                            fs-verity on
-Storage model    Stored files    vs Overlay          Size           vs Overlay      Size (vs own off)        vs Overlay off
-───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-Overlay                     6             —     124.0 KiB                    —                      —                     —
-EROFS/layer                 4  -2 (-33.3%)      124.0 KiB        +0 B (+0.0%)      156.0 KiB (+25.8%)   +32.0 KiB (+25.8%)
-File CAS/image             15  +9 (+150.0%)     236.0 KiB  +112.0 KiB (+90.3%)     304.0 KiB (+28.8%)  +180.0 KiB (+145.2%)
-File CAS/layer             14  +8 (+133.3%)     168.0 KiB   +44.0 KiB (+35.5%)     224.0 KiB (+33.3%)  +100.0 KiB (+80.6%)
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                          fs-verity off                            fs-verity on
+Storage model    Stored files     vs Overlay          Size            vs Overlay      Size (vs own off)        vs Overlay off
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Overlay                     6              —     124.0 KiB                     —                      —                     —
+EROFS/layer                 4   -2 (-33.3%)      124.0 KiB        +0 B (+0.0%)       156.0 KiB (+25.8%)   +32.0 KiB (+25.8%)
+File CAS/image             19  +13 (+216.7%)     272.0 KiB  +148.0 KiB (+119.4%)     340.0 KiB (+25.0%)  +216.0 KiB (+174.2%)
+File CAS/layer             14   +8 (+133.3%)     168.0 KiB   +44.0 KiB (+35.5%)      224.0 KiB (+33.3%)  +100.0 KiB (+80.6%)
 
 STORAGE PROJECTION · modelled allocation per store, not paths
 █ allocation without fs-verity · ▒ fs-verity increment
@@ -21,7 +21,7 @@ STORAGE PROJECTION · modelled allocation per store, not paths
 
 ┌─ Overlay · 0.1 MiB ──────────────────────────────────────────────────┐
 │ 4 upper directories, one per snapshot                                │
-│ ████████████████                                             0.1 MiB │
+│ ███████████████                                              0.1 MiB │
 │ file payload 0.1 MiB (of which padding 0.0 MiB)                      │
 │ host 0.1 MiB · 12 inodes                                             │
 │ unused versions 0 (0.0 MiB allocated, kept)                          │
@@ -33,7 +33,7 @@ STORAGE PROJECTION · modelled allocation per store, not paths
 
 ┌─ EROFS/layer · 0.2 MiB with fs-verity ───────────────────────────────┐
 │ 4 layer.erofs images, one per snapshot                               │
-│ ████████████████▒▒▒▒▒                                        0.2 MiB │
+│ ███████████████▒▒▒                                           0.2 MiB │
 │ without fs-verity 0.1 MiB · fs-verity +0.0 MiB                       │
 │ file payload 0.1 MiB · image layout 0.0 MiB · host 0.1 MiB           │
 │ unused versions 0 (0.0 MiB allocated, kept)                          │
@@ -45,9 +45,9 @@ STORAGE PROJECTION · modelled allocation per store, not paths
 
 ┌─ File CAS/image · 0.3 MiB with fs-verity ────────────────────────────┐
 │ 2 composefs images (0.0 MiB) · 5 shared objects (0.1 MiB)            │
-│ ███████████████████████████████▒▒▒▒▒▒▒▒▒                     0.3 MiB │
-│ without fs-verity 0.2 MiB                                            │
-│ fs-verity +0.1 MiB · OCI metadata 0.0 MiB · host 0.1 MiB             │
+│ ████████████████████████████████▒▒▒▒▒▒▒▒                     0.3 MiB │
+│ without fs-verity 0.3 MiB                                            │
+│ fs-verity +0.1 MiB · OCI metadata 0.0 MiB · host 0.2 MiB             │
 │ inline content 0.0 MiB, inside the composefs images                  │
 │ reuse: rootfs images shared between images 0 of 2 (0.0 MiB)          │
 │   contents used more than once 3 (0.0 MiB of extra uses)             │
@@ -57,7 +57,7 @@ STORAGE PROJECTION · modelled allocation per store, not paths
 
 ┌─ File CAS/layer · 0.2 MiB with fs-verity ────────────────────────────┐
 │ 4 layer metadata images (0.0 MiB) · 6 objects (0.1 MiB)              │
-│ ██████████████████████▒▒▒▒▒▒▒                                0.2 MiB │
+│ ████████████████████▒▒▒▒▒▒                                   0.2 MiB │
 │ without fs-verity 0.2 MiB (not a valid configuration)                │
 │ fs-verity +0.1 MiB · host 0.1 MiB · unused versions 0 (0.0 MiB       │
 │   allocated, kept)                                                   │
