@@ -78,7 +78,7 @@ fs-verity      per sealed file: one descriptor block, plus a Merkle tree of
                about 1/127 of the file in whole blocks; files up to 4 KiB
                have no tree
 host metadata  ext4 directory and shared xattr blocks, long symlinks, and the
-               store's small files: bindings and references
+               store's small files: bindings, references, saved scan records
 ```
 
 | Model | File data | Images | Sealed with fs-verity |

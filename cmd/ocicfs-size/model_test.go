@@ -277,8 +277,11 @@ func TestCASSize(t *testing.T) {
 	if b.Units != 1 || b.Objects != 1 || b.PayloadAlloc != 4096 || b.PayloadBytes != 65 || b.Inline != 64 || b.OCIMeta != meta {
 		t.Errorf("one root: %+v", b)
 	}
-	if b.Files != 1+2+1+1+1 { // object, manifest and config, image, binding, reference
+	if b.Files != 1+2+1+1+1+1 { // object, manifest and config, image, binding, reference, saved layer
 		t.Errorf("one root: %d files", b.Files)
+	}
+	if len(roots[0].saved) != 1 {
+		t.Errorf("one layer: %d saved layers", len(roots[0].saved))
 	}
 	if want := verityBytes(roots[0].size, 4096, 4096) + 3*4096; b.Verity != want {
 		t.Errorf("verity %d, want %d", b.Verity, want)
@@ -286,6 +289,9 @@ func TestCASSize(t *testing.T) {
 	both := casSize(roots, p)
 	if both.Units != 1 || both.OCIMeta != meta+alloc(roots[1].img.ManifestSize, 4096)+alloc(roots[1].img.ConfigSize, 4096) {
 		t.Errorf("two roots: %+v", both)
+	}
+	if both.Files != b.Files+2+1+1 { // manifest and config, binding, reference; image and saved layer shared
+		t.Errorf("two roots: %d files", both.Files)
 	}
 	if both.Host <= b.Host {
 		t.Errorf("a second root adds no binding: %d <= %d", both.Host, b.Host)

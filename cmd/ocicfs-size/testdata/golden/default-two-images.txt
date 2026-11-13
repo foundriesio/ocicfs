@@ -6,11 +6,11 @@ OCI layers:       6 references · 4 unique blobs
 Compressed size:  89.5 KiB total · 53.5 KiB unique
 
 Estimated disk usage (formula-based): ext4 · 4 KiB blocks · no compression · inline max size 64 B (File CAS/image)
-───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-                                                        fs-verity off                            fs-verity on
-Storage model    Stored files    vs Overlay          Size           vs Overlay      Size (vs own off)        vs Overlay off
-───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-Overlay                     6             —     124.0 KiB                    —                      —                     —
-EROFS/layer                 4  -2 (-33.3%)      124.0 KiB        +0 B (+0.0%)      156.0 KiB (+25.8%)   +32.0 KiB (+25.8%)
-File CAS/image             15  +9 (+150.0%)     236.0 KiB  +112.0 KiB (+90.3%)     304.0 KiB (+28.8%)  +180.0 KiB (+145.2%)
-File CAS/layer             14  +8 (+133.3%)     168.0 KiB   +44.0 KiB (+35.5%)     224.0 KiB (+33.3%)  +100.0 KiB (+80.6%)
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                          fs-verity off                            fs-verity on
+Storage model    Stored files     vs Overlay          Size            vs Overlay      Size (vs own off)        vs Overlay off
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Overlay                     6              —     124.0 KiB                     —                      —                     —
+EROFS/layer                 4   -2 (-33.3%)      124.0 KiB        +0 B (+0.0%)       156.0 KiB (+25.8%)   +32.0 KiB (+25.8%)
+File CAS/image             19  +13 (+216.7%)     272.0 KiB  +148.0 KiB (+119.4%)     340.0 KiB (+25.0%)  +216.0 KiB (+174.2%)
+File CAS/layer             14   +8 (+133.3%)     168.0 KiB   +44.0 KiB (+35.5%)      224.0 KiB (+33.3%)  +100.0 KiB (+80.6%)
