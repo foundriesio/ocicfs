@@ -393,7 +393,9 @@ releases to benefit from delta pulls.
 ### Layer format and verification
 
 Publish zstd:chunked layers with
-`skopeo copy --dest-compress-format zstd:chunked`.
+`skopeo copy --dest-compress-format zstd:chunked --dest-force-compress-format`.
+Without the second option, skopeo keeps layers that are already compressed,
+so a gzip image stays gzip.
 
 These are standard `tar+zstd` blobs with a per-file table of contents.
 Their descriptors carry the
