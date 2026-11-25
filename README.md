@@ -177,6 +177,7 @@ by the repository's tests.
   [mounting](docs/mount.md), [sealing](docs/seal.md).
 - **Manage the store:** [inspect](docs/inspect.md),
   [list and remove](docs/ls-remove.md), [holds and gc](docs/gc.md).
+- **Integrate:** [end-to-end integration with cfs-snapshotter](docs/integration.md).
 - **Plan storage:** [image storage and update estimates](docs/ocicfs-size.md).
 - **Understand the design:** [why ocicfs exists](docs/why.md),
   [ADR 0001: architecture](docs/adr/0001-high-level-architecture.md),
