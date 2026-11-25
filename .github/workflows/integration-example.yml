@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Runs the worked example behind docs/integration.md on a hosted runner,
+# with the released packages of ocicfs and cfs-snapshotter. One step per
+# stage of the guide; each runs a script from examples/integration.
+name: Integration example
+
+on:
+  push:
+    paths:
+      - docs/integration.md
+      - examples/integration/**
+      - .github/workflows/integration-example.yml
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-example-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OCICFS_VERSION: 0.5.1
+  CFS_SNAPSHOTTER_VERSION: 0.5.1
+  DOCKER_PACKAGE: 5:29.7.2-1~ubuntu.24.04~noble
+  CONTAINERD_PACKAGE: 2.3.3-1~ubuntu.24.04~noble
+  COMPOSEFS_VERSION: 1.0.8
+  SKOPEO_VERSION: 1.25.1
+  # A private package of this repository; each run publishes its own tags.
+  IMAGE: ghcr.io/${{ github.repository }}/integration-example
+  TAG_SUFFIX: ${{ github.run_id }}
+
+jobs:
+  example:
+    name: publish, preload, update, roll back, finalize
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Prerequisites
+        run: examples/integration/0-prerequisites.sh
+
+      - name: Log in to the registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Publishing
+        run: examples/integration/1-publish.sh
+
+      - name: Host/device setup
+        run: examples/integration/2-host-setup.sh
+
+      - name: Preloading from an archive
+        run: examples/integration/3-preload.sh
+
+      - name: Updating with a delta pull
+        run: examples/integration/4-update.sh
+
+      - name: Rolling back the update
+        run: examples/integration/5-rollback.sh
+
+      # Update once more, to show the other outcome.
+      - name: Updating again
+        run: examples/integration/4-update.sh
+
+      - name: Finalizing the update
+        run: examples/integration/5-finalize.sh
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          sudo journalctl --no-pager -n 100 -u cfs-snapshotter -u containerd -u docker || true
+          sudo ocicfs ls || true
+          docker ps -a || true

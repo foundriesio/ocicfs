@@ -11,6 +11,8 @@ Integrating ocicfs and [cfs-snapshotter][cfs] involves decisions at four stages 
 
 This guide lists these decisions and their trade-offs, and links to the documentation that covers each step.
 
+For one path through all four stages as runnable scripts, see the [integration example](../examples/integration/README.md).
+
 ## Summary
 
 Most goals need a decision at more than one stage. Pick the goals you want and apply every cell in their rows.
@@ -18,7 +20,7 @@ Most goals need a decision at more than one stage. Pick the goals you want and a
 | If you want | Publishing | Host setup | Preloading and updating |
 |---|---|---|---|
 | Delta pulls: download only the changed files instead of whole layers | [`zstd:chunked` layers](#publishing) | [Preloaded mode](#hostdevice-setup) | [`ocicfs pull --delta`](#updating), with the previous version still in the store as the base |
-| Storage usage optimization: no layer archives kept in containerd's content store | | [Preloaded mode](#hostdevice-setup) | [`ocicfs pull`](#preloading), then register the image with a metadata-only runtime pull (`docker pull`) |
+| Storage usage optimization: no layer archives kept in containerd's content store | | [Preloaded mode](#hostdevice-setup) | [`ocicfs pull`](#preloading), then register the image with a metadata-only runtime pull (`docker pull`), which needs the registry to be reachable |
 | Publisher-attested merged rootfs (all image layers combined), verified on every use | [Sealed image](#publishing) | [fs-verity](#hostdevice-setup) | Preload and update by [pinned image digest](#publishing) |
 | File content checked on every read | | [fs-verity](#hostdevice-setup) | |
 | First use without a registry | [Image archive](#preloading) | | [Import and load the archive](#preloading) |
@@ -54,7 +56,7 @@ Decide when and how to preload container images onto the host/device.
 **How to preload**
 
 1. [Pull images directly from a registry][registry-pull] with `ocicfs pull`, then [run `docker pull`][preload-run] to register them with the runtime. The image is already in the store, so `docker pull` downloads only the manifest and config, not the layers. Docker 29.9 or newer needs [`"lazy-pull": true`][lazy-pull] for this.
-2. [Save images to an OCI archive][copy], [import it][from-archive] with `ocicfs pull`, then [load it into the runtime][offline-load]. `docker load` copies the archive's layers into containerd's content store, so this path does not save that storage.
+2. [Save images to an OCI archive][copy], [import it][from-archive] with `ocicfs pull`, then [load it into the runtime][offline-load]. `docker load` copies the archive's layers into containerd's content store, so this path does not save that storage. To save it, register the imported image with `docker pull` instead of loading it. That downloads the manifest and config, so the registry must be reachable at that moment and the first start is not fully offline.
 
 ## Updating
 
