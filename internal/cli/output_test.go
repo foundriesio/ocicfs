@@ -53,3 +53,20 @@ func TestWriteFsckReportText(t *testing.T) {
 		t.Fatalf("text = %q", text.String())
 	}
 }
+
+// TestWriteFsckReportPullAgain: an image whose binding a repair removed is
+// marked for a pull, and the last line says so.
+func TestWriteFsckReportPullAgain(t *testing.T) {
+	removed := true
+	report := &ocicfs.FsckReport{Images: []ocicfs.FsckImage{{
+		Digest: "sha256:abc", Platform: "linux/arm64/v8", BindingRemoved: &removed,
+		Objects: []ocicfs.FsckObject{{Fsverity: "sha256:def", Problem: ocicfs.FsckMissing}},
+	}}}
+	var text bytes.Buffer
+	if err := WriteFsckReport(&text, FormatText, report); err != nil {
+		t.Fatalf("WriteFsckReport: %v", err)
+	}
+	if got := text.String(); !strings.Contains(got, "sha256:abc linux/arm64/v8 PULL AGAIN") || !strings.Contains(got, "pull each image marked PULL AGAIN") {
+		t.Fatalf("text = %q", got)
+	}
+}

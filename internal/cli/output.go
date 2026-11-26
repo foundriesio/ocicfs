@@ -603,6 +603,9 @@ type FsckImageOutput struct {
 	Intact   bool               `json:"intact"`
 	Error    string             `json:"error"`
 	Objects  []FsckObjectOutput `json:"objects"`
+	// BindingRemoved is present after a repair: true when the image must be
+	// pulled again.
+	BindingRemoved *bool `json:"binding_removed,omitempty"`
 }
 
 // FsckObjectOutput is one failed object in FsckOutput. Digest and Fsverity
@@ -612,16 +615,21 @@ type FsckObjectOutput struct {
 	Fsverity string `json:"fsverity,omitempty"`
 	Problem  string `json:"problem"`
 	Detail   string `json:"detail,omitempty"`
+	// Fixed is present after a repair. InUse marks an object the repair left
+	// because a mounted image uses it.
+	Fixed *bool `json:"fixed,omitempty"`
+	InUse bool  `json:"in_use,omitempty"`
 }
 
 // WriteFsckReport renders a check report to w in the requested format.
 func WriteFsckReport(w io.Writer, format Format, r *ocicfs.FsckReport) error {
 	out := FsckOutput{Intact: r.Intact, Images: []FsckImageOutput{}, Unreferenced: fsckObjects(r.Unreferenced)}
-	failed := 0
+	failed, pulls, repaired := 0, 0, false
 	for _, img := range r.Images {
 		if !img.Intact {
 			failed++
 		}
+		repaired = repaired || img.BindingRemoved != nil
 		refs := img.Refs
 		if refs == nil {
 			refs = []string{}
@@ -629,6 +637,7 @@ func WriteFsckReport(w io.Writer, format Format, r *ocicfs.FsckReport) error {
 		out.Images = append(out.Images, FsckImageOutput{
 			Digest: img.Digest.String(), Platform: img.Platform, Refs: refs,
 			Intact: img.Intact, Error: img.Error, Objects: fsckObjects(img.Objects),
+			BindingRemoved: img.BindingRemoved,
 		})
 	}
 	if format == FormatJSON {
@@ -638,6 +647,10 @@ func WriteFsckReport(w io.Writer, format Format, r *ocicfs.FsckReport) error {
 		state := "intact"
 		if !img.Intact {
 			state = "NOT INTACT"
+		}
+		if img.BindingRemoved != nil && *img.BindingRemoved {
+			state = "PULL AGAIN"
+			pulls++
 		}
 		if _, err := fmt.Fprintf(w, "%s %s %s %s\n", img.Digest, img.Platform, state, scrubControl(strings.Join(img.Refs, " "))); err != nil {
 			return err
@@ -659,9 +672,25 @@ func WriteFsckReport(w io.Writer, format Format, r *ocicfs.FsckReport) error {
 			return err
 		}
 	}
-	_, err := fmt.Fprintf(w, "%d %s checked, %d not intact; %d other %s failed\n",
+	if _, err := fmt.Fprintf(w, "%d %s checked, %d not intact; %d other %s failed\n",
 		len(out.Images), plural(len(out.Images), "image"), failed,
-		len(out.Unreferenced), plural(len(out.Unreferenced), "object"))
+		len(out.Unreferenced), plural(len(out.Unreferenced), "object")); err != nil {
+		return err
+	}
+	var next string
+	switch {
+	case out.Intact:
+	case pulls > 0:
+		next = "pull each image marked PULL AGAIN from its source, then run `ocicfs fsck` again"
+	case repaired:
+		next = "run `ocicfs fsck` again to see what is left"
+	default:
+		next = "to repair: make a source for these images reachable, run `ocicfs fsck --fix`, then pull each image it marks"
+	}
+	if next == "" {
+		return nil
+	}
+	_, err := fmt.Fprintln(w, next)
 	return err
 }
 
@@ -670,6 +699,7 @@ func fsckObjects(objects []ocicfs.FsckObject) []FsckObjectOutput {
 	for _, o := range objects {
 		out = append(out, FsckObjectOutput{
 			Digest: o.Digest.String(), Fsverity: o.Fsverity, Problem: o.Problem, Detail: o.Detail,
+			Fixed: o.Fixed, InUse: o.InUse,
 		})
 	}
 	return out
@@ -681,8 +711,12 @@ func writeFsckObjects(w io.Writer, objects []FsckObjectOutput) error {
 		if o.Fsverity != "" {
 			names = strings.TrimSpace(names + " fsverity " + o.Fsverity)
 		}
-		line := strings.TrimRight(fmt.Sprintf("  %-8s %s %s", o.Problem, names, scrubControl(o.Detail)), " ")
-		if _, err := fmt.Fprintln(w, line); err != nil {
+		problem := o.Problem
+		if o.Fixed != nil {
+			problem += map[bool]string{true: " (fixed)", false: " (NOT FIXED)"}[*o.Fixed]
+		}
+		line := strings.TrimSpace(problem + " " + names + " " + scrubControl(o.Detail))
+		if _, err := fmt.Fprintf(w, "  %s\n", line); err != nil {
 			return err
 		}
 	}

@@ -497,6 +497,23 @@ type Engine interface {
 	// made from a part of the checks would call intact what was never
 	// read. The store lock is held shared for the whole check, so gc reports
 	// ErrStoreBusy meanwhile.
+	//
+	// WithFix, valid only without refs, then repairs the store under the
+	// exclusive store lock, returning ErrStoreBusy with the report and
+	// nothing changed while another command holds the lock, as a pull does
+	// for its whole run. It
+	// checks the failed objects again and acts on what still fails: a
+	// misnamed object gets its names back, a damaged one is deleted, and
+	// the binding of every image left without an object it needs is
+	// removed, so that image reports ErrNotFound until it is pulled again.
+	// Left in place, and reported as not fixed, are an object that cannot
+	// be opened, a mounted composefs image, and, unless WithFixForce is
+	// given, a damaged object a mounted image uses. Reference records and
+	// holds are never touched. An error found before the first change
+	// leaves the store as it was; the repair is not atomic after that, and
+	// a run that was interrupted is completed by running it again. The
+	// report describes the store as checked, with what the repair did
+	// recorded on each object and image, so Intact stays false.
 	Fsck(ctx context.Context, refs []string, opts ...FsckOption) (*FsckReport, error)
 	// PreflightTools verifies mkcomposefs, which building images into the
 	// store runs, is available on PATH. Pull performs the same check before

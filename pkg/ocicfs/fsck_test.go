@@ -6,6 +6,8 @@ package ocicfs
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,7 +17,9 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"github.com/foundriesio/ocicfs/internal/composefs"
 	"github.com/foundriesio/ocicfs/internal/devtest"
+	"github.com/foundriesio/ocicfs/internal/objectstore"
 	"github.com/foundriesio/ocicfs/internal/octest"
 	"github.com/foundriesio/ocicfs/internal/verity"
 )
@@ -594,6 +598,733 @@ func TestFsckDuringPull(t *testing.T) {
 		}
 		if report := fsck(t, eng); !report.Intact || len(report.Images) != 2 {
 			t.Fatalf("report after the pull = %+v", report)
+		}
+	})
+}
+
+func fsckFix(t *testing.T, eng Engine, opts ...FsckOption) *FsckReport {
+	t.Helper()
+	report, err := eng.Fsck(context.Background(), nil, append([]FsckOption{WithFix()}, opts...)...)
+	if err != nil {
+		t.Fatalf("Fsck with a repair: %v", err)
+	}
+	return report
+}
+
+// A repair says it removed the binding of an image whose config names the
+// architecture's default variant, which the binding's own platform omits.
+func TestFsckFixDefaultVariant(t *testing.T) {
+	fsckModes(t, func(t *testing.T, eng Engine, storeRoot string) {
+		lay := fsckPullVariant(t, eng, "variant")
+		objPath, viewPath, _ := fsckPaths(t, storeRoot, fsckBody("variant"))
+		mustRemoveFile(t, objPath)
+		mustRemoveFile(t, viewPath)
+		report := fsckFix(t, eng)
+		if len(report.Images) != 1 {
+			t.Fatalf("report = %+v", report)
+		}
+		wantFixed(t, report.Images[0], false, true)
+		if isPresent(octest.BindingPath(storeRoot, lay.Root, lay.Platform)) {
+			t.Fatal("the binding was left")
+		}
+	})
+}
+
+// A file put in the place of an object's content-addressed name: the repair
+// deletes it and gives the object, intact under its view name, that name
+// back, so nothing needs a pull.
+func TestFsckFixReplacedObject(t *testing.T) {
+	fsckModes(t, func(t *testing.T, eng Engine, storeRoot string) {
+		lay := gcPull(t, eng, "a")
+		objPath, _, _ := fsckPaths(t, storeRoot, fsckBody("a"))
+		mustRemoveFile(t, objPath)
+		if err := os.WriteFile(objPath, []byte("dsads\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		report := fsck(t, eng)
+		wantOneObject(t, fsckImageOf(t, report, lay), FsckMisnamed)
+		if len(report.Unreferenced) != 1 || report.Unreferenced[0].Problem != FsckDamaged {
+			t.Fatalf("report = %+v", report)
+		}
+		report = fsckFix(t, eng)
+		wantFixed(t, fsckImageOf(t, report, lay), true, false)
+		if !*report.Unreferenced[0].Fixed {
+			t.Fatalf("report of the repair = %+v", report)
+		}
+		wantIntact(t, eng)
+		if got, err := os.ReadFile(objPath); err != nil || string(got) != fsckBody("a") { // #nosec G304 -- test store path
+			t.Fatalf("object = %q, %v", got, err)
+		}
+	})
+}
+
+// wantFixed asserts img lists exactly one failed object and that the repair
+// fixed it or left it, and removed img's binding or kept it.
+func wantFixed(t *testing.T, img FsckImage, fixed, bindingRemoved bool) FsckObject {
+	t.Helper()
+	if len(img.Objects) != 1 || img.BindingRemoved == nil || *img.BindingRemoved != bindingRemoved {
+		t.Fatalf("image = %+v, want one object and binding removed = %v", img, bindingRemoved)
+	}
+	o := img.Objects[0]
+	if o.Problem != FsckMissing && (o.Fixed == nil || *o.Fixed != fixed) {
+		t.Fatalf("object = %+v, want fixed = %v", o, fixed)
+	}
+	return o
+}
+
+func wantIntact(t *testing.T, eng Engine) {
+	t.Helper()
+	if report := fsck(t, eng); !report.Intact {
+		t.Fatalf("store not intact: %+v", report)
+	}
+}
+
+func isPresent(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
+}
+
+func repull(t *testing.T, eng Engine, lay octest.Layout, opts ...PullOption) {
+	t.Helper()
+	if len(opts) == 0 {
+		opts = []PullOption{WithFromDir(lay.Dir)}
+	}
+	if _, err := eng.Pull(context.Background(), lay.Ref, opts...); err != nil {
+		t.Fatalf("Pull %s: %v", lay.Ref, err)
+	}
+}
+
+// layerReads counts the layer blobs a pull opens.
+type layerReads struct {
+	BlobSource
+	n int
+}
+
+func (s *layerReads) Open(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
+	if strings.Contains(desc.MediaType, "layer") {
+		s.n++
+	}
+	return s.BlobSource.Open(ctx, desc)
+}
+
+// A damaged object two wanted images and one unwanted binding share: the
+// repair deletes it and removes all three bindings, gc refuses until the
+// wanted images are pulled again, and only the first of those pulls reads a
+// layer.
+func TestFsckFixSharedObject(t *testing.T) {
+	fsckModes(t, func(t *testing.T, eng Engine, storeRoot string) {
+		ctx := context.Background()
+		layA := gcPull(t, eng, "a")
+		layB := gcPull(t, eng, "b")
+		unwanted := gcPull(t, eng, "unwanted")
+		mustRemoveFile(t, octest.RefPath(storeRoot, mustNormalizeRef(t, unwanted.Ref)))
+		fsckDamage(t, storeRoot, gcSharedBody, fsckDonor(t, eng, "donor"))
+
+		report := fsckFix(t, eng)
+		if report.Intact {
+			t.Fatal("a report with damage found reads intact after the repair")
+		}
+		wantFixed(t, fsckImageOf(t, report, layA), true, true)
+		wantFixed(t, fsckImageOf(t, report, layB), true, true)
+		objPath, viewPath, _ := fsckPaths(t, storeRoot, gcSharedBody)
+		if isPresent(objPath) || isPresent(viewPath) {
+			t.Fatal("the damaged object survived the repair")
+		}
+		for _, lay := range []octest.Layout{layA, layB, unwanted} {
+			if isPresent(octest.BindingPath(storeRoot, lay.Root, lay.Platform)) {
+				t.Fatalf("binding of %s survived the repair", lay.Ref)
+			}
+		}
+		if _, err := eng.Inspect(ctx, layA.Ref); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Inspect of an image to pull again = %v, want ErrNotFound", err)
+		}
+		if _, err := eng.GC(ctx); err == nil || !strings.Contains(err.Error(), "ocicfs pull") {
+			t.Fatalf("GC before the pulls = %v, want a refusal naming `ocicfs pull`", err)
+		}
+
+		first := &layerReads{BlobSource: layoutBlobs(t, layA.Dir)}
+		repull(t, eng, layA, WithBlobSource(first))
+		second := &layerReads{BlobSource: layoutBlobs(t, layB.Dir)}
+		repull(t, eng, layB, WithBlobSource(second))
+		if first.n != 1 || second.n != 0 {
+			t.Fatalf("layer reads = %d then %d, want 1 then 0", first.n, second.n)
+		}
+		if _, err := eng.GC(ctx); err != nil {
+			t.Fatalf("GC after the pulls: %v", err)
+		}
+		wantIntact(t, eng)
+	})
+}
+
+// Misnamed objects are repaired in place: nothing is deleted, no binding is
+// removed, and no source is needed.
+func TestFsckFixMisnamed(t *testing.T) {
+	fsckModes(t, func(t *testing.T, eng Engine, storeRoot string) {
+		// A lost view name.
+		layA := gcPull(t, eng, "a")
+		_, viewA, _ := fsckPaths(t, storeRoot, fsckBody("a"))
+		mustRemoveFile(t, viewA)
+		// A wrong content-addressed name over intact bytes.
+		layB := gcPull(t, eng, "b")
+		objB, _, _ := fsckPaths(t, storeRoot, fsckBody("b"))
+		wrong := octest.ObjectPath(storeRoot, digest.FromString("some other content"))
+		if err := os.MkdirAll(filepath.Dir(wrong), 0o755); err != nil { // #nosec G301 -- test store directory
+			t.Fatal(err)
+		}
+		if err := os.Rename(objB, wrong); err != nil {
+			t.Fatal(err)
+		}
+		report := fsckFix(t, eng)
+		for _, lay := range []octest.Layout{layA, layB} {
+			if o := wantFixed(t, fsckImageOf(t, report, lay), true, false); o.Problem != FsckMisnamed {
+				t.Fatalf("object of %s = %+v", lay.Ref, o)
+			}
+		}
+		if isPresent(wrong) {
+			t.Fatal("the wrong content-addressed name survived the repair")
+		}
+		wantIntact(t, eng)
+	})
+}
+
+// A misnamed object whose correct name another object holds is left as it
+// is: no name is taken from either object and both contents stay readable.
+func TestFsckFixLeavesTakenNames(t *testing.T) {
+	fsckModes(t, func(t *testing.T, eng Engine, storeRoot string) {
+		// Two objects carry each other's view name.
+		layA := gcPull(t, eng, "a")
+		layB := gcPull(t, eng, "b")
+		objA, viewA, _ := fsckPaths(t, storeRoot, fsckBody("a"))
+		objB, viewB, _ := fsckPaths(t, storeRoot, fsckBody("b"))
+		for _, mv := range [][2]string{{viewA, viewA + ".tmp"}, {viewB, viewA}, {viewA + ".tmp", viewB}} {
+			if err := os.Rename(mv[0], mv[1]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// An object that lost its content-addressed name to a second copy
+		// of the same content.
+		layC := gcPull(t, eng, "c")
+		objC, viewC, _ := fsckPaths(t, storeRoot, fsckBody("c"))
+		mustRemoveFile(t, objC)
+		if err := os.Rename(viewC, viewC+".first"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := eng.(*engine).obj.WriteObject(context.Background(), strings.NewReader(fsckBody("c"))); err != nil {
+			t.Fatalf("WriteObject: %v", err)
+		}
+		mustRemoveFile(t, viewC)
+		if err := os.Rename(viewC+".first", viewC); err != nil {
+			t.Fatal(err)
+		}
+
+		report := fsckFix(t, eng)
+		for _, lay := range []octest.Layout{layA, layB, layC} {
+			o := wantFixed(t, fsckImageOf(t, report, lay), false, false)
+			if o.Problem != FsckMisnamed || !strings.Contains(o.Detail, "held by another object") {
+				t.Fatalf("object of %s = %+v", lay.Ref, o)
+			}
+		}
+		for path, want := range map[string]string{objA: fsckBody("a"), objB: fsckBody("b"), objC: fsckBody("c"), viewC: fsckBody("c")} {
+			got, err := os.ReadFile(path) // #nosec G304 -- test store path
+			if err != nil || string(got) != want {
+				t.Fatalf("%s = %q, %v; want %q", path, got, err, want)
+			}
+		}
+		if !isPresent(viewA) || !isPresent(viewB) {
+			t.Fatal("the repair removed a view name")
+		}
+	})
+}
+
+// A root an image is reached through is not the binding's: when it is
+// missing, the report says so on the image and the binding stays, since a
+// pull of that reference stores the root again with the binding in place.
+func TestFsckFixKeepsBindingOverMissingRoot(t *testing.T) {
+	fsckModes(t, func(t *testing.T, eng Engine, storeRoot string) {
+		lay := gcPull(t, eng, "a")
+		fsckAliasThroughMissingIndex(t, eng, lay)
+		img := fsckImageOf(t, fsckFix(t, eng), lay)
+		if o := wantFixed(t, img, false, false); o.Problem != FsckMissing || img.Error == "" {
+			t.Fatalf("image = %+v", img)
+		}
+		if !isPresent(octest.BindingPath(storeRoot, lay.Root, lay.Platform)) {
+			t.Fatal("the repair removed the binding of a complete image")
+		}
+		// The same with the broken reference removed between the check and
+		// the repair: what the check listed for it no longer counts.
+		fsckBeforeFixHook(t, func() {
+			if err := eng.Remove(context.Background(), "example.com/through-index:v1"); err != nil {
+				t.Errorf("Remove: %v", err)
+			}
+		})
+		fsckFix(t, eng)
+		if !isPresent(octest.BindingPath(storeRoot, lay.Root, lay.Platform)) {
+			t.Fatal("the repair removed a healthy image's binding over a reference that is gone")
+		}
+		wantIntact(t, eng)
+	})
+}
+
+// The repair reaches a store whose only finding is a binding nothing keeps
+// over a missing object: it removes the binding, and a pull then restores
+// the image.
+func TestFsckFixUnwantedBinding(t *testing.T) {
+	fsckModes(t, func(t *testing.T, eng Engine, storeRoot string) {
+		lay := fsckUnwantedImage(t, eng, storeRoot, true)
+		wantFixed(t, fsckImageOf(t, fsckFix(t, eng), lay), false, true)
+		if isPresent(octest.BindingPath(storeRoot, lay.Root, lay.Platform)) {
+			t.Fatal("the binding survived the repair")
+		}
+		repull(t, eng, lay)
+		wantIntact(t, eng)
+		objPath, _, _ := fsckPaths(t, storeRoot, fsckBody("unwanted"))
+		if !isPresent(objPath) {
+			t.Fatal("the pull did not restore the object")
+		}
+	})
+}
+
+// A mounted image that lost its content-addressed name still protects the
+// objects it refers to.
+func TestFsckFixMountedImageWithViewNameOnly(t *testing.T) {
+	fsckModes(t, func(t *testing.T, eng Engine, storeRoot string) {
+		lay := gcPull(t, eng, "a")
+		info, err := eng.Inspect(context.Background(), lay.Ref)
+		if err != nil {
+			t.Fatalf("Inspect: %v", err)
+		}
+		lockObjectShared(t, storeRoot, info.Composefs.Digest)
+		mustRemoveFile(t, octest.ObjectPath(storeRoot, info.Composefs.Digest))
+		fsckDamage(t, storeRoot, fsckBody("a"), fsckDonor(t, eng, "donor"))
+		objPath, _, _ := fsckPaths(t, storeRoot, fsckBody("a"))
+
+		// Without its content-addressed name the image cannot be read
+		// through its binding, so its two failed objects are listed as no
+		// image's: the image itself, misnamed, and the damaged file.
+		report := fsckFix(t, eng)
+		if img := fsckImageOf(t, report, lay); img.BindingRemoved == nil || *img.BindingRemoved {
+			t.Fatalf("image = %+v", img)
+		}
+		if len(report.Unreferenced) != 2 {
+			t.Fatalf("unreferenced = %+v", report.Unreferenced)
+		}
+		for _, o := range report.Unreferenced {
+			switch o.Problem {
+			case FsckMisnamed:
+				if o.Fixed == nil || !*o.Fixed {
+					t.Fatalf("the image's lost name was not repaired: %+v", o)
+				}
+			case FsckDamaged:
+				if o.Fixed == nil || *o.Fixed || !o.InUse {
+					t.Fatalf("damaged object of a mounted image = %+v", o)
+				}
+			default:
+				t.Fatalf("object = %+v", o)
+			}
+		}
+		if !isPresent(objPath) || !isPresent(octest.ObjectPath(storeRoot, info.Composefs.Digest)) {
+			t.Fatal("the repair removed an object a mounted image uses, or did not restore the image's name")
+		}
+	})
+}
+
+// A failed object that changed between the check and the repair is not acted
+// on and not reported as fixed.
+func TestFsckFixObjectChangedBeforeRepair(t *testing.T) {
+	fsckModes(t, func(t *testing.T, eng Engine, storeRoot string) {
+		lay := gcPull(t, eng, "a")
+		fsckDamage(t, storeRoot, fsckBody("a"), fsckDonor(t, eng, "donor"))
+		objPath, viewPath, _ := fsckPaths(t, storeRoot, fsckBody("a"))
+		fsckBeforeFixHook(t, func() {
+			if err := os.Remove(viewPath); err != nil {
+				t.Error(err)
+			}
+		})
+		o := wantFixed(t, fsckImageOf(t, fsckFix(t, eng), lay), false, true)
+		if !strings.Contains(o.Detail, "changed during the run") || !isPresent(objPath) {
+			t.Fatalf("object = %+v", o)
+		}
+		// The next run sees the remnant for what it is.
+		if report := fsckFix(t, eng); len(report.Unreferenced) != 1 || isPresent(objPath) {
+			t.Fatalf("second repair = %+v", report)
+		}
+	})
+}
+
+// A damaged object that has one name only, as a deletion interrupted between
+// its two unlinks leaves it, is removed, and a pull then restores the image.
+func TestFsckFixSingleNameRemnants(t *testing.T) {
+	fsckModes(t, func(t *testing.T, eng Engine, storeRoot string) {
+		layA := gcPull(t, eng, "a")
+		layB := gcPull(t, eng, "b")
+		fsckDamage(t, storeRoot, fsckBody("a"), fsckDonor(t, eng, "donor-a"))
+		fsckDamage(t, storeRoot, fsckBody("b"), fsckDonor(t, eng, "donor-b"))
+		objA, viewA, _ := fsckPaths(t, storeRoot, fsckBody("a"))
+		objB, viewB, _ := fsckPaths(t, storeRoot, fsckBody("b"))
+		mustRemoveFile(t, objA)  // view name only
+		mustRemoveFile(t, viewB) // content-addressed name only
+
+		report := fsckFix(t, eng)
+		wantFixed(t, fsckImageOf(t, report, layA), true, true)
+		// The image reaches its object by the view name, which is gone;
+		// the remnant under the other name is no image's.
+		if o := wantFixed(t, fsckImageOf(t, report, layB), false, true); o.Problem != FsckMissing {
+			t.Fatalf("object = %+v", o)
+		}
+		if len(report.Unreferenced) != 1 || report.Unreferenced[0].Fixed == nil || !*report.Unreferenced[0].Fixed {
+			t.Fatalf("unreferenced = %+v", report.Unreferenced)
+		}
+		for _, path := range []string{objA, viewA, objB, viewB} {
+			if isPresent(path) {
+				t.Fatalf("%s survived the repair", path)
+			}
+		}
+		repull(t, eng, layA)
+		repull(t, eng, layB)
+		wantIntact(t, eng)
+	})
+}
+
+// The damaged composefs image of a mounted image is left with its binding,
+// and the pass goes on to the other bindings.
+func TestFsckFixKeepsMountedComposefsImage(t *testing.T) {
+	fsckModes(t, func(t *testing.T, eng Engine, storeRoot string) {
+		ctx := context.Background()
+		mounted := gcPull(t, eng, "mounted")
+		info, err := eng.Inspect(ctx, mounted.Ref)
+		if err != nil {
+			t.Fatalf("Inspect: %v", err)
+		}
+		// The donor takes the image's content-addressed name; its own view
+		// name goes, so the damaged image has one name.
+		donorObj, donorView, _ := fsckPaths(t, storeRoot, fsckDonor(t, eng, "donor"))
+		if err := os.Rename(donorObj, octest.ObjectPath(storeRoot, info.Composefs.Digest)); err != nil {
+			t.Fatal(err)
+		}
+		mustRemoveFile(t, donorView)
+		lockObjectShared(t, storeRoot, info.Composefs.Digest)
+
+		other := gcPull(t, eng, "other")
+		objPath, viewPath, _ := fsckPaths(t, storeRoot, fsckBody("other"))
+		mustRemoveFile(t, objPath)
+		mustRemoveFile(t, viewPath)
+
+		// What the mounted image refers to cannot be read from a damaged
+		// image, so every damaged file object counts as used by it.
+		third := gcPull(t, eng, "third")
+		fsckDamage(t, storeRoot, fsckBody("third"), fsckDonor(t, eng, "donor-third"))
+
+		report := fsckFix(t, eng)
+		if o := wantFixed(t, fsckImageOf(t, report, third), false, false); !o.InUse {
+			t.Fatalf("damaged object beside an unreadable mounted image = %+v", o)
+		}
+		img := fsckImageOf(t, report, mounted)
+		if o := wantFixed(t, img, false, false); !o.InUse || o.Digest != info.Composefs.Digest {
+			t.Fatalf("mounted composefs image = %+v", o)
+		}
+		if !isPresent(octest.ObjectPath(storeRoot, info.Composefs.Digest)) ||
+			!isPresent(octest.BindingPath(storeRoot, mounted.Root, mounted.Platform)) {
+			t.Fatal("a mounted composefs image or its binding was removed")
+		}
+		wantFixed(t, fsckImageOf(t, report, other), false, true)
+		if isPresent(octest.BindingPath(storeRoot, other.Root, other.Platform)) {
+			t.Fatal("the binding of the other image survived the repair")
+		}
+	})
+}
+
+// A damaged object a mounted image uses is left, with the image's binding,
+// unless the repair is forced.
+func TestFsckFixMountedImageObject(t *testing.T) {
+	fsckModes(t, func(t *testing.T, eng Engine, storeRoot string) {
+		lay := gcPull(t, eng, "a")
+		info, err := eng.Inspect(context.Background(), lay.Ref)
+		if err != nil {
+			t.Fatalf("Inspect: %v", err)
+		}
+		lockObjectShared(t, storeRoot, info.Composefs.Digest)
+		fsckDamage(t, storeRoot, fsckBody("a"), fsckDonor(t, eng, "donor"))
+		objPath, _, _ := fsckPaths(t, storeRoot, fsckBody("a"))
+		binding := octest.BindingPath(storeRoot, lay.Root, lay.Platform)
+
+		if o := wantFixed(t, fsckImageOf(t, fsckFix(t, eng), lay), false, false); !o.InUse {
+			t.Fatalf("object of a mounted image = %+v", o)
+		}
+		if !isPresent(objPath) || !isPresent(binding) {
+			t.Fatal("an unforced repair removed an object a mounted image uses, or its binding")
+		}
+
+		if o := wantFixed(t, fsckImageOf(t, fsckFix(t, eng, WithFixForce()), lay), true, true); o.InUse {
+			t.Fatalf("object after a forced repair = %+v", o)
+		}
+		if isPresent(objPath) || isPresent(binding) {
+			t.Fatal("a forced repair left the object or the binding")
+		}
+		// The mounted composefs image itself is intact and stays.
+		if !isPresent(octest.ObjectPath(storeRoot, info.Composefs.Digest)) {
+			t.Fatal("the mounted composefs image was removed")
+		}
+	})
+}
+
+// Whatever stops a repair before its first change leaves the store as it
+// was, and the report of the check is still returned.
+func TestFsckFixBusyStore(t *testing.T) {
+	fsckModes(t, func(t *testing.T, eng Engine, storeRoot string) {
+		lay := gcPull(t, eng, "a")
+		fsckDamage(t, storeRoot, fsckBody("a"), fsckDonor(t, eng, "donor"))
+		objPath, viewPath, _ := fsckPaths(t, storeRoot, fsckBody("a"))
+		unchanged := func(what string, report *FsckReport, err, want error) {
+			t.Helper()
+			if err == nil || (want != nil && !errors.Is(err, want)) {
+				t.Fatalf("%s: err = %v, want %v", what, err, want)
+			}
+			if report == nil || len(fsckImageOf(t, report, lay).Objects) != 1 || fsckImageOf(t, report, lay).Objects[0].Fixed != nil {
+				t.Fatalf("%s: report = %+v", what, report)
+			}
+			if !isPresent(objPath) || !isPresent(viewPath) || !isPresent(octest.BindingPath(storeRoot, lay.Root, lay.Platform)) {
+				t.Fatalf("%s: the store changed", what)
+			}
+		}
+
+		// A pull, hold, or mount in progress.
+		fsckBeforeFixHook(t, func() {
+			unlock, err := eng.(*engine).lockStoreShared()
+			if err != nil {
+				t.Errorf("lockStoreShared: %v", err)
+				return
+			}
+			t.Cleanup(unlock)
+		})
+		report, err := eng.Fsck(context.Background(), nil, WithFix())
+		unchanged("busy store", report, err, ErrStoreBusy)
+	})
+}
+
+func TestFsckFixChangesNothingOnError(t *testing.T) {
+	fsckModes(t, func(t *testing.T, eng Engine, storeRoot string) {
+		lay := gcPull(t, eng, "a")
+		fsckDamage(t, storeRoot, fsckBody("a"), fsckDonor(t, eng, "donor"))
+		objPath, viewPath, _ := fsckPaths(t, storeRoot, fsckBody("a"))
+		unchanged := func(what string, report *FsckReport, err error) {
+			t.Helper()
+			if err == nil || report == nil || fsckImageOf(t, report, lay).Objects[0].Fixed != nil {
+				t.Fatalf("%s: report = %+v, err = %v", what, report, err)
+			}
+			if !isPresent(objPath) || !isPresent(viewPath) || !isPresent(octest.BindingPath(storeRoot, lay.Root, lay.Platform)) {
+				t.Fatalf("%s: the store changed", what)
+			}
+		}
+
+		// Cancellation after the check.
+		ctx, cancel := context.WithCancel(context.Background())
+		fsckBeforeFixHook(t, cancel)
+		report, err := eng.Fsck(ctx, nil, WithFix())
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled repair = %v", err)
+		}
+		unchanged("cancellation", report, err)
+
+		// No mkcomposefs: the images could not be rebuilt afterwards.
+		t.Setenv("PATH", t.TempDir())
+		report, err = eng.Fsck(context.Background(), nil, WithFix())
+		if err == nil || !strings.Contains(err.Error(), "mkcomposefs") {
+			t.Fatalf("repair without mkcomposefs = %v", err)
+		}
+		unchanged("no mkcomposefs", report, err)
+	})
+}
+
+// An object that fails the second check with an error that is no evidence
+// about its bytes stops the repair.
+func TestFsckFixStopsOnRecheckError(t *testing.T) {
+	if verity.Mode == verity.ModeOff {
+		t.Skip("a build made in off mode never enables fs-verity")
+	}
+	eng, storeRoot, _ := gcEngine(t, "a")
+	other := gcPull(t, eng, "b")
+	fsckDamage(t, storeRoot, fsckBody("a"), fsckDonor(t, eng, "donor-a"))
+	fsckDamage(t, storeRoot, fsckBody("b"), fsckDonor(t, eng, "donor-b"))
+	objPath, viewPath, _ := fsckPaths(t, storeRoot, fsckBody("a"))
+	otherObj, _, _ := fsckPaths(t, storeRoot, fsckBody("b"))
+	fsckBeforeFixHook(t, func() {
+		// The damaged object is replaced by an intact one without fs-verity.
+		for _, path := range []string{objPath, viewPath} {
+			if err := os.Remove(path); err != nil {
+				t.Error(err)
+			}
+		}
+		if err := os.WriteFile(objPath, []byte(fsckBody("a")), 0o600); err != nil {
+			t.Error(err)
+		}
+		if err := os.Link(objPath, viewPath); err != nil {
+			t.Error(err)
+		}
+	})
+	report, err := eng.Fsck(context.Background(), nil, WithFix())
+	if err == nil || !strings.Contains(err.Error(), "fs-verity") || report == nil {
+		t.Fatalf("Fsck = %+v, %v; want the no-fs-verity error", report, err)
+	}
+	if !isPresent(otherObj) || !isPresent(octest.BindingPath(storeRoot, other.Root, other.Platform)) {
+		t.Fatal("the repair changed the store before stopping")
+	}
+}
+
+func fsckBeforeFixHook(t *testing.T, fn func()) {
+	t.Helper()
+	fsckBeforeFix = func() {
+		fsckBeforeFix = nil
+		fn()
+	}
+	t.Cleanup(func() { fsckBeforeFix = nil })
+}
+
+// An object that cannot be opened is left where it is, and so is the binding
+// of an image whose composefs image it is.
+func TestFsckFixKeepsUnopenableObject(t *testing.T) {
+	fsckModes(t, func(t *testing.T, eng Engine, storeRoot string) {
+		ctx := context.Background()
+		e := eng.(*engine)
+		lay := gcPull(t, eng, "a")
+		info, err := eng.Inspect(ctx, lay.Ref)
+		if err != nil {
+			t.Fatalf("Inspect: %v", err)
+		}
+		entry := objectstore.Entry{Digest: info.Composefs.Digest}
+		unopenable := objectstore.ObjectCheck{Status: objectstore.ObjectDamaged, Unopenable: true}
+		if out := e.fixObject(entry, unopenable, &mountedSet{}, true); out.fixed || out.inUse || out.detail == "" {
+			t.Fatalf("outcome for an unopenable object = %+v", out)
+		}
+		if !isPresent(octest.ObjectPath(storeRoot, info.Composefs.Digest)) {
+			t.Fatal("an unopenable object was removed")
+		}
+		removed, err := e.removeBrokenBindings(ctx, map[digest.Digest]bool{info.Composefs.Digest: true})
+		if err != nil || len(removed) != 0 || !isPresent(octest.BindingPath(storeRoot, lay.Root, lay.Platform)) {
+			t.Fatalf("removeBrokenBindings = %v, %v; want the binding kept", removed, err)
+		}
+	})
+}
+
+// A damaged object a hold names directly is deleted like any other, and the
+// report says no pull brings it back.
+func TestFsckFixHeldLooseObject(t *testing.T) {
+	fsckModes(t, func(t *testing.T, eng Engine, storeRoot string) {
+		e := eng.(*engine)
+		body := fsckDonor(t, eng, "loose")
+		loose := digest.FromString(body)
+		unlock, err := e.holds.Lock(loose)
+		if err != nil {
+			t.Fatalf("Lock: %v", err)
+		}
+		err = e.holds.Hold(loose, "keeper")
+		unlock()
+		if err != nil {
+			t.Fatalf("Hold: %v", err)
+		}
+		fsckDamage(t, storeRoot, body, fsckDonor(t, eng, "donor"))
+
+		report := fsckFix(t, eng)
+		if len(report.Unreferenced) != 1 || report.Unreferenced[0].Fixed == nil || !*report.Unreferenced[0].Fixed ||
+			!strings.Contains(report.Unreferenced[0].Detail, "ocicfs release") {
+			t.Fatalf("unreferenced = %+v", report.Unreferenced)
+		}
+		if isPresent(octest.ObjectPath(storeRoot, loose)) {
+			t.Fatal("the damaged held object survived the repair")
+		}
+	})
+}
+
+// deltaStats records how many files each delta pull made while it is
+// installed found missing and fetched. Files small enough to be inlined in the
+// composefs image are fetched by every pull.
+type deltaStats struct {
+	slog.Handler
+	missing []int64
+}
+
+func (h *deltaStats) Handle(ctx context.Context, r slog.Record) error {
+	if r.Message == "delta: pull" {
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "missing" {
+				h.missing = append(h.missing, a.Value.Int64())
+			}
+			return true
+		})
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+// A delta pull restores an image whose binding a repair removed, and fetches
+// the one file the repair deleted: one file more than the same pull fetches
+// when only the binding is gone.
+func TestFsckFixThenDeltaPull(t *testing.T) {
+	requireDeltaFixtures(t)
+	storeRoot := verityStoreRoot(t)
+	ref := deltaFixtureRef(t, deltaReleaseN1)
+	pullInto(t, storeRoot, ref, WithFromDir(deltaReleaseN1), WithDelta())
+	eng := newEngine(t, storeRoot)
+	info, err := eng.Inspect(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	stats := &deltaStats{Handler: slog.NewTextHandler(io.Discard, nil)}
+	old := slog.Default()
+	slog.SetDefault(slog.New(stats))
+	t.Cleanup(func() { slog.SetDefault(old) })
+
+	// The control: the binding alone is gone.
+	mustRemoveFile(t, octest.BindingPath(storeRoot, info.Root, info.Platform))
+	pullInto(t, storeRoot, ref, WithFromDir(deltaReleaseN1), WithDelta())
+
+	names, err := composefs.ReferencedObjects(context.Background(), octest.ObjectPath(storeRoot, info.Composefs.Digest))
+	if err != nil || len(names) == 0 {
+		t.Fatalf("ReferencedObjects = %v, %v", names, err)
+	}
+	// One of the image's file objects is replaced by other content under
+	// both of its names.
+	donorObj, donorView, _ := fsckPaths(t, storeRoot, fsckDonor(t, eng, "donor"))
+	victimView := filepath.Join(storeRoot, "objects", "fsverity-sha256-12", names[0])
+	victim, err := os.ReadFile(victimView) // #nosec G304 -- test store path
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(donorView, victimView); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(donorObj, octest.ObjectPath(storeRoot, digest.FromBytes(victim))); err != nil { // #nosec G703 -- test store path
+		t.Fatal(err)
+	}
+
+	report := fsckFix(t, eng)
+	if len(report.Images) != 1 || report.Images[0].BindingRemoved == nil || !*report.Images[0].BindingRemoved {
+		t.Fatalf("report = %+v", report)
+	}
+	if isPresent(victimView) {
+		t.Fatal("the damaged object survived the repair")
+	}
+	pullInto(t, storeRoot, ref, WithFromDir(deltaReleaseN1), WithDelta())
+	if len(stats.missing) != 2 || stats.missing[1] != stats.missing[0]+1 {
+		t.Fatalf("delta pulls listed %v files as missing; want one file more after the repair", stats.missing)
+	}
+	if _, err := eng.GC(context.Background()); err != nil {
+		t.Fatalf("GC after the pull: %v", err)
+	}
+	wantIntact(t, eng)
+}
+
+func TestFsckFixUsage(t *testing.T) {
+	fsckModes(t, func(t *testing.T, eng Engine, _ string) {
+		lay := gcPull(t, eng, "a")
+		ctx := context.Background()
+		if _, err := eng.Fsck(ctx, []string{lay.Ref}, WithFix()); err == nil {
+			t.Fatal("a repair accepted a reference")
+		}
+		if _, err := eng.Fsck(ctx, nil, WithFixForce()); err == nil {
+			t.Fatal("force was accepted without a repair")
+		}
+		// A repair of an intact store changes nothing and needs no lock.
+		if report := fsckFix(t, eng); !report.Intact || report.Images[0].BindingRemoved != nil {
+			t.Fatalf("repair of an intact store = %+v", report)
 		}
 	})
 }
