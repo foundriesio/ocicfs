@@ -537,17 +537,23 @@ func validateBinding(doc bindingDoc, wantPlatform platformDoc) error {
 	return nil
 }
 
-func platformPath(p ocispec.Platform) (platformDoc, string, error) {
-	arch := strings.ToLower(p.Architecture)
-	variant := strings.ToLower(p.Variant)
-	// Canonicalize the architecture's default variant to empty: runtime.GOARCH
-	// yields no variant, while an image config may name the default explicitly
-	// (e.g. arm64/v8). Treating them as one key makes a host's linux/arm64 and
-	// an image's linux/arm64/v8 resolve to the same binding.
-	if variant == defaultVariant(arch) {
-		variant = ""
+// CanonicalPlatform returns p in the spelling bindings are keyed by: lower
+// case, and without the variant when it is the architecture's default.
+// runtime.GOARCH yields no variant, while an image config may name the
+// default explicitly (e.g. arm64/v8); as one key, a host's linux/arm64 and an
+// image's linux/arm64/v8 resolve to the same binding.
+func CanonicalPlatform(p ocispec.Platform) ocispec.Platform {
+	c := ocispec.Platform{OS: strings.ToLower(p.OS), Architecture: strings.ToLower(p.Architecture), Variant: strings.ToLower(p.Variant)}
+	if c.Variant == defaultVariant(c.Architecture) {
+		c.Variant = ""
 	}
-	parts := []string{strings.ToLower(p.OS), arch}
+	return c
+}
+
+func platformPath(p ocispec.Platform) (platformDoc, string, error) {
+	p = CanonicalPlatform(p)
+	arch, variant := p.Architecture, p.Variant
+	parts := []string{p.OS, arch}
 	if variant != "" {
 		parts = append(parts, variant)
 	}

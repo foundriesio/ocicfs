@@ -35,7 +35,7 @@ import (
 
 func TestCommandsCoverM1Verbs(t *testing.T) {
 	root, _ := newRootCommand(io.Discard, io.Discard)
-	want := []string{"copy", "gc", "hold", "inspect", "ls", "mount", "publish", "pull", "release", "remove", "seal", "unmount", "version"}
+	want := []string{"copy", "fsck", "gc", "hold", "inspect", "ls", "mount", "publish", "pull", "release", "remove", "seal", "unmount", "version"}
 
 	// cobra adds its own "help" and "completion" commands; compare only ocicfs's.
 	builtins := map[string]bool{"help": true, "completion": true}
@@ -295,6 +295,91 @@ func TestRunPullFromDirE2E(t *testing.T) {
 	if _, err := os.Stat(octest.BindingPath(storeRoot, lay.Root, lay.Platform)); err != nil {
 		t.Errorf("binding not written by CLI pull: %v", err)
 	}
+}
+
+// TestRunFsck pins the fsck exit statuses: 0 for an intact store, 3 once
+// damage is found, 1 when the check cannot run.
+func TestRunFsck(t *testing.T) {
+	storeRoot, cleanup, err := devtest.VerityRoot()
+	if errors.Is(err, devtest.ErrNoVerity) {
+		t.Skipf("verity-capable store root unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("VerityRoot: %v", err)
+	}
+	t.Cleanup(cleanup)
+	if _, err := exec.LookPath("mkcomposefs"); err != nil {
+		t.Skip("mkcomposefs not found in PATH")
+	}
+	platform := ocispec.Platform{OS: runtime.GOOS, Architecture: runtime.GOARCH}
+	lay, err := octest.BuildSingleLayerGzip(t.TempDir(), platform,
+		octest.File{Name: "etc/config.txt", Mode: 0o644, Body: "hello from ocicfs\n"},
+	)
+	if err != nil {
+		t.Fatalf("build layout: %v", err)
+	}
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"--root", storeRoot, "pull", "--from-dir", lay.Dir, lay.Ref}, &out, &errOut); code != 0 {
+		if strings.Contains(errOut.String(), "fs-verity") {
+			t.Skipf("fs-verity unsupported on the test filesystem: %s", errOut.String())
+		}
+		t.Fatalf("pull exit code = %d, stderr = %q", code, errOut.String())
+	}
+
+	type report struct {
+		Intact bool `json:"intact"`
+		Images []struct {
+			Digest  string            `json:"digest"`
+			Refs    []string          `json:"refs"`
+			Intact  bool              `json:"intact"`
+			Error   *string           `json:"error"`
+			Objects []json.RawMessage `json:"objects"`
+		} `json:"images"`
+	}
+	fsck := func(want int, args ...string) (report, string) {
+		t.Helper()
+		out.Reset()
+		errOut.Reset()
+		code := run(context.Background(), append([]string{"--root", storeRoot, "fsck"}, args...), &out, &errOut)
+		if code != want {
+			t.Fatalf("fsck %v exit code = %d, want %d; stdout = %q, stderr = %q", args, code, want, out.String(), errOut.String())
+		}
+		var r report
+		if len(args) > 0 && args[0] == "--format" && out.Len() > 0 {
+			if err := json.Unmarshal(out.Bytes(), &r); err != nil {
+				t.Fatalf("stdout is not JSON: %v; out=%q", err, out.String())
+			}
+		}
+		return r, out.String()
+	}
+
+	r, _ := fsck(0, "--format", "json")
+	if !r.Intact || len(r.Images) != 1 || r.Images[0].Digest != lay.Root.String() || len(r.Images[0].Refs) != 1 ||
+		r.Images[0].Error == nil || r.Images[0].Objects == nil {
+		t.Fatalf("report of an intact store = %+v", r)
+	}
+	if _, text := fsck(0, lay.Ref); !strings.Contains(text, " intact ") || !strings.Contains(text, "1 image checked, 0 not intact") {
+		t.Fatalf("text report = %q", text)
+	}
+
+	if err := os.Remove(octest.BindingPath(storeRoot, lay.Root, lay.Platform)); err != nil {
+		t.Fatal(err)
+	}
+	r, _ = fsck(3, "--format", "json")
+	if r.Intact || len(r.Images) != 1 || r.Images[0].Intact || *r.Images[0].Error == "" {
+		t.Fatalf("report of a damaged store = %+v", r)
+	}
+	if errOut.Len() != 0 {
+		t.Fatalf("stderr after a completed check = %q", errOut.String())
+	}
+	if _, text := fsck(3); !strings.Contains(text, "NOT INTACT") || !strings.Contains(text, "  error: ") {
+		t.Fatalf("text report = %q", text)
+	}
+
+	if _, text := fsck(1, "example.com/absent:latest"); text != "" || !strings.Contains(errOut.String(), "fsck") {
+		t.Fatalf("stdout = %q, stderr = %q", text, errOut.String())
+	}
+	fsck(2, "--format", "yaml")
 }
 
 // noChildren lists no manifests for any archive entry.

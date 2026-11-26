@@ -6,6 +6,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/foundriesio/ocicfs/pkg/ocicfs"
@@ -34,5 +35,21 @@ func TestWriteImagesHeldOnlyRef(t *testing.T) {
 	}
 	if len(decoded) != 1 || decoded[0] != (ImageOutput{Ref: "", Digest: "sha256:abc", Size: 7}) {
 		t.Fatalf("json = %#v", decoded)
+	}
+}
+
+// TestWriteFsckReportText: a failed object with no detail ends its line at
+// the name.
+func TestWriteFsckReportText(t *testing.T) {
+	report := &ocicfs.FsckReport{Images: []ocicfs.FsckImage{{
+		Digest: "sha256:abc", Platform: "linux/arm64/v8",
+		Objects: []ocicfs.FsckObject{{Fsverity: "sha256:def", Problem: ocicfs.FsckMissing}},
+	}}}
+	var text bytes.Buffer
+	if err := WriteFsckReport(&text, FormatText, report); err != nil {
+		t.Fatalf("WriteFsckReport: %v", err)
+	}
+	if !strings.Contains(text.String(), " fsverity sha256:def\n") {
+		t.Fatalf("text = %q", text.String())
 	}
 }

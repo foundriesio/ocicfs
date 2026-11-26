@@ -61,7 +61,7 @@ func newRootCommand(stdout, stderr io.Writer) (*cobra.Command, *globalOptions) {
 		Use:   "ocicfs",
 		Short: "OCI-native content delivery and mount engine for IoT/edge devices",
 		Long: "ocicfs pulls, verifies, and mounts OCI content as composefs images. It " +
-			"provides primitives — seal, copy, pull, mount, unmount, inspect, ls, hold, release, remove, gc — " +
+			"provides primitives — seal, copy, pull, mount, unmount, inspect, ls, hold, release, remove, gc, fsck — " +
 			"and leaves version management and update orchestration to the upper-layer " +
 			"agent that drives it.",
 		Version:       version.String(),
@@ -100,6 +100,7 @@ func newRootCommand(stdout, stderr io.Writer) (*cobra.Command, *globalOptions) {
 		newReleaseCommand(g),
 		newRemoveCommand(g),
 		newGCCommand(g),
+		newFsckCommand(g),
 		newVersionCommand(g),
 	)
 	return root, g

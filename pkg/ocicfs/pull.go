@@ -401,6 +401,7 @@ func looksLikeBareDigest(s string) bool {
 	return true
 }
 
-func hostPlatform() ocispec.Platform {
+// hostPlatform is a variable so that a test can stand in for another host.
+var hostPlatform = func() ocispec.Platform {
 	return ocispec.Platform{OS: runtime.GOOS, Architecture: runtime.GOARCH}
 }

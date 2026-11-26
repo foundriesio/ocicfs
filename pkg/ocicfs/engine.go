@@ -479,6 +479,25 @@ type Engine interface {
 	// anything, except orphan view entries, which exist only after external
 	// damage and are counted only when actually swept.
 	GC(ctx context.Context, opts ...GCOption) (*GCReport, error)
+	// Fsck checks stored content against its digests and reports what
+	// failed, reading only local state. With refs it checks the images they
+	// name and the objects those need; with none it checks every object in
+	// the store, garbage included, since a later pull reuses any object
+	// that is present, and every image a reference or a hold keeps or
+	// that has a binding. Each
+	// object is read once: its sha256 is compared with its
+	// content-addressed name and its fs-verity digest with its view name.
+	// An object whose bytes match no name, or cannot be read back, is
+	// damaged; one whose bytes are intact but which lacks a name or
+	// carries a wrong one is misnamed; one an image needs and the store
+	// lacks is missing. Damage is data in the report, not an error. An
+	// error means the check could not run or could not finish, for example
+	// on a reference that names no local image or a read failure that is
+	// no evidence about the bytes; no report is returned then, since one
+	// made from a part of the checks would call intact what was never
+	// read. The store lock is held shared for the whole check, so gc reports
+	// ErrStoreBusy meanwhile.
+	Fsck(ctx context.Context, refs []string, opts ...FsckOption) (*FsckReport, error)
 	// PreflightTools verifies mkcomposefs, which building images into the
 	// store runs, is available on PATH. Pull performs the same check before
 	// it needs the tool; PreflightTools lets a caller that will feed builds

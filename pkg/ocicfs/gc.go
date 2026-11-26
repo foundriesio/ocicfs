@@ -236,23 +236,71 @@ func (e *engine) markWanted(ctx context.Context) (*gcMarks, error) {
 		marked:   map[string]struct{}{},
 	}
 
+	roots, err := e.wantedRoots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range roots {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if r.err != nil {
+			return nil, r.err
+		}
+		m.sha[r.root] = struct{}{}
+		if r.loose {
+			// A held loose object: the digest alone is the mark. It joins no
+			// binding-protecting set — a binding directory keyed by the same
+			// digest is unrelated and sweeps normally.
+			continue
+		}
+		m.sha[r.identity] = struct{}{}
+		m.wanted[r.identity] = struct{}{}
+		for _, p := range r.platforms {
+			if err := e.markImage(ctx, m, r.root, r.identity, p, r.origin); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return m, nil
+}
+
+// wantedRoot is one root the store keeps content for: an agent's reference
+// record or a held digest.
+type wantedRoot struct {
+	// root anchors the metadata chain and identity is the platform image
+	// manifest it must resolve to. A hold names the identity itself.
+	root, identity digest.Digest
+	// origin says where the root comes from, for messages: "ref <name>" or
+	// "hold". ref is the reference name, empty for a hold.
+	origin, ref string
+	// loose marks a held digest that is not an image: the object alone is
+	// kept.
+	loose bool
+	// platforms are the platforms to resolve the root for: the ones a
+	// reference recorded plus the ones that have a binding on disk.
+	platforms []ocispec.Platform
+	// err says why a held root's images cannot be enumerated: its object is
+	// missing or unreadable, it is an image index, or it has no binding.
+	err error
+}
+
+// wantedRoots lists the store's roots: every agent reference record and every
+// held digest. Both listings are strict. A runtime reference names an image
+// on a holder's behalf and pins nothing, so it is not a root: the hold is.
+func (e *engine) wantedRoots(ctx context.Context) ([]wantedRoot, error) {
 	records, err := e.refs.ListStrict(ctx)
 	if err != nil {
 		return nil, err
 	}
+	var roots []wantedRoot
 	for _, rec := range records {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		// A runtime reference names an image on a holder's behalf and pins
-		// nothing: the hold marks the image, and the sweep drops the name
-		// once the holder is gone.
 		if rec.Holder != "" {
 			continue
 		}
-		m.sha[rec.Resolved.Digest] = struct{}{}
-		m.sha[rec.Identity.Digest] = struct{}{}
-		m.wanted[rec.Identity.Digest] = struct{}{}
 		platforms, err := parseRecordPlatforms(rec.Platforms)
 		if err != nil {
 			return nil, fmt.Errorf("ref %s: %w", rec.Ref, err)
@@ -261,11 +309,11 @@ func (e *engine) markWanted(ctx context.Context) (*gcMarks, error) {
 		if err != nil {
 			return nil, fmt.Errorf("ref %s: %w", rec.Ref, err)
 		}
-		for _, p := range append(platforms, onDisk...) {
-			if err := e.markImage(ctx, m, rec.Resolved.Digest, rec.Identity.Digest, p, "ref "+rec.Ref); err != nil {
-				return nil, err
-			}
-		}
+		roots = append(roots, wantedRoot{
+			root: rec.Resolved.Digest, identity: rec.Identity.Digest,
+			origin: "ref " + rec.Ref, ref: rec.Ref,
+			platforms: append(platforms, onDisk...),
+		})
 	}
 
 	held, err := e.holds.List(ctx)
@@ -276,38 +324,50 @@ func (e *engine) markWanted(ctx context.Context) (*gcMarks, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		m.sha[root] = struct{}{}
+		r := wantedRoot{root: root, identity: root, origin: "hold"}
+		present, err := e.obj.Has(root)
+		if err != nil {
+			return nil, err
+		}
+		if !present {
+			// Hold records holders only for present content, so the content
+			// was deleted behind the hold's back.
+			r.err = fmt.Errorf("held object %s is missing from the store; run `ocicfs pull` to restore it or `ocicfs release` to stop wanting it", root)
+			roots = append(roots, r)
+			continue
+		}
 		kind, err := e.heldRootKind(root)
+		if objectstore.IsCorruption(err) {
+			// The object is there and cannot be read back.
+			r.err = err
+			roots = append(roots, r)
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
 		if kind == heldLoose {
-			// A held loose object: the digest alone is the mark. It joins no
-			// binding-protecting set — a binding directory keyed by the same
-			// digest is unrelated and sweeps normally.
+			r.loose = true
+			roots = append(roots, r)
 			continue
 		}
-		m.wanted[root] = struct{}{}
-		onDisk, err := e.img.Platforms(ctx, root)
+		r.platforms, err = e.img.Platforms(ctx, root)
 		if err != nil {
 			return nil, fmt.Errorf("held %s: %w", root, err)
 		}
-		if len(onDisk) == 0 {
+		if len(r.platforms) == 0 {
 			if kind == heldIndex {
 				// Bindings are keyed by the platform-manifest identity, never
 				// by an index, so a pull can never satisfy this hold; only
 				// releasing it can.
-				return nil, fmt.Errorf("held digest %s is an image index, which no binding can ever be keyed by; `ocicfs release` it and hold the image identity instead", root)
-			}
-			return nil, fmt.Errorf("held image %s has no binding, so its objects cannot be enumerated; run `ocicfs pull` to restore it or `ocicfs release` to stop wanting it", root)
-		}
-		for _, p := range onDisk {
-			if err := e.markImage(ctx, m, root, root, p, "hold"); err != nil {
-				return nil, err
+				r.err = fmt.Errorf("held digest %s is an image index, which no binding can ever be keyed by; `ocicfs release` it and hold the image identity instead", root)
+			} else {
+				r.err = fmt.Errorf("held image %s has no binding, so its objects cannot be enumerated; run `ocicfs pull` to restore it or `ocicfs release` to stop wanting it", root)
 			}
 		}
+		roots = append(roots, r)
 	}
-	return m, nil
+	return roots, nil
 }
 
 // markImage marks one wanted image: the hash-verified metadata chain root
