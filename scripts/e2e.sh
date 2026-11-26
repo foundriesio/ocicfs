@@ -45,7 +45,10 @@
 # the default auto one and checks the fs-verity state each reports and runs
 # with on tmpfs and on the verity loopback, that a required build reports a
 # filesystem without fs-verity unsupported and refuses it and a store
-# written without fs-verity, and that an off build reads objects with it. The registry legs run against a local zot
+# written without fs-verity, and that an off build reads objects with it. A
+# store check leg then damages objects -- bytes overwritten in a store
+# without fs-verity, blocks overwritten on the device under a store with it
+# -- and takes each through fsck, fsck --fix, a pull and a mount. The registry legs run against a local zot
 # instance -- a real OCI registry that enforces the distribution spec on
 # manifest PUTs, unlike an in-process test registry. It needs a privileged,
 # fs-verity-capable environment with mkcomposefs on PATH -- i.e. the dev
@@ -88,6 +91,7 @@ TARBALL=""
 TARINDEX=""
 COPYTAR=""
 VDIR=""
+FLOOP=""
 SECTION="setup"
 NSECTIONS=0
 NSKIPPED=0
@@ -118,6 +122,10 @@ cleanup() {
 	[ -n "$TARBALL" ] && rm -f "$TARBALL"
 	[ -n "$TARINDEX" ] && rm -rf "$TARINDEX"
 	[ -n "$COPYTAR" ] && rm -f "$COPYTAR"
+	if [ -n "$FLOOP" ]; then
+		umount "$VDIR/fsck-verity" 2>/dev/null
+		losetup -d "$FLOOP" 2>/dev/null
+	fi
 	if [ -n "$VDIR" ]; then
 		if mountpoint -q "$VDIR/tmpfs" && ! umount "$VDIR/tmpfs"; then
 			rc=1
@@ -860,3 +868,285 @@ mount_and_read "$VAUTO" "$VDIR/off"
 
 step "off on the store the auto build filled: expect the objects with fs-verity read"
 mount_and_read "$VOFF" "$VDIR/auto"
+
+section "Store check and repair: fsck, fsck --fix, then a pull restores"
+# Two images that share one file; the first also overrides, in a second
+# layer, a file of its first layer, so the store holds an object no image
+# refers to. Each damage below goes the same way: fsck exits 3 and names the
+# object and every image that needs it, fsck --fix deletes it and removes
+# those images' bindings, a pull of each image restores it, fsck exits 0,
+# and the file reads back through a mount.
+step "build two images sharing a file and push them to the registry"
+FSRC="$VDIR/fsck-src"
+mkdir "$FSRC"
+for name in a b; do
+	umoci init --layout "$FSRC/layout-$name"
+	umoci new --image "$FSRC/layout-$name:img"
+	umoci unpack --image "$FSRC/layout-$name:img" "$FSRC/$name" >/dev/null 2>&1
+	r="$FSRC/$name/rootfs"
+	mkdir -p "$r/data"
+	seq 1 12000 >"$r/data/shared"
+	seq 1 2000 | sed "s/^/own $name /" >"$r/data/own"
+	[ "$name" = b ] || seq 1 3000 | sed 's/^/lower /' >"$r/data/shadowed"
+	umoci repack --image "$FSRC/layout-$name:img" "$FSRC/$name" >/dev/null 2>&1
+done
+cp -p "$FSRC/a/rootfs/data/shadowed" "$FSRC/shadowed-lower"
+umoci unpack --image "$FSRC/layout-a:img" "$FSRC/a2" >/dev/null 2>&1
+seq 1 3000 | sed 's/^/upper /' >"$FSRC/a2/rootfs/data/shadowed"
+umoci repack --image "$FSRC/layout-a:img" "$FSRC/a2" >/dev/null 2>&1
+for name in a b; do
+	umoci config --image "$FSRC/layout-$name:img" --os linux --architecture "$(go env GOARCH)" >/dev/null 2>&1
+	umoci gc --layout "$FSRC/layout-$name" >/dev/null 2>&1
+	crane push "$FSRC/layout-$name" "127.0.0.1:$port/fsck-$name"
+done
+fa="$(jq -r '.manifests[0].digest' "$FSRC/layout-a/index.json")"
+fb="$(jq -r '.manifests[0].digest' "$FSRC/layout-b/index.json")"
+faref="127.0.0.1:$port/fsck-a@$fa"
+fbref="127.0.0.1:$port/fsck-b@$fb"
+
+# FK is ocicfs on the store under test and FOUT the output of its last fsck.
+FK=()
+FOUT=""
+
+# hex_of prints the sha256 of file $1, and object_of the path of the object
+# holding that content in the store under test.
+hex_of() { sha256sum <"$1" | cut -d' ' -f1; }
+object_of() {
+	local hex
+	hex="$(hex_of "$1")"
+	echo "${FK[2]}/objects/sha256/${hex:0:2}/${hex:2}"
+}
+
+# fsck runs `ocicfs fsck --format json` with the arguments after $1 on the
+# store under test, expects exit status $1, and leaves the report in FOUT.
+fsck() {
+	local want="$1" rc=0
+	shift
+	FOUT="$("${FK[@]}" fsck --format json "$@")" || rc=$?
+	printf '%s\n' "$FOUT"
+	[ "$rc" -eq "$want" ] || fail "fsck $* exited $rc, want $want"
+}
+
+# images_listing prints, sorted, the digests of the images whose failed
+# objects in FOUT include the object with content digest sha256:$1.
+images_listing() {
+	jq -r --arg d "sha256:$1" '[.images[] | select(any(.objects[]; .digest == $d)) | .digest] | sort | join(" ")' <<<"$FOUT"
+}
+
+# read_back mounts image $1 from the store under test and compares the file
+# data/$2 with the source file $3.
+read_back() {
+	"${FK[@]}" mount "$1" "$MNT"
+	cmp "$MNT/data/$2" "$3" || fail "data/$2 of $1 does not read back as built"
+	"${FK[@]}" unmount "$MNT"
+}
+
+# check_fix_restore takes a damaged shared file through the whole flow. $1
+# is the damaged file's source, $2 a pattern its problem detail must match,
+# and the rest the images that share it, as "ref digest" pairs.
+check_fix_restore() {
+	local src="$1" detail="$2" hex obj want="" pair ref
+	shift 2
+	hex="$(hex_of "$src")"
+	obj="$(object_of "$src")"
+	for pair in "$@"; do want+="${pair#* } "; done
+	want="$(tr ' ' '\n' <<<"$want" | sort | xargs)"
+
+	step "fsck: expect exit 3, the object damaged, and every image sharing it named"
+	fsck 3
+	[ "$(images_listing "$hex")" = "$want" ] || fail "fsck names images '$(images_listing "$hex")' for the damaged object, want '$want'"
+	jq -e --arg d "sha256:$hex" --arg re "$detail" \
+		'[.images[].objects[] | select(.digest == $d) | .problem == "damaged" and (.detail | test($re))] | all' \
+		<<<"$FOUT" >/dev/null || fail "fsck does not report sha256:$hex as damaged with a detail matching '$detail'"
+
+	step "fsck --fix: expect exit 3, the object deleted, and the bindings of those images removed"
+	fsck 3 --fix
+	jq -e --arg d "sha256:$hex" '[.images[].objects[] | select(.digest == $d) | .fixed] | all' <<<"$FOUT" >/dev/null \
+		|| fail "fsck --fix did not report the damaged object fixed"
+	[ "$(jq -r '[.images[] | select(.binding_removed) | .digest] | sort | join(" ")' <<<"$FOUT")" = "$want" ] \
+		|| fail "fsck --fix did not remove the bindings of exactly the images sharing the object"
+	[ ! -e "$obj" ] || fail "the damaged object survived fsck --fix"
+	for pair in "$@"; do
+		if "${FK[@]}" inspect "${pair% *}" >/dev/null 2>&1; then fail "inspect still finds ${pair% *} after fsck --fix"; fi
+	done
+	if out="$("${FK[@]}" gc 2>&1)"; then fail "gc ran with images waiting for a pull"; fi
+	printf '%s\n' "$out" | grep -qF 'ocicfs pull' || fail "the refused gc does not name ocicfs pull"
+
+	step "pull each image again, then fsck: expect exit 0 and the file read back through a mount"
+	for pair in "$@"; do "${FK[@]}" pull "${pair% *}"; done
+	"${FK[@]}" gc >/dev/null
+	fsck 0
+	for pair in "$@"; do
+		ref="${pair% *}"
+		read_back "$ref" shared "$src"
+	done
+}
+
+FK=(bin/ocicfs --root "$VDIR/tmpfs/fsck")
+"${FK[@]}" pull "$faref"
+"${FK[@]}" pull "$fbref"
+fsck 0
+
+step "an object only a lower layer needs: expect it reported as no image's, removed by --fix, and no pull needed"
+obj="$(object_of "$FSRC/shadowed-lower")"
+[ -f "$obj" ] || fail "the pull did not store the file the upper layer overrides"
+head -c "$(stat -c %s "$obj")" /dev/zero >"$obj"
+fsck 3
+jq -e --arg d "sha256:$(hex_of "$FSRC/shadowed-lower")" \
+	'([.images[].intact] | all) and ([.unreferenced[] | select(.digest == $d and .problem == "damaged")] | length == 1)' \
+	<<<"$FOUT" >/dev/null || fail "fsck does not report the overridden file's object as damaged and no image's"
+fsck 3 --fix
+jq -e '([.unreferenced[].fixed] | all) and ([.images[].binding_removed] | any | not)' <<<"$FOUT" >/dev/null \
+	|| fail "fsck --fix did not remove the object, or removed a binding"
+[ ! -e "$obj" ] || fail "the damaged object survived fsck --fix"
+fsck 0
+
+step "without fs-verity: overwrite the bytes of the object both images share"
+obj="$(object_of "$FSRC/a/rootfs/data/shared")"
+head -c "$(stat -c %s "$obj")" /dev/zero >"$obj"
+check_fix_restore "$FSRC/a/rootfs/data/shared" 'match no name' "$faref $fa" "$fbref $fb"
+
+step "a damaged file of a mounted image: expect it kept without --force, deleted with it"
+"${FK[@]}" mount "$faref" "$MNT"
+obj="$(object_of "$FSRC/a/rootfs/data/own")"
+head -c "$(stat -c %s "$obj")" /dev/zero >"$obj"
+fsck 3 --fix
+jq -e --arg d "sha256:$(hex_of "$FSRC/a/rootfs/data/own")" \
+	'[.images[] | select(any(.objects[]; .digest == $d and .fixed == false and .in_use == true)) | .binding_removed == false] == [true]' \
+	<<<"$FOUT" >/dev/null || fail "fsck --fix did not leave the mounted image's damaged file and binding in place"
+[ -f "$obj" ] || fail "fsck --fix deleted a file a mounted image uses"
+fsck 3 --fix --force
+jq -e --arg d "sha256:$(hex_of "$FSRC/a/rootfs/data/own")" \
+	'[.images[] | select(any(.objects[]; .digest == $d and .fixed == true)) | .binding_removed] == [true]' \
+	<<<"$FOUT" >/dev/null || fail "fsck --fix --force did not delete the damaged file and remove the binding"
+[ ! -e "$obj" ] || fail "the damaged file survived fsck --fix --force"
+"${FK[@]}" unmount "$MNT"
+"${FK[@]}" pull "$faref"
+fsck 0
+read_back "$faref" own "$FSRC/a/rootfs/data/own"
+
+if [ "$(go env GOARCH)" = amd64 ]; then
+	step "a delta pull restores: damage the file both releases share, fix, pull --delta each"
+	"${FK[@]}" pull --delta "$nref"
+	"${FK[@]}" pull --delta "$n1ref"
+	printf 'this file is bigger than sixty-four bytes so it is stored as an object.\ndata unchanged across releases\n' >"$FSRC/app-data"
+	obj="$(object_of "$FSRC/app-data")"
+	head -c "$(stat -c %s "$obj")" /dev/zero >"$obj"
+	fsck 3
+	[ "$(images_listing "$(hex_of "$FSRC/app-data")")" = "$(printf '%s\n' "$ndigest" "$n1digest" | sort | xargs)" ] \
+		|| fail "fsck does not name both releases for the damaged file"
+	fsck 3 --fix
+	dlog="$(mktemp)"
+	"${FK[@]}" pull --delta "$nref" 2>"$dlog"
+	cat "$dlog"
+	if grep 'msg="delta: layer"' "$dlog" | grep -qv 'fallback=none'; then fail "a layer fell back to a whole fetch"; fi
+	summary="$(grep 'msg="delta: pull"' "$dlog")"
+	fetched="$(sed -n 's/.* fetched=\([0-9]*\).*/\1/p' <<<"$summary")"
+	size="$(sed -n 's/.* size=\([0-9]*\).*/\1/p' <<<"$summary")"
+	[ "$fetched" -gt 0 ] && [ "$fetched" -lt "$size" ] || fail "the restoring delta pull fetched $fetched of $size layer bytes"
+	rm -f "$dlog"
+	"${FK[@]}" pull --delta "$n1ref"
+	fsck 0
+	for ref in "$nref" "$n1ref"; do
+		"${FK[@]}" mount "$ref" "$MNT"
+		cmp "$MNT/app/data" "$FSRC/app-data" || fail "app/data of $ref does not read back after the delta pull"
+		"${FK[@]}" unmount "$MNT"
+	done
+else
+	step "skipped the delta restore: the delta fixtures are linux/amd64 images"
+fi
+
+# The fs-verity cases need a filesystem of their own, whose blocks can be
+# overwritten on its device.
+step "with fs-verity: a store on its own loop device"
+dd if=/dev/zero of="$VDIR/fsck.img" bs=1M count=64 status=none
+mkfs.ext4 -q -F -b 4096 -O verity "$VDIR/fsck.img"
+mkdir "$VDIR/fsck-verity"
+FLOOP="$(losetup --find --show "$VDIR/fsck.img")" || fail "cannot attach a loop device for the fsck store"
+mount "$FLOOP" "$VDIR/fsck-verity"
+FK=(bin/ocicfs --root "$VDIR/fsck-verity/store")
+"${FK[@]}" pull "$faref"
+"${FK[@]}" pull "$fbref"
+[ "$("${FK[@]}" version | sed -n 's/^verity: \([a-z]*\) .*/\1/p')" = enabled ] || fail "the loop store does not run with fs-verity"
+fsck 0
+
+# overwrite_block overwrites, on the device, the 4096-byte block at index $2
+# of the file $1, counting the fs-verity metadata the filesystem keeps past
+# the end of the data, then drops the page cache so the next read reaches
+# the device.
+overwrite_block() {
+	local phys
+	sync -f "$1"
+	phys="$(filefrag -v -b4096 "$1" | awk -v l="$2" '$1 ~ /^[0-9]+:$/ { gsub(/\.\./, " "); gsub(/:/, " "); if (l >= $2 && l <= $3) print $4 + (l - $2) }')"
+	[ -n "$phys" ] || fail "no block $2 in $1"
+	dd if=/dev/urandom of="$FLOOP" bs=4096 seek="$phys" count=1 conv=fsync oflag=direct status=none
+	sync
+	echo 3 >/proc/sys/vm/drop_caches
+}
+
+# verity_blocks prints the index of the first fs-verity metadata block of
+# file $1, its Merkle tree: ext4 starts it at the next 64 KiB boundary past
+# the data.
+verity_blocks() { echo $((($(stat -c %s "$1") + 65535) / 65536 * 16)); }
+
+step "a file without fs-verity in the place of an object: expect it damaged, deleted by --fix, the object's name relinked, and no pull needed"
+obj="$(object_of "$FSRC/a/rootfs/data/own")"
+rm "$obj"
+echo dsads >"$obj"
+fsck 3
+jq -e --arg d "sha256:$(hex_of "$FSRC/a/rootfs/data/own")" \
+	'[.unreferenced[] | select(.digest == $d and .problem == "damaged" and (.detail | test("carries no fs-verity")))] | length == 1' \
+	<<<"$FOUT" >/dev/null || fail "fsck does not report the file without fs-verity as damaged"
+fsck 3 --fix
+jq -e '([.unreferenced[].fixed] | all) and ([.images[].objects[].fixed] | all) and ([.images[].binding_removed] | any | not)' <<<"$FOUT" >/dev/null \
+	|| fail "fsck --fix did not delete the file and relink the object's name, or removed a binding"
+fsck 0
+read_back "$faref" own "$FSRC/a/rootfs/data/own"
+
+step "overwrite a data block of the object both images share: expect the read to fail with EIO"
+obj="$(object_of "$FSRC/a/rootfs/data/shared")"
+overwrite_block "$obj" 0
+if out="$(cat "$obj" 2>&1 >/dev/null)"; then fail "the kernel served the overwritten block"; fi
+printf '%s\n' "$out"
+printf '%s\n' "$out" | grep -qF 'Input/output error' || fail "reading the overwritten block did not fail with EIO"
+check_fix_restore "$FSRC/a/rootfs/data/shared" 'read: .*input/output error' "$faref $fa" "$fbref $fb"
+
+step "overwrite a Merkle tree block: expect the object damaged, then --fix and a pull to restore"
+obj="$(object_of "$FSRC/b/rootfs/data/own")"
+overwrite_block "$obj" "$(verity_blocks "$obj")"
+fsck 3
+jq -e --arg d "sha256:$(hex_of "$FSRC/b/rootfs/data/own")" --arg b "$fb" \
+	'[.images[] | select(any(.objects[]; .digest == $d and .problem == "damaged" and (.detail | test("read: .*input/output error")))) | .digest] == [$b]' \
+	<<<"$FOUT" >/dev/null || fail "fsck does not report the object with the overwritten Merkle tree block as damaged"
+fsck 3 --fix
+"${FK[@]}" pull "$fbref"
+fsck 0
+read_back "$fbref" own "$FSRC/b/rootfs/data/own"
+
+step "overwrite the manifest of a held image: expect it reported as that image's damage, then --fix and a pull to restore"
+"${FK[@]}" hold --holder e2e-fsck "$fbref"
+overwrite_block "$(object_of "$FSRC/layout-b/blobs/sha256/${fb#sha256:}")" 0
+fsck 3
+jq -e --arg d "$fb" \
+	'[.images[] | select(.digest == $d) | .error != "" and any(.objects[]; .digest == $d and .problem == "damaged")] == [true]' \
+	<<<"$FOUT" >/dev/null || fail "fsck does not report the held image's unreadable manifest as its damage"
+fsck 3 --fix
+"${FK[@]}" pull "$fbref"
+fsck 0
+"${FK[@]}" release --holder e2e-fsck "$fbref"
+
+step "overwrite the block locating the fs-verity descriptor: expect the object reported, and left by --fix as it cannot be opened"
+obj="$(object_of "$FSRC/a/rootfs/data/own")"
+overwrite_block "$obj" $(($(verity_blocks "$obj") + 1))
+fsck 3
+jq -e --arg d "sha256:$(hex_of "$FSRC/a/rootfs/data/own")" \
+	'[.images[].objects[] | select(.digest == $d) | .problem == "damaged" and (.detail | test("open: .*structure needs cleaning"))] == [true]' \
+	<<<"$FOUT" >/dev/null || fail "fsck does not report the object whose descriptor cannot be located as damaged at open"
+fsck 3 --fix
+jq -e --arg d "sha256:$(hex_of "$FSRC/a/rootfs/data/own")" \
+	'[.images[] | select(any(.objects[]; .digest == $d and .fixed == false)) | .binding_removed == false] == [true]' \
+	<<<"$FOUT" >/dev/null || fail "fsck --fix did not leave the unopenable object and its image's binding"
+[ -e "$obj" ] || fail "fsck --fix removed an object it could not open"
+umount "$VDIR/fsck-verity"
+losetup -d "$FLOOP"
+FLOOP=""

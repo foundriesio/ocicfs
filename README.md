@@ -205,7 +205,7 @@ make            # stripped binary into bin/ (the default)
 make check      # lint, vet, unit tests
 make test       # unit tests
 make lint       # gofumpt + golangci-lint
-make test-e2e   # end to end: every verb, every pull source, seal, gc, delta
+make test-e2e   # end to end: every verb, every pull source, seal, gc, delta, fsck
 ```
 
 Where each target runs:
