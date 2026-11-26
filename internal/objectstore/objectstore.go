@@ -766,16 +766,21 @@ func (s *Store) InUse(d digest.Digest) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0) // #nosec G304 -- digest-derived object path
+	return inUsePath(path)
+}
+
+// inUsePath is the in-use probe on the object named by path.
+func inUsePath(path string) (bool, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0) // #nosec G304 -- store-derived object path
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("objectstore: open object %s: %w", d, err)
+		return false, fmt.Errorf("objectstore: open object %s: %w", path, err)
 	}
 	defer func() {
 		if err := f.Close(); err != nil {
-			slog.Warn("objectstore: failed to close object", "digest", d, "err", err)
+			slog.Warn("objectstore: failed to close object", "path", path, "err", err)
 		}
 	}()
 	err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB) // #nosec G115 -- a file descriptor always fits in int
@@ -783,7 +788,7 @@ func (s *Store) InUse(d digest.Digest) (bool, error) {
 		return true, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("objectstore: probe object %s: %w", d, err)
+		return false, fmt.Errorf("objectstore: probe object %s: %w", path, err)
 	}
 	// The close below drops the probe lock with the descriptor.
 	return false, nil
