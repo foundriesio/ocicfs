@@ -62,7 +62,7 @@ func (s *Store) Preflight() error {
 // such object, so the store holds objects another build wrote.
 func requireVerity(err error) error {
 	if noVerity(err) {
-		return fmt.Errorf("object carries no fs-verity, which this build requires; the store holds objects written without it: remove the store and pull again, or enable fs-verity on its objects in place as docs/on-disk-layout.md describes: %w", err)
+		return fmt.Errorf("object carries no fs-verity, which this build requires; the store holds objects written without it: enable fs-verity on its objects in place as docs/on-disk-layout.md describes, or pull again into an empty store on a filesystem with fs-verity support: %w", err)
 	}
 	return err
 }

@@ -76,7 +76,7 @@ The steps depend on the mode chosen in [Host/Device Setup](#hostdevice-setup). I
 2. Switch the workload to the new version and check it.
 3. Roll back to the previous version, or remove it with `docker image rm`. The snapshotter then releases its hold and reclaims the space on its own.
 
-Use [ocicfs-size](ocicfs-size.md) to estimate the storage an update needs. See [image retention and garbage collection][retention] for how runtime snapshots and holds interact.
+Use [ocicfs-size](ocicfs-size.md) to estimate the storage an update needs. Use [`ocicfs fsck`][fsck] to check that the store still holds what was pulled, for example after an unclean shutdown. See [image retention and garbage collection][retention] for how runtime snapshots and holds interact.
 
 [cfs]: https://github.com/foundriesio/cfs-snapshotter
 [cfs-install]: https://github.com/foundriesio/cfs-snapshotter/blob/main/INSTALL.md
@@ -96,3 +96,4 @@ Use [ocicfs-size](ocicfs-size.md) to estimate the storage an update needs. See [
 [delta]: pull.md#delta-pull
 [remove]: ls-remove.md
 [gc]: gc.md
+[fsck]: fsck.md

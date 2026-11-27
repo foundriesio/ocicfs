@@ -119,6 +119,7 @@ See [mount notes](docs/mount.md#notes).
 | List, inspect and remove stored images | `ls`, `inspect`, `remove` |
 | Pin an image against `remove` and `gc`, or release the pin | `hold`, `release` |
 | Reclaim content no image wants and no mount uses | `gc` |
+| Check stored content against its digests | `fsck` |
 
 Not available today:
 
@@ -176,7 +177,8 @@ by the repository's tests.
 - **Use:** [installing](INSTALL.md), [pulling and offline import](docs/pull.md),
   [mounting](docs/mount.md), [sealing](docs/seal.md).
 - **Manage the store:** [inspect](docs/inspect.md),
-  [list and remove](docs/ls-remove.md), [holds and gc](docs/gc.md).
+  [list and remove](docs/ls-remove.md), [holds and gc](docs/gc.md),
+  [checking the store](docs/fsck.md).
 - **Integrate:** [end-to-end integration with cfs-snapshotter](docs/integration.md).
 - **Plan storage:** [image storage and update estimates](docs/ocicfs-size.md).
 - **Understand the design:** [why ocicfs exists](docs/why.md),
@@ -203,7 +205,7 @@ make            # stripped binary into bin/ (the default)
 make check      # lint, vet, unit tests
 make test       # unit tests
 make lint       # gofumpt + golangci-lint
-make test-e2e   # end to end: every verb, every pull source, seal, gc, delta
+make test-e2e   # end to end: every verb, every pull source, seal, gc, delta, fsck
 ```
 
 Where each target runs:

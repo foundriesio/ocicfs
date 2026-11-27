@@ -486,11 +486,18 @@ func HandleExit(cmd *cobra.Command, err error, errOut io.Writer) int {
 			_, _ = fmt.Fprint(errOut, cmd.UsageString())
 		}
 		return 2
+	case errors.Is(err, ErrDamageFound):
+		return 3
 	default:
 		_, _ = fmt.Fprintf(errOut, "%s: %s\n", prog, err.Error())
 		return 1
 	}
 }
+
+// ErrDamageFound is what the fsck command returns after printing a report
+// that is not intact. It maps to exit code 3 with no further diagnostic, so
+// a caller can tell damage from a check that could not run.
+var ErrDamageFound = errors.New("damage found")
 
 // isUsageError reports whether err is a command-line usage error: either an
 // explicit UsageError or one of cobra's command-resolution errors.
@@ -578,4 +585,140 @@ func plural64(n int64, noun string) string {
 		return noun
 	}
 	return noun + "s"
+}
+
+// FsckOutput is the JSON shape of `ocicfs fsck` output. Its field names are a
+// stable contract for callers that parse ocicfs's output.
+type FsckOutput struct {
+	Intact       bool               `json:"intact"`
+	Images       []FsckImageOutput  `json:"images"`
+	Unreferenced []FsckObjectOutput `json:"unreferenced,omitempty"`
+}
+
+// FsckImageOutput is one checked image in FsckOutput.
+type FsckImageOutput struct {
+	Digest   string             `json:"digest"`
+	Platform string             `json:"platform"`
+	Refs     []string           `json:"refs"`
+	Intact   bool               `json:"intact"`
+	Error    string             `json:"error"`
+	Objects  []FsckObjectOutput `json:"objects"`
+	// BindingRemoved is present after a repair: true when the image must be
+	// pulled again.
+	BindingRemoved *bool `json:"binding_removed,omitempty"`
+}
+
+// FsckObjectOutput is one failed object in FsckOutput. Digest and Fsverity
+// are each present when the object has that name, or is needed under it.
+type FsckObjectOutput struct {
+	Digest   string `json:"digest,omitempty"`
+	Fsverity string `json:"fsverity,omitempty"`
+	Problem  string `json:"problem"`
+	Detail   string `json:"detail,omitempty"`
+	// Fixed is present after a repair. InUse marks an object the repair left
+	// because a mounted image uses it.
+	Fixed *bool `json:"fixed,omitempty"`
+	InUse bool  `json:"in_use,omitempty"`
+}
+
+// WriteFsckReport renders a check report to w in the requested format.
+func WriteFsckReport(w io.Writer, format Format, r *ocicfs.FsckReport) error {
+	out := FsckOutput{Intact: r.Intact, Images: []FsckImageOutput{}, Unreferenced: fsckObjects(r.Unreferenced)}
+	failed, pulls, repaired := 0, 0, false
+	for _, img := range r.Images {
+		if !img.Intact {
+			failed++
+		}
+		repaired = repaired || img.BindingRemoved != nil
+		refs := img.Refs
+		if refs == nil {
+			refs = []string{}
+		}
+		out.Images = append(out.Images, FsckImageOutput{
+			Digest: img.Digest.String(), Platform: img.Platform, Refs: refs,
+			Intact: img.Intact, Error: img.Error, Objects: fsckObjects(img.Objects),
+			BindingRemoved: img.BindingRemoved,
+		})
+	}
+	if format == FormatJSON {
+		return emitJSON(w, out)
+	}
+	for _, img := range out.Images {
+		state := "intact"
+		if !img.Intact {
+			state = "NOT INTACT"
+		}
+		if img.BindingRemoved != nil && *img.BindingRemoved {
+			state = "PULL AGAIN"
+			pulls++
+		}
+		if _, err := fmt.Fprintf(w, "%s %s %s %s\n", img.Digest, img.Platform, state, scrubControl(strings.Join(img.Refs, " "))); err != nil {
+			return err
+		}
+		if img.Error != "" {
+			if _, err := fmt.Fprintf(w, "  error: %s\n", scrubControl(img.Error)); err != nil {
+				return err
+			}
+		}
+		if err := writeFsckObjects(w, img.Objects); err != nil {
+			return err
+		}
+	}
+	if len(out.Unreferenced) > 0 {
+		if _, err := fmt.Fprintln(w, "objects no image needs:"); err != nil {
+			return err
+		}
+		if err := writeFsckObjects(w, out.Unreferenced); err != nil {
+			return err
+		}
+	}
+	if _, err := fmt.Fprintf(w, "%d %s checked, %d not intact; %d other %s failed\n",
+		len(out.Images), plural(len(out.Images), "image"), failed,
+		len(out.Unreferenced), plural(len(out.Unreferenced), "object")); err != nil {
+		return err
+	}
+	var next string
+	switch {
+	case out.Intact:
+	case pulls > 0:
+		next = "pull each image marked PULL AGAIN from its source, then run `ocicfs fsck` again"
+	case repaired:
+		next = "run `ocicfs fsck` again to see what is left"
+	default:
+		next = "to repair: make a source for these images reachable, run `ocicfs fsck --fix`, then pull each image it marks"
+	}
+	if next == "" {
+		return nil
+	}
+	_, err := fmt.Fprintln(w, next)
+	return err
+}
+
+func fsckObjects(objects []ocicfs.FsckObject) []FsckObjectOutput {
+	out := []FsckObjectOutput{}
+	for _, o := range objects {
+		out = append(out, FsckObjectOutput{
+			Digest: o.Digest.String(), Fsverity: o.Fsverity, Problem: o.Problem, Detail: o.Detail,
+			Fixed: o.Fixed, InUse: o.InUse,
+		})
+	}
+	return out
+}
+
+func writeFsckObjects(w io.Writer, objects []FsckObjectOutput) error {
+	for _, o := range objects {
+		names := o.Digest
+		if o.Fsverity != "" {
+			names = strings.TrimSpace(names + " fsverity " + o.Fsverity)
+		}
+		problem := o.Problem
+		if o.Fixed != nil {
+			problem += map[bool]string{true: " (fixed)", false: " (NOT FIXED)"}[*o.Fixed]
+		}
+		line := strings.TrimSpace(problem + " " + names + " " + scrubControl(o.Detail))
+		if _, err := fmt.Fprintf(w, "  %s\n", line); err != nil {
+			return err
+		}
+	}
+	return nil
 }
